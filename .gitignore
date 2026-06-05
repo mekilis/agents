@@ -1,0 +1,13 @@
+.DS_Store
+
+# Local build and editor output
+bin/
+dist/
+*.test
+*.out
+
+# Local QA scratch notes
+qa/
+
+# Local/private docs
+docs/

@@ -1,0 +1,21 @@
+#!/bin/sh
+# Agents pre-commit hook: fast formatting + vet checks only.
+# Tests run in CI to keep commits quick.
+#
+# Enable once per clone: git config core.hooksPath .githooks
+
+set -e
+
+gofiles=$(git diff --cached --name-only --diff-filter=ACM | grep '\.go$' || true)
+
+if [ -n "$gofiles" ]; then
+	unformatted=$(gofmt -l $gofiles)
+	if [ -n "$unformatted" ]; then
+		echo "gofmt: the following files need formatting:" >&2
+		echo "$unformatted" | sed 's/^/  /' >&2
+		echo "run: gofmt -w $unformatted" >&2
+		exit 1
+	fi
+fi
+
+go vet ./...

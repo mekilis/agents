@@ -1,0 +1,2227 @@
+package app
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestTrustWorkspaceRoundTrip(t *testing.T) {
+	t.Setenv("USER", "agents-test-user")
+	dir := t.TempDir()
+	e := env{
+		cwd:       filepath.Join(dir, "repo"),
+		home:      dir,
+		trustPath: filepath.Join(dir, ".agents", "trust.json"),
+	}
+
+	trusted, err := isTrusted(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trusted {
+		t.Fatal("new workspace should not start trusted")
+	}
+
+	if _, err := trustWorkspace(e); err != nil {
+		t.Fatal(err)
+	}
+
+	trusted, err = isTrusted(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !trusted {
+		t.Fatal("workspace should be trusted after trustWorkspace")
+	}
+
+	store, err := readTrustStore(e.trustPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(store.Workspaces) != 1 {
+		t.Fatalf("expected one trusted workspace, got %+v", store.Workspaces)
+	}
+	got := store.Workspaces[0]
+	if got.User != "agents-test-user" {
+		t.Fatalf("expected trust user to be recorded, got %+v", got)
+	}
+	if got.Host == "" {
+		t.Fatalf("expected trust host to be recorded, got %+v", got)
+	}
+}
+
+func TestTrustWorkspaceRecordsAndChecksGitRemote(t *testing.T) {
+	t.Setenv("USER", "agents-test-user")
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "repo")
+	if err := os.MkdirAll(filepath.Join(repo, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeGitConfig(t, repo, "git@example.com:agents/agents.git")
+	e := env{
+		cwd:       repo,
+		home:      dir,
+		trustPath: filepath.Join(dir, ".agents", "trust.json"),
+	}
+	if _, err := trustWorkspace(e); err != nil {
+		t.Fatal(err)
+	}
+	store, err := readTrustStore(e.trustPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := store.Workspaces[0].GitRemote; got != "git@example.com:agents/agents.git" {
+		t.Fatalf("expected git remote to be recorded, got %q", got)
+	}
+	trusted, err := isTrusted(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !trusted {
+		t.Fatal("workspace should be trusted while remote matches")
+	}
+
+	writeGitConfig(t, repo, "git@example.com:someone-else/agents.git")
+	trusted, err = isTrusted(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if trusted {
+		t.Fatal("workspace should not stay trusted after origin remote changes")
+	}
+
+	record, err := trustWorkspace(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.GitRemote != "git@example.com:someone-else/agents.git" {
+		t.Fatalf("expected trust refresh to record changed remote, got %+v", record)
+	}
+	trusted, err = isTrusted(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !trusted {
+		t.Fatal("workspace should be trusted again after explicit trust refresh")
+	}
+}
+
+func TestLegacyTrustRecordWithoutGitRemoteStillMatches(t *testing.T) {
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "repo")
+	if err := os.MkdirAll(filepath.Join(repo, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeGitConfig(t, repo, "git@example.com:agents/agents.git")
+	e := env{
+		cwd:       repo,
+		home:      dir,
+		trustPath: filepath.Join(dir, ".agents", "trust.json"),
+	}
+	if err := writeTrustStore(e.trustPath, trustStore{Workspaces: []trustedWorkspace{{
+		Path:      repo,
+		TrustedAt: time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC).Format(time.RFC3339),
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	trusted, err := isTrusted(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !trusted {
+		t.Fatal("legacy trust record without git remote should remain trusted")
+	}
+}
+
+func TestRunTrustCommandWritesTrustRecord(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		code := Run([]string{"trust"}, bytes.NewBuffer(nil), &out, &errOut)
+		if code != 0 {
+			return code
+		}
+		e, err := currentEnv(bytes.NewBuffer(nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		trusted, err := isTrusted(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !trusted {
+			t.Fatal("workspace should be trusted after agents trust")
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("Run trust code=%d stderr=%s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "trusted:") {
+		t.Fatalf("expected trust output, got:\n%s", out.String())
+	}
+}
+
+func TestRunTrustCommandJSON(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		if err := os.MkdirAll(filepath.Join(cwd, ".git"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeGitConfig(t, cwd, "git@example.com:agents/agents.git")
+		code := Run([]string{"trust", "--json"}, bytes.NewBuffer(nil), &out, &errOut)
+		if code != 0 {
+			return code
+		}
+		e, err := currentEnv(bytes.NewBuffer(nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		trusted, err := isTrusted(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !trusted {
+			t.Fatal("workspace should be trusted after agents trust --json")
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("Run trust --json code=%d stderr=%s", code, errOut.String())
+	}
+	var got trustJSON
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("trust JSON should decode: %v\n%s", err, out.String())
+	}
+	if got.Trust != "trusted" || got.Workspace == "" || got.GitRemote != "git@example.com:agents/agents.git" {
+		t.Fatalf("unexpected trust JSON: %+v", got)
+	}
+}
+
+func TestRunTrustCommandRejectsUnknownFlag(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		return Run([]string{"trust", "--later"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code == 0 {
+		t.Fatal("expected trust with unknown flag to fail")
+	}
+	if !strings.Contains(errOut.String(), "unknown flag --later") {
+		t.Fatalf("expected unknown flag error, got %q", errOut.String())
+	}
+}
+
+func TestRunStatusDoesNotPrintBanner(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		return Run([]string{"status"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code != 0 {
+		t.Fatalf("Run status code=%d stderr=%s", code, errOut.String())
+	}
+	if strings.Contains(out.String(), "AGENTS") {
+		t.Fatalf("status should not print interactive banner, got:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "active task: none") {
+		t.Fatalf("status should show active task, got:\n%s", out.String())
+	}
+}
+
+func TestRunUnknownCommandUsesPublicCLIError(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		return Run([]string{"review", "this", "repo"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code == 0 {
+		t.Fatal("expected unknown command to fail")
+	}
+	got := errOut.String()
+	if !strings.Contains(got, "unknown command: review this repo") {
+		t.Fatalf("expected unknown command error, got %q", got)
+	}
+	if strings.Contains(got, "wiring gap") || strings.Contains(got, "internal error") {
+		t.Fatalf("unknown command should not expose implementation-detail wording, got %q", got)
+	}
+	if !strings.Contains(got, "agents help") {
+		t.Fatalf("expected help hint, got %q", got)
+	}
+}
+
+func TestHelpShowsTrustCommand(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		return Run([]string{"help"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code != 0 {
+		t.Fatalf("Run help code=%d stderr=%s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "agents trust [--json]") {
+		t.Fatalf("help should show trust command, got:\n%s", out.String())
+	}
+}
+
+func TestStatusShowsActiveTaskSummary(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		taskDir := filepath.Join(cwd, ".agents", "tasks", "2026-06-04-001-demo--demo-1")
+		if err := os.MkdirAll(taskDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(cwd, ".agents", "active"), []byte("tasks/2026-06-04-001-demo--demo-1\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		task := "# Demo Task\n\nstatus: active\n\nA demo task.\n"
+		if err := os.WriteFile(filepath.Join(taskDir, "task.md"), []byte(task), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return Run([]string{"status"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code != 0 {
+		t.Fatalf("Run status code=%d stderr=%s", code, errOut.String())
+	}
+	got := out.String()
+	for _, want := range []string{
+		"active task: Demo Task",
+		"task status: active",
+		"task path: tasks/2026-06-04-001-demo--demo-1",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("status missing %q, got:\n%s", want, got)
+		}
+	}
+}
+
+func TestStatusShowsActiveTaskRecordSummary(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		task, err := openTask(e, []string{"Record Summary"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addDecision(e, []string{"Record summary should count decisions"}, time.Date(2026, 6, 5, 10, 1, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addHandoff(e, []string{"--to", "reviewer", "Please review status output"}, time.Date(2026, 6, 5, 10, 2, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		openFinding, err := addFinding(e, []string{"open issue"}, time.Date(2026, 6, 5, 10, 3, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		fixedFinding, err := addFinding(e, []string{"fixed issue"}, time.Date(2026, 6, 5, 10, 4, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := updateFindingStatus(e, []string{fixedFinding.Path}, "fixed", "Fixed", time.Date(2026, 6, 5, 10, 5, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		verifiedFinding, err := addFinding(e, []string{"verified issue"}, time.Date(2026, 6, 5, 10, 6, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := updateFindingStatus(e, []string{verifiedFinding.Path}, "verified", "Verification", time.Date(2026, 6, 5, 10, 7, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(cwd, ".agents", task.Path, "verification"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(cwd, ".agents", task.Path, "verification", "2026-06-05T100800Z-go-test.md"), []byte("# Verification\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if openFinding.Path == "" {
+			t.Fatal("open finding should exist")
+		}
+		return Run([]string{"status"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code != 0 {
+		t.Fatalf("Run status code=%d stderr=%s", code, errOut.String())
+	}
+	got := out.String()
+	for _, want := range []string{
+		"next: decide next step",
+		"findings: open=1 fixed=1 verified=1",
+		"records: decisions=1 handoffs=1 verification=1",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("status missing %q, got:\n%s", want, got)
+		}
+	}
+}
+
+func TestStatusJSONNoActiveTask(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		return Run([]string{"status", "--json"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code != 0 {
+		t.Fatalf("Run status --json code=%d stderr=%s", code, errOut.String())
+	}
+	var got struct {
+		Workspace  string          `json:"workspace"`
+		Trust      string          `json:"trust"`
+		ActiveTask json.RawMessage `json:"active_task"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("status JSON should decode: %v\n%s", err, out.String())
+	}
+	if got.Workspace == "" || got.Trust != "not trusted" {
+		t.Fatalf("unexpected status JSON: %+v", got)
+	}
+	if string(got.ActiveTask) != "null" {
+		t.Fatalf("expected active_task null, got %s", got.ActiveTask)
+	}
+}
+
+func TestStatusJSONActiveTask(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		task, err := openTask(e, []string{"JSON Task"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addDecision(e, []string{"Expose status as JSON"}, time.Date(2026, 6, 5, 10, 1, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(cwd, ".agents", task.Path, "verification"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(cwd, ".agents", task.Path, "verification", "2026-06-05T100200Z-json.md"), []byte("# Verification\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return Run([]string{"status", "--json"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code != 0 {
+		t.Fatalf("Run status --json code=%d stderr=%s", code, errOut.String())
+	}
+	var got statusJSON
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("status JSON should decode: %v\n%s", err, out.String())
+	}
+	if got.ActiveTask == nil {
+		t.Fatal("expected active task")
+	}
+	if got.ActiveTask.Title != "JSON Task" || got.ActiveTask.Records.Decisions != 1 || got.ActiveTask.Records.Verification != 1 {
+		t.Fatalf("unexpected active task JSON: %+v", got.ActiveTask)
+	}
+}
+
+func TestStatusJSONRejectsUnknownFlag(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		return Run([]string{"status", "--nope"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code == 0 {
+		t.Fatal("expected status with unknown flag to fail")
+	}
+	if !strings.Contains(errOut.String(), "unknown flag --nope") {
+		t.Fatalf("expected unknown flag error, got %q", errOut.String())
+	}
+}
+
+func TestActiveTaskRejectsEscapingPath(t *testing.T) {
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "repo")
+	if err := os.MkdirAll(filepath.Join(repo, ".agents"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, ".agents", "active"), []byte("../outside\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := readActiveTask(repo); got.Path != "" {
+		t.Fatalf("expected escaping active path to be ignored, got %+v", got)
+	}
+}
+
+func TestInitCreatesShareableWorkspaceState(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		code := Run([]string{"init"}, bytes.NewBuffer(nil), &out, &errOut)
+		if code != 0 {
+			return code
+		}
+		got := out.String()
+		for _, want := range []string{
+			"task state: share",
+			"created: .agents/config.yml",
+		} {
+			if !strings.Contains(got, want) {
+				t.Fatalf("init output missing %q, got:\n%s", want, got)
+			}
+		}
+		config, err := os.ReadFile(filepath.Join(cwd, ".agents", "config.yml"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(config), "commit_chunks: true") {
+			t.Fatalf("expected shared config, got:\n%s", config)
+		}
+		for _, want := range []string{
+			"implementer: agent",
+			"reviewer: codex",
+			"coordinator: codex",
+			`codex_model: ""`,
+			`codex_reasoning: ""`,
+			`claude_model: ""`,
+			`claude_effort: ""`,
+			`cursor_model: ""`,
+		} {
+			if !strings.Contains(string(config), want) {
+				t.Fatalf("expected default role %q, got:\n%s", want, config)
+			}
+		}
+		if _, err := os.Stat(filepath.Join(cwd, ".agents", "tasks")); err != nil {
+			t.Fatal(err)
+		}
+		agentsIgnore, err := os.ReadFile(filepath.Join(cwd, ".agents", ".gitignore"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(agentsIgnore) != "runs/\n" {
+			t.Fatalf("expected .agents/.gitignore to ignore runs only, got:\n%s", agentsIgnore)
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("Run init code=%d stderr=%s", code, errOut.String())
+	}
+}
+
+func TestInitKeepsExistingAgentsGitignore(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		if err := os.MkdirAll(filepath.Join(cwd, ".agents"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(cwd, ".agents", ".gitignore"), []byte("cache/\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		code := Run([]string{"init"}, bytes.NewBuffer(nil), &out, &errOut)
+		if code != 0 {
+			return code
+		}
+		got, err := os.ReadFile(filepath.Join(cwd, ".agents", ".gitignore"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != "cache/\nruns/\n" {
+			t.Fatalf("unexpected .agents/.gitignore:\n%s", got)
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("Run init code=%d stderr=%s", code, errOut.String())
+	}
+}
+
+func TestInitLocalAddsAgentsToGitignore(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		if err := os.WriteFile(filepath.Join(cwd, ".gitignore"), []byte("bin/\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		code := Run([]string{"init", "--local"}, bytes.NewBuffer(nil), &out, &errOut)
+		if code != 0 {
+			return code
+		}
+		config, err := os.ReadFile(filepath.Join(cwd, ".agents", "config.yml"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(config), "commit_chunks: false") {
+			t.Fatalf("expected local config, got:\n%s", config)
+		}
+		ignore, err := os.ReadFile(filepath.Join(cwd, ".gitignore"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(ignore), ".agents/") {
+			t.Fatalf("expected .agents/ in .gitignore, got:\n%s", ignore)
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("Run init --local code=%d stderr=%s", code, errOut.String())
+	}
+}
+
+func TestInitKeepsExistingConfig(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		if err := os.MkdirAll(filepath.Join(cwd, ".agents"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(cwd, ".agents", "config.yml"), []byte("custom: true\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		code := Run([]string{"init"}, bytes.NewBuffer(nil), &out, &errOut)
+		if code != 0 {
+			return code
+		}
+		if !strings.Contains(out.String(), "kept: .agents/config.yml") {
+			t.Fatalf("expected kept config output, got:\n%s", out.String())
+		}
+		config, err := os.ReadFile(filepath.Join(cwd, ".agents", "config.yml"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(config) != "custom: true\n" {
+			t.Fatalf("config should not be overwritten, got:\n%s", config)
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("Run init code=%d stderr=%s", code, errOut.String())
+	}
+}
+
+func TestInitRejectsUnknownFlag(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		return Run([]string{"init", "--maybe"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code == 0 {
+		t.Fatalf("expected init with unknown flag to fail")
+	}
+	if !strings.Contains(errOut.String(), "unknown flag") {
+		t.Fatalf("expected unknown flag error, got %q", errOut.String())
+	}
+}
+
+func TestCompletionZshPrintsScript(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		return Run([]string{"completion", "zsh"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code != 0 {
+		t.Fatalf("Run completion zsh code=%d stderr=%s", code, errOut.String())
+	}
+	got := out.String()
+	for _, want := range []string{
+		"#compdef agents",
+		"'init:initialize Agents state'",
+		"'completion:generate shell completion'",
+		"'--local:ignore .agents in this repo'",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("completion script missing %q, got:\n%s", want, got)
+		}
+	}
+}
+
+func TestCompletionInstallZshWritesCompletionAndZshrc(t *testing.T) {
+	var out, errOut bytes.Buffer
+	var testHome string
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		testHome = home
+		return Run([]string{"completion", "install-zsh"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code != 0 {
+		t.Fatalf("Run completion install-zsh code=%d stderr=%s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "installed:") {
+		t.Fatalf("install output should mention installed path, got:\n%s", out.String())
+	}
+	completion, err := os.ReadFile(filepath.Join(testHome, ".zsh", "completions", "_agents"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(completion), "#compdef agents") {
+		t.Fatalf("completion file missing script:\n%s", completion)
+	}
+	zshrc, err := os.ReadFile(filepath.Join(testHome, ".zshrc"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{".zsh/completions", "autoload -Uz compinit", "compinit"} {
+		if !strings.Contains(string(zshrc), want) {
+			t.Fatalf(".zshrc missing %q:\n%s", want, zshrc)
+		}
+	}
+}
+
+func TestStartOpensTaskAndHandoffToImplementer(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		code := Run([]string{"start", "Fix bookmark search", "--ref", "BUG-44", "Fix uppercase title matching and add tests"}, bytes.NewBuffer(nil), &out, &errOut)
+		if code != 0 {
+			return code
+		}
+		active := readActiveTask(cwd)
+		if active.Title != "Fix bookmark search" {
+			t.Fatalf("unexpected active task: %+v", active)
+		}
+		handoffDir := filepath.Join(cwd, ".agents", active.Path, "handoffs")
+		entries, err := os.ReadDir(handoffDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) != 1 {
+			t.Fatalf("expected one handoff, got %d", len(entries))
+		}
+		data, err := os.ReadFile(filepath.Join(handoffDir, entries[0].Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := string(data)
+		for _, want := range []string{"To: implementer", "Fix uppercase title matching and add tests"} {
+			if !strings.Contains(got, want) {
+				t.Fatalf("handoff missing %q, got:\n%s", want, got)
+			}
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("Run start code=%d stderr=%s", code, errOut.String())
+	}
+	for _, want := range []string{"started task: Fix bookmark search", "handoff to: implementer"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("start output missing %q, got:\n%s", want, out.String())
+		}
+	}
+}
+
+func TestStartRequiresInstruction(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		return Run([]string{"start", "Fix bookmark search"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code == 0 {
+		t.Fatal("expected start without instruction to fail")
+	}
+	if !strings.Contains(errOut.String(), "instruction text is required") {
+		t.Fatalf("expected instruction error, got %q", errOut.String())
+	}
+}
+
+func TestInteractiveRejectsUntrustedNonTTY(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		return Run(nil, bytes.NewBufferString(""), &out, &errOut)
+	})
+	if code == 0 {
+		t.Fatalf("expected non-tty untrusted run to fail")
+	}
+	if !strings.Contains(errOut.String(), "not trusted") {
+		t.Fatalf("expected trust error, got %q", errOut.String())
+	}
+	if strings.Contains(out.String(), "AGENTS") || strings.Contains(out.String(), "o---o") {
+		t.Fatalf("non-tty untrusted run should not print banner, got:\n%s", out.String())
+	}
+}
+
+func TestInteractiveTrustThenRunsLoop(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		writeDemoActiveTask(t, cwd)
+		e := env{
+			cwd:       cwd,
+			home:      home,
+			isTTY:     true,
+			trustPath: filepath.Join(home, ".agents", "trust.json"),
+		}
+		return runInteractive(bytes.NewBufferString("y\n/status\n/quit\n"), &out, &errOut, e)
+	})
+	if code != 0 {
+		t.Fatalf("runInteractive code=%d stderr=%s", code, errOut.String())
+	}
+	got := out.String()
+	for _, want := range []string{
+		"AGENTS",
+		"Trusted this folder.",
+		"active task: Demo Task",
+		`Type plain text to chat with the coordinator. "/" for commands, "?" for help.`,
+		"› ",
+		"Goodbye.",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("interactive output missing %q, got:\n%s", want, got)
+		}
+	}
+	if strings.Count(got, "active task: Demo Task") < 2 {
+		t.Fatalf("status command should print the active task again, got:\n%s", got)
+	}
+}
+
+func TestPrintBannerUsesFullAgentsWordmark(t *testing.T) {
+	var out bytes.Buffer
+	printBanner(&out)
+	got := out.String()
+	for _, want := range []string{
+		"AGENTS",
+		"   / \\   __ _  ___ _ __ | |_ ___ ",
+		" / ___ \\ (_| |  __/ | | | |_\\__ \\",
+		"        |___/                     ",
+		"coding agents, coordinated",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("banner missing %q, got:\n%s", want, got)
+		}
+	}
+	if lines := strings.Count(strings.TrimRight(got, "\n"), "\n") + 1; lines != 8 {
+		t.Fatalf("banner should be 8 lines, got %d:\n%s", lines, got)
+	}
+}
+
+func TestInteractiveCanDisableBanner(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		writeDemoActiveTask(t, cwd)
+		e := env{
+			cwd:           cwd,
+			home:          home,
+			isTTY:         true,
+			disableBanner: true,
+			trustPath:     filepath.Join(home, ".agents", "trust.json"),
+		}
+		return runInteractive(bytes.NewBufferString("y\n/status\n/quit\n"), &out, &errOut, e)
+	})
+	if code != 0 {
+		t.Fatalf("runInteractive code=%d stderr=%s", code, errOut.String())
+	}
+	got := out.String()
+	if strings.Contains(got, "coding agents, coordinated") || strings.Contains(got, "/ ___ \\") {
+		t.Fatalf("disabled banner should not print wordmark, got:\n%s", got)
+	}
+	for _, want := range []string{
+		"Trusted this folder.",
+		"active task: Demo Task",
+		"Goodbye.",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("interactive output missing %q, got:\n%s", want, got)
+		}
+	}
+}
+
+func TestBannerDisabledFromEnv(t *testing.T) {
+	for _, value := range []string{"1", "true", "TRUE", "yes", "on"} {
+		if !bannerDisabledFromEnv(value) {
+			t.Fatalf("expected %q to disable banner", value)
+		}
+	}
+	for _, value := range []string{"", "0", "false", "no", "off", "sometimes"} {
+		if bannerDisabledFromEnv(value) {
+			t.Fatalf("expected %q not to disable banner", value)
+		}
+	}
+}
+
+func TestInteractiveHelpAndExit(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{
+			cwd:       cwd,
+			home:      home,
+			isTTY:     false,
+			trustPath: filepath.Join(home, ".agents", "trust.json"),
+		}
+		if _, err := trustWorkspace(e); err != nil {
+			t.Fatal(err)
+		}
+		return runInteractive(bytes.NewBufferString("?\n/exit\n"), &out, &errOut, e)
+	})
+	if code != 0 {
+		t.Fatalf("runInteractive code=%d stderr=%s", code, errOut.String())
+	}
+	got := out.String()
+	for _, want := range []string{
+		"Shortcuts:",
+		"plain text  chat with the coordinator",
+		"Slash commands:",
+		`/status`,
+		"show workspace, active task, and record counts",
+		`/task open "title" [--ref REF]`,
+		`/decision add "text"`,
+		"/run",
+		"/quit",
+		"Goodbye.",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("interactive help missing %q, got:\n%s", want, got)
+		}
+	}
+}
+
+func TestInteractiveSlashPrefixShowsMatchingCommands(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{
+			cwd:       cwd,
+			home:      home,
+			isTTY:     false,
+			trustPath: filepath.Join(home, ".agents", "trust.json"),
+		}
+		if _, err := trustWorkspace(e); err != nil {
+			t.Fatal(err)
+		}
+		return runInteractive(bytes.NewBufferString("/st\n/\n/quit\n"), &out, &errOut, e)
+	})
+	if code != 0 {
+		t.Fatalf("runInteractive code=%d stderr=%s", code, errOut.String())
+	}
+	got := out.String()
+	if !strings.Contains(got, "/status") || !strings.Contains(got, "show workspace, active task, and record counts") {
+		t.Fatalf("prefix should suggest /status, got:\n%s", got)
+	}
+	if !strings.Contains(got, "/start") || !strings.Contains(got, "fast path") {
+		t.Fatalf("bare slash should show full command menu, got:\n%s", got)
+	}
+	if strings.Contains(got, "unknown command: /st") {
+		t.Fatalf("prefix should not run as unknown command, got:\n%s", got)
+	}
+}
+
+func TestInteractiveUniqueSlashPrefixExecutes(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{
+			cwd:       cwd,
+			home:      home,
+			isTTY:     false,
+			trustPath: filepath.Join(home, ".agents", "trust.json"),
+		}
+		if _, err := trustWorkspace(e); err != nil {
+			t.Fatal(err)
+		}
+		return runInteractive(bytes.NewBufferString("/q\n"), &out, &errOut, e)
+	})
+	if code != 0 {
+		t.Fatalf("runInteractive code=%d stderr=%s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "Goodbye.") {
+		t.Fatalf("/q should resolve to /quit, got:\n%s", out.String())
+	}
+}
+
+func TestInteractiveExactQuitExits(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{
+			cwd:       cwd,
+			home:      home,
+			isTTY:     false,
+			trustPath: filepath.Join(home, ".agents", "trust.json"),
+		}
+		if _, err := trustWorkspace(e); err != nil {
+			t.Fatal(err)
+		}
+		return runInteractive(bytes.NewBufferString("/quit\n"), &out, &errOut, e)
+	})
+	if code != 0 {
+		t.Fatalf("runInteractive code=%d stderr=%s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "Goodbye.") {
+		t.Fatalf("/quit should exit, got:\n%s", out.String())
+	}
+	if strings.Contains(errOut.String(), "unknown command") {
+		t.Fatalf("/quit should not produce unknown command, got stderr:\n%s", errOut.String())
+	}
+}
+
+func TestInteractiveUniqueSlashPrefixPreservesArgs(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{
+			cwd:       cwd,
+			home:      home,
+			isTTY:     false,
+			trustPath: filepath.Join(home, ".agents", "trust.json"),
+		}
+		if _, err := trustWorkspace(e); err != nil {
+			t.Fatal(err)
+		}
+		input := strings.Join([]string{
+			`/task open "Prefix Task"`,
+			`/dec add "Prefixes resolve"`,
+			`/sta`,
+			`/qu`,
+			"",
+		}, "\n")
+		return runInteractive(bytes.NewBufferString(input), &out, &errOut, e)
+	})
+	if code != 0 {
+		t.Fatalf("runInteractive code=%d stderr=%s", code, errOut.String())
+	}
+	got := out.String()
+	for _, want := range []string{
+		"decision: Prefixes resolve",
+		"Slash commands:",
+		"/start",
+		"/status",
+		"Goodbye.",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("interactive output missing %q, got:\n%s", want, got)
+		}
+	}
+}
+
+func TestCompleteSlashInputCompletesUniquePrefix(t *testing.T) {
+	got, ok := completeSlashInput("/qu")
+	if !ok || got != "/quit " {
+		t.Fatalf("completeSlashInput(/qu) got %q ok=%v", got, ok)
+	}
+}
+
+func TestCompleteSlashInputLeavesAmbiguousPrefix(t *testing.T) {
+	got, ok := completeSlashInput("/st")
+	if ok || got != "/st" {
+		t.Fatalf("completeSlashInput(/st) got %q ok=%v", got, ok)
+	}
+}
+
+func TestComposerSuggestionsHideExactCommand(t *testing.T) {
+	if got := composerSuggestionLines("/quit", false); len(got) != 0 {
+		t.Fatalf("exact slash command should not keep suggestions open, got %#v", got)
+	}
+	if got := composerSuggestionLines("/qu", false); len(got) == 0 || !strings.Contains(strings.Join(got, "\n"), "/quit") {
+		t.Fatalf("partial slash command should suggest /quit, got %#v", got)
+	}
+}
+
+func TestComposerSuggestionsAreCompact(t *testing.T) {
+	got := composerSuggestionLines("/", false)
+	if len(got) > liveSuggestionLimit+1 {
+		t.Fatalf("live suggestions should stay compact, got %d lines: %#v", len(got), got)
+	}
+	text := strings.Join(got, "\n")
+	if !strings.Contains(text, "more") || !strings.Contains(text, "? for all") {
+		t.Fatalf("compact suggestions should point to full help, got:\n%s", text)
+	}
+}
+
+func TestNormalizePastedTextJoinsLines(t *testing.T) {
+	got := normalizePastedText("I want to build a tiny dependency-free project from scratch.\nMake it runnable.\n\nAdd tests.")
+	want := "I want to build a tiny dependency-free project from scratch. Make it runnable. Add tests."
+	if got != want {
+		t.Fatalf("normalizePastedText got %q want %q", got, want)
+	}
+}
+
+func TestCleanCodexExecOutputReturnsFinalAnswer(t *testing.T) {
+	raw := strings.Join([]string{
+		"Reading additional input from stdin...",
+		"OpenAI Codex v0.137.0",
+		"user",
+		"prompt text",
+		"codex",
+		"I will inspect files.",
+		"exec",
+		"rg --files",
+		"hook: Stop",
+		"tok" + "ens used",
+		"21,091",
+		"Here is the clear coordinator reply.",
+		"",
+		"What should it do?",
+	}, "\n")
+	got := cleanInteractiveAgentOutput("codex", raw)
+	want := "Here is the clear coordinator reply.\n\nWhat should it do?"
+	if got != want {
+		t.Fatalf("cleanInteractiveAgentOutput got:\n%q\nwant:\n%q", got, want)
+	}
+}
+
+func TestCleanInteractiveAgentOutputHidesAgentsRecordOutput(t *testing.T) {
+	raw := "What should this project do?\nhandoff to: implementer\npath: tasks/example/handoffs/file.md\n"
+	got := cleanInteractiveAgentOutput("custom", raw)
+	want := "What should this project do?"
+	if got != want {
+		t.Fatalf("cleanInteractiveAgentOutput got %q want %q", got, want)
+	}
+}
+
+func TestInteractiveRequiresSlashForCommandsAndChatsWithCoordinator(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{
+			cwd:       cwd,
+			home:      home,
+			isTTY:     false,
+			trustPath: filepath.Join(home, ".agents", "trust.json"),
+		}
+		if _, err := trustWorkspace(e); err != nil {
+			t.Fatal(err)
+		}
+		input := strings.Join([]string{
+			`status`,
+			`I want to add bookmark tags, but I need help shaping the plan.`,
+			`/status`,
+			`/quit`,
+			"",
+		}, "\n")
+		return runInteractive(bytes.NewBufferString(input), &out, &errOut, e)
+	})
+	if code != 0 {
+		t.Fatalf("runInteractive code=%d stderr=%s", code, errOut.String())
+	}
+	got := out.String()
+	for _, want := range []string{
+		"started coordinator intake: status",
+		"sent to coordinator",
+		"active task: status",
+		"records: decisions=0 handoffs=2 verification=0",
+		"Goodbye.",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("interactive output missing %q, got:\n%s", want, got)
+		}
+	}
+}
+
+func TestInteractiveTTYChatRunsCoordinatorResponse(t *testing.T) {
+	var out bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{
+			cwd:       cwd,
+			home:      home,
+			isTTY:     true,
+			trustPath: filepath.Join(home, ".agents", "trust.json"),
+		}
+		if _, err := trustWorkspace(e); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := initWorkspace(e, "share"); err != nil {
+			t.Fatal(err)
+		}
+		script := filepath.Join(cwd, "coordinator.sh")
+		body := "#!/bin/sh\nset -eu\nprintf 'Hi. What constraints or reference should I use?\\n'\n"
+		if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cfg := "roles:\n  implementer: agent\n  reviewer: codex\n  coordinator: " + script + " {prompt_file}\n"
+		if err := os.WriteFile(filepath.Join(cwd, ".agents", "config.yml"), []byte(cfg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := recordCoordinatorChat(e, "hi", &out); err != nil {
+			t.Fatal(err)
+		}
+		if err := runCoordinatorChatResponse(e, &out); err != nil {
+			t.Fatal(err)
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+	got := out.String()
+	for _, want := range []string{
+		"sent to coordinator",
+		"coordinator is responding...",
+		"Hi. What constraints or reference should I use?",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("interactive coordinator response missing %q, got:\n%s", want, got)
+		}
+	}
+	for _, unwanted := range []string{
+		"handoff to:",
+		"path:",
+		"ran role:",
+		"prompt:",
+		"log:",
+	} {
+		if strings.Contains(got, unwanted) {
+			t.Fatalf("interactive coordinator response should hide %q, got:\n%s", unwanted, got)
+		}
+	}
+}
+
+func TestPrintInterruptHintIncludesActiveTask(t *testing.T) {
+	var out bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Interruptible Session"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		printInterruptHint(&out, e)
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+	got := out.String()
+	for _, want := range []string{
+		"Active task: Interruptible Session",
+		"To continue this session, run agents",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("interrupt hint missing %q, got:\n%s", want, got)
+		}
+	}
+}
+
+func TestInteractiveRunsSlashStartCommand(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{
+			cwd:       cwd,
+			home:      home,
+			isTTY:     false,
+			trustPath: filepath.Join(home, ".agents", "trust.json"),
+		}
+		if _, err := trustWorkspace(e); err != nil {
+			t.Fatal(err)
+		}
+		input := strings.Join([]string{
+			`/start "Fix bookmark search" --ref BUG-44 "Fix uppercase title matching and add tests"`,
+			`/status`,
+			`/quit`,
+			"",
+		}, "\n")
+		return runInteractive(bytes.NewBufferString(input), &out, &errOut, e)
+	})
+	if code != 0 {
+		t.Fatalf("runInteractive code=%d stderr=%s", code, errOut.String())
+	}
+	got := out.String()
+	for _, want := range []string{
+		"started task: Fix bookmark search",
+		"handoff to: implementer",
+		"active task: Fix bookmark search",
+		"records: decisions=0 handoffs=1 verification=0",
+		"Goodbye.",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("interactive output missing %q, got:\n%s", want, got)
+		}
+	}
+}
+
+func TestParseCommandLine(t *testing.T) {
+	got, err := parseCommandLine(`task open "Provider Driver Config" --ref PROVIDERS-1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"task", "open", "Provider Driver Config", "--ref", "PROVIDERS-1"}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("parseCommandLine got %#v want %#v", got, want)
+	}
+}
+
+func TestParseCommandLineRejectsUnterminatedQuote(t *testing.T) {
+	if _, err := parseCommandLine(`decision add "missing end`); err == nil {
+		t.Fatalf("expected unterminated quote error")
+	}
+}
+
+func TestTaskOpenCreatesChunksAndSetsActive(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		code := Run([]string{"task", "open", "Provider Driver Config", "--ref", "PROVIDERS-1"}, bytes.NewBuffer(nil), &out, &errOut)
+		if code != 0 {
+			return code
+		}
+		got := out.String()
+		taskPath := "tasks/" + time.Now().UTC().Format("2006-01-02") + "-001-provider-driver-config--providers-1"
+		for _, want := range []string{
+			"opened task: Provider Driver Config",
+			"task path: " + taskPath,
+		} {
+			if !strings.Contains(got, want) {
+				t.Fatalf("task open output missing %q, got:\n%s", want, got)
+			}
+		}
+		taskMarkdown, err := os.ReadFile(filepath.Join(cwd, ".agents", taskPath, "task.md"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(taskMarkdown), "ref: PROVIDERS-1") {
+			t.Fatalf("task.md missing ref, got:\n%s", taskMarkdown)
+		}
+		if strings.HasSuffix(string(taskMarkdown), "\n\n") {
+			t.Fatalf("task.md should not end with a blank line, got:\n%s", taskMarkdown)
+		}
+		if active := readActiveTask(cwd); active.Title != "Provider Driver Config" {
+			t.Fatalf("unexpected active task %+v", active)
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("Run task open code=%d stderr=%s", code, errOut.String())
+	}
+}
+
+func TestOpenTaskIncrementsSequenceForDate(t *testing.T) {
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "repo")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	e := env{cwd: repo, home: dir, trustPath: filepath.Join(dir, ".agents", "trust.json")}
+	now := time.Date(2026, 6, 5, 12, 0, 0, 0, time.UTC)
+	first, err := openTask(e, []string{"First Task"}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := openTask(e, []string{"Second Task"}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Path != "tasks/2026-06-05-001-first-task" {
+		t.Fatalf("unexpected first path %q", first.Path)
+	}
+	if second.Path != "tasks/2026-06-05-002-second-task" {
+		t.Fatalf("unexpected second path %q", second.Path)
+	}
+}
+
+func TestTaskUseSwitchesActiveTask(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		firstDir := filepath.Join(cwd, ".agents", "tasks", "2026-06-05-001-first")
+		secondDir := filepath.Join(cwd, ".agents", "tasks", "2026-06-05-002-second")
+		if err := os.MkdirAll(firstDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(secondDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(firstDir, "task.md"), []byte("# First\n\nstatus: active\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(secondDir, "task.md"), []byte("# Second\n\nstatus: active\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return Run([]string{"task", "use", "tasks/2026-06-05-002-second"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code != 0 {
+		t.Fatalf("Run task use code=%d stderr=%s", code, errOut.String())
+	}
+	got := out.String()
+	for _, want := range []string{
+		"active task: Second",
+		"task path: tasks/2026-06-05-002-second",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("task use output missing %q, got:\n%s", want, got)
+		}
+	}
+}
+
+func TestTaskUseRejectsEscapingPath(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		return Run([]string{"task", "use", "../outside"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code == 0 {
+		t.Fatalf("expected escaping task use to fail")
+	}
+	if !strings.Contains(errOut.String(), "stay inside .agents") {
+		t.Fatalf("expected escaping path error, got %q", errOut.String())
+	}
+}
+
+func TestDecisionAddWritesChunkUnderActiveTask(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		task, err := openTask(env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}, []string{"Task With Decision"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		code := Run([]string{"decision", "add", "Reviewers do not edit code"}, bytes.NewBuffer(nil), &out, &errOut)
+		if code != 0 {
+			return code
+		}
+		decisionDir := filepath.Join(cwd, ".agents", task.Path, "decisions")
+		entries, err := os.ReadDir(decisionDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) != 1 {
+			t.Fatalf("expected one decision, got %d", len(entries))
+		}
+		data, err := os.ReadFile(filepath.Join(decisionDir, entries[0].Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := string(data)
+		for _, want := range []string{
+			"# Decision: Reviewers do not edit code",
+			"Status: proposed",
+			"Reviewers do not edit code",
+		} {
+			if !strings.Contains(got, want) {
+				t.Fatalf("decision missing %q, got:\n%s", want, got)
+			}
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("Run decision add code=%d stderr=%s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "decision: Reviewers do not edit code") {
+		t.Fatalf("unexpected output:\n%s", out.String())
+	}
+}
+
+func TestDecisionAddRequiresActiveTask(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		return Run([]string{"decision", "add", "A decision"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code == 0 {
+		t.Fatalf("expected decision add without active task to fail")
+	}
+	if !strings.Contains(errOut.String(), "no active task") {
+		t.Fatalf("expected active task error, got %q", errOut.String())
+	}
+}
+
+func TestHandoffWritesChunkUnderActiveTask(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		task, err := openTask(env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}, []string{"Task With Handoff"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		code := Run([]string{"handoff", "--to", "reviewer", "Please review the task lifecycle commands."}, bytes.NewBuffer(nil), &out, &errOut)
+		if code != 0 {
+			return code
+		}
+		handoffDir := filepath.Join(cwd, ".agents", task.Path, "handoffs")
+		entries, err := os.ReadDir(handoffDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) != 1 {
+			t.Fatalf("expected one handoff, got %d", len(entries))
+		}
+		data, err := os.ReadFile(filepath.Join(handoffDir, entries[0].Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := string(data)
+		for _, want := range []string{
+			"# Handoff: reviewer",
+			"To: reviewer",
+			"Please review the task lifecycle commands.",
+		} {
+			if !strings.Contains(got, want) {
+				t.Fatalf("handoff missing %q, got:\n%s", want, got)
+			}
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("Run handoff code=%d stderr=%s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "handoff to: reviewer") {
+		t.Fatalf("unexpected output:\n%s", out.String())
+	}
+}
+
+func TestHandoffRequiresTo(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		return Run([]string{"handoff", "Please review this."}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code == 0 {
+		t.Fatalf("expected handoff without --to to fail")
+	}
+	if !strings.Contains(errOut.String(), "--to is required") {
+		t.Fatalf("expected --to error, got %q", errOut.String())
+	}
+}
+
+func TestFindingAddWritesOpenFinding(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		task, err := openTask(env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}, []string{"Task With Finding"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		code := Run([]string{"finding", "add", "fetch failure is ignored", "--severity", "high"}, bytes.NewBuffer(nil), &out, &errOut)
+		if code != 0 {
+			return code
+		}
+		findingDir := filepath.Join(cwd, ".agents", task.Path, "findings")
+		entries, err := os.ReadDir(findingDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) != 1 {
+			t.Fatalf("expected one finding, got %d", len(entries))
+		}
+		data, err := os.ReadFile(filepath.Join(findingDir, entries[0].Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := string(data)
+		for _, want := range []string{
+			"# Finding: fetch failure is ignored",
+			"Status: open",
+			"Severity: high",
+			"fetch failure is ignored",
+		} {
+			if !strings.Contains(got, want) {
+				t.Fatalf("finding missing %q, got:\n%s", want, got)
+			}
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("Run finding add code=%d stderr=%s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "finding: fetch failure is ignored") {
+		t.Fatalf("unexpected output:\n%s", out.String())
+	}
+}
+
+func TestFindingFixAndVerifyUpdateStatus(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		task, err := openTask(env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}, []string{"Task With Finding"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		record, err := addFinding(env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}, []string{"fetch failure is ignored"}, time.Date(2026, 6, 5, 11, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		base := filepath.Base(record.Path)
+		if code := Run([]string{"finding", "fix", base}, bytes.NewBuffer(nil), &out, &errOut); code != 0 {
+			return code
+		}
+		if code := Run([]string{"finding", "verify", record.Path}, bytes.NewBuffer(nil), &out, &errOut); code != 0 {
+			return code
+		}
+		data, err := os.ReadFile(filepath.Join(cwd, ".agents", record.Path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := string(data)
+		for _, want := range []string{
+			"Status: verified",
+			"## Fixed",
+			"## Verification",
+		} {
+			if !strings.Contains(got, want) {
+				t.Fatalf("updated finding missing %q, got:\n%s", want, got)
+			}
+		}
+		if task.Path == "" {
+			t.Fatal("task should exist")
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("Run finding fix/verify code=%d stderr=%s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "fixed finding:") || !strings.Contains(out.String(), "verified finding:") {
+		t.Fatalf("unexpected output:\n%s", out.String())
+	}
+}
+
+func TestFindingAddRejectsInvalidSeverity(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		if _, err := openTask(env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}, []string{"Task"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		return Run([]string{"finding", "add", "bad thing", "--severity", "urgent"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code == 0 {
+		t.Fatalf("expected invalid severity to fail")
+	}
+	if !strings.Contains(errOut.String(), "severity must be") {
+		t.Fatalf("expected severity error, got %q", errOut.String())
+	}
+}
+
+func TestFindingRequiresActiveTask(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		return Run([]string{"finding", "add", "A finding"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code == 0 {
+		t.Fatalf("expected finding add without active task to fail")
+	}
+	if !strings.Contains(errOut.String(), "no active task") {
+		t.Fatalf("expected active task error, got %q", errOut.String())
+	}
+}
+
+func TestFindingUpdateRejectsEscapingPath(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		if _, err := openTask(env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}, []string{"Task"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		return Run([]string{"finding", "fix", "../outside"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code == 0 {
+		t.Fatalf("expected escaping finding path to fail")
+	}
+	if !strings.Contains(errOut.String(), "stay inside active task findings") {
+		t.Fatalf("expected escaping path error, got %q", errOut.String())
+	}
+}
+
+func TestArchiveSummarizesAndPrunesActiveTask(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		task, err := openTask(e, []string{"Archive Me"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addDecision(e, []string{"Keep durable decisions"}, time.Date(2026, 6, 5, 10, 5, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addHandoff(e, []string{"--to", "reviewer", "Review before archive"}, time.Date(2026, 6, 5, 10, 6, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(cwd, ".agents", task.Path, "scope.md"), []byte("# Scope\n\n- keep durable outcome\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(cwd, ".agents", task.Path, "status.md"), []byte("# Status\n\nImplemented:\n\n- archive keeps useful summaries\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		openFinding, err := addFinding(e, []string{"open issue", "--severity", "high"}, time.Date(2026, 6, 5, 10, 7, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		verifiedFinding, err := addFinding(e, []string{"verified issue"}, time.Date(2026, 6, 5, 10, 8, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := updateFindingStatus(e, []string{verifiedFinding.Path}, "verified", "Verification", time.Date(2026, 6, 5, 10, 9, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+
+		code := Run([]string{"archive"}, bytes.NewBuffer(nil), &out, &errOut)
+		if code != 0 {
+			return code
+		}
+		archiveDir := filepath.Join(cwd, ".agents", "archive", filepath.Base(task.Path))
+		summary, err := os.ReadFile(filepath.Join(archiveDir, "summary.md"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := string(summary)
+		for _, want := range []string{
+			"# Archive Me",
+			"status: archived",
+			"- decisions: 1",
+			"- handoffs: 1",
+			"- findings open: 1",
+			"- findings verified: 1",
+			"## Scope",
+			"- keep durable outcome",
+			"## Final Status",
+			"- archive keeps useful summaries",
+		} {
+			if !strings.Contains(got, want) {
+				t.Fatalf("archive summary missing %q, got:\n%s", want, got)
+			}
+		}
+		if _, err := os.Stat(filepath.Join(cwd, ".agents", task.Path)); !os.IsNotExist(err) {
+			t.Fatalf("expected live task to be pruned, stat err=%v", err)
+		}
+		if active := readActiveTask(cwd); active.Path != "" {
+			t.Fatalf("expected active task to be cleared, got %+v", active)
+		}
+		if _, err := os.Stat(filepath.Join(archiveDir, "decisions", "2026-06-05T100500Z-keep-durable-decisions.md")); err != nil {
+			t.Fatalf("expected decision to be copied, err=%v", err)
+		}
+		if _, err := os.Stat(filepath.Join(archiveDir, "findings", filepath.Base(openFinding.Path))); err != nil {
+			t.Fatalf("expected open finding to be preserved, err=%v", err)
+		}
+		if _, err := os.Stat(filepath.Join(archiveDir, "findings", filepath.Base(verifiedFinding.Path))); !os.IsNotExist(err) {
+			t.Fatalf("expected verified finding not to be copied, err=%v", err)
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("Run archive code=%d stderr=%s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "archived task: Archive Me") {
+		t.Fatalf("unexpected output:\n%s", out.String())
+	}
+}
+
+func TestArchiveRequiresActiveTask(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		return Run([]string{"archive"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code == 0 {
+		t.Fatalf("expected archive without active task to fail")
+	}
+	if !strings.Contains(errOut.String(), "no active task") {
+		t.Fatalf("expected active task error, got %q", errOut.String())
+	}
+}
+
+func TestRunRoutesOpenFindingsToImplementer(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Loop Task"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addFinding(e, []string{"open issue"}, time.Date(2026, 6, 5, 10, 1, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		return Run([]string{"run"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code != 0 {
+		t.Fatalf("Run run code=%d stderr=%s", code, errOut.String())
+	}
+	got := out.String()
+	for _, want := range []string{
+		"next role: implementer",
+		"next action: fix open findings",
+		"findings: open=1 fixed=0 verified=0",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("run output missing %q, got:\n%s", want, got)
+		}
+	}
+}
+
+func TestRunJSONRoutesOpenFindingsToImplementer(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Loop JSON Task"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addFinding(e, []string{"open issue"}, time.Date(2026, 6, 5, 10, 1, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		return Run([]string{"run", "--json"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code != 0 {
+		t.Fatalf("Run run --json code=%d stderr=%s", code, errOut.String())
+	}
+	var got loopJSON
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("run JSON should decode: %v\n%s", err, out.String())
+	}
+	if got.Task == nil || got.NextRole != "implementer" || got.NextAction != "fix open findings" || got.Task.Findings.Open != 1 {
+		t.Fatalf("unexpected run JSON: %+v", got)
+	}
+}
+
+func TestRunJSONRejectsUnknownFlag(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		return Run([]string{"run", "--later"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code == 0 {
+		t.Fatal("expected run with unknown flag to fail")
+	}
+	if !strings.Contains(errOut.String(), "unknown flag --later") {
+		t.Fatalf("expected unknown flag error, got %q", errOut.String())
+	}
+}
+
+func TestRunRoutesFixedFindingsToReviewer(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Loop Task"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		finding, err := addFinding(e, []string{"fixed issue"}, time.Date(2026, 6, 5, 10, 1, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := updateFindingStatus(e, []string{finding.Path}, "fixed", "Fixed", time.Date(2026, 6, 5, 10, 2, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		return Run([]string{"run"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code != 0 {
+		t.Fatalf("Run run code=%d stderr=%s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "next role: reviewer") || !strings.Contains(out.String(), "verify fixed findings independently") {
+		t.Fatalf("unexpected run output:\n%s", out.String())
+	}
+}
+
+func TestRunRoutesHandoffToImplementerToImplementer(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Loop Task"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addHandoff(e, []string{"--to", "implementer", "Please implement this task"}, time.Date(2026, 6, 5, 10, 1, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		return Run([]string{"run"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code != 0 {
+		t.Fatalf("Run run code=%d stderr=%s", code, errOut.String())
+	}
+	got := out.String()
+	for _, want := range []string{
+		"next role: implementer",
+		"next action: act on latest handoff",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("run output missing %q, got:\n%s", want, got)
+		}
+	}
+}
+
+func TestRunRoutesHandoffToCoordinatorToCoordinator(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Planning Task"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addHandoff(e, []string{"--to", "coordinator", "Help me turn this into a clear plan"}, time.Date(2026, 6, 5, 10, 1, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		return Run([]string{"run"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code != 0 {
+		t.Fatalf("Run run code=%d stderr=%s", code, errOut.String())
+	}
+	got := out.String()
+	for _, want := range []string{
+		"next role: coordinator",
+		"next action: continue intake and planning",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("run output missing %q, got:\n%s", want, got)
+		}
+	}
+}
+
+func TestRunRoutesHandoffToReviewerToReviewer(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Loop Task"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addHandoff(e, []string{"--to", "reviewer", "Please review this task"}, time.Date(2026, 6, 5, 10, 1, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		return Run([]string{"run"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code != 0 {
+		t.Fatalf("Run run code=%d stderr=%s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "next role: reviewer") || !strings.Contains(out.String(), "review latest handoff") {
+		t.Fatalf("unexpected run output:\n%s", out.String())
+	}
+}
+
+func TestRunStopsAtHumanBoundaryAfterVerification(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		task, err := openTask(e, []string{"Loop Task"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		verificationDir := filepath.Join(cwd, ".agents", task.Path, "verification")
+		if err := os.MkdirAll(verificationDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(verificationDir, "2026-06-05T100100Z-go-test.md"), []byte("# Verification\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return Run([]string{"run"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code != 0 {
+		t.Fatalf("Run run code=%d stderr=%s", code, errOut.String())
+	}
+	got := out.String()
+	for _, want := range []string{
+		"next role: human",
+		"next action: approve archive, commit, or next task",
+		"boundary: human approval required",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("run output missing %q, got:\n%s", want, got)
+		}
+	}
+}
+
+func TestRunExecutesConfiguredImplementer(t *testing.T) {
+	var out, errOut bytes.Buffer
+	var promptCopy string
+	var runCwd string
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		runCwd = cwd
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Executable Loop"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		script := filepath.Join(cwd, "implementer.sh")
+		body := "#!/bin/sh\nset -eu\ncp \"$1\" prompt-copy.txt\nprintf 'implemented from %s\\n' \"$1\"\nprintf 'checked stderr too\\n' >&2\n"
+		if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cfg := "roles:\n  implementer: " + script + " {prompt_file}\n  reviewer: codex\n  coordinator: codex\n"
+		if err := os.WriteFile(filepath.Join(cwd, ".agents", "config.yml"), []byte(cfg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		code := Run([]string{"run"}, bytes.NewBuffer(nil), &out, &errOut)
+		if data, err := os.ReadFile(filepath.Join(cwd, "prompt-copy.txt")); err == nil {
+			promptCopy = string(data)
+		}
+		return code
+	})
+	if code != 0 {
+		t.Fatalf("Run run code=%d stderr=%s", code, errOut.String())
+	}
+	got := out.String()
+	for _, want := range []string{
+		"run id: ",
+		"run log: .agents/runs/logs/",
+		"implemented from",
+		"checked stderr too",
+		"ran role: implementer",
+		"prompt: .agents/runs/prompts/",
+		"log: .agents/runs/logs/",
+		"agent output:",
+		"after:",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("run output missing %q, got:\n%s", want, got)
+		}
+	}
+	if !strings.Contains(promptCopy, "You are the implementer") {
+		t.Fatalf("prompt copy should contain implementer prompt")
+	}
+	logs, err := filepath.Glob(filepath.Join(runCwd, ".agents", "runs", "logs", "*-implementer.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 1 {
+		t.Fatalf("expected one implementer log, got %d: %v", len(logs), logs)
+	}
+	logData, err := os.ReadFile(logs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	logText := string(logData)
+	for _, want := range []string{
+		"# Agents run ",
+		"role: implementer",
+		"agent: ",
+		"model: provider default",
+		"reasoning: provider default",
+		"--- provider output ---",
+		"implemented from",
+		"checked stderr too",
+	} {
+		if !strings.Contains(logText, want) {
+			t.Fatalf("run log missing %q:\n%s", want, logText)
+		}
+	}
+	if !strings.Contains(logText, "implemented from") || !strings.Contains(logText, "checked stderr too") {
+		t.Fatalf("run log missing streamed output:\n%s", logText)
+	}
+}
+
+func TestReadConfigParsesModelSettings(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".agents"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgText := strings.Join([]string{
+		"settings:",
+		"  codex_model: gpt-5.5",
+		"  codex_reasoning: low",
+		"  claude_model: opus",
+		"  claude_effort: high",
+		"  cursor_model: claude-4.6-sonnet-medium-thinking",
+		"roles:",
+		"  implementer: agent",
+		"  reviewer: codex",
+		"  coordinator: codex",
+		"",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(dir, ".agents", "config.yml"), []byte(cfgText), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := readConfig(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Settings.CodexModel != "gpt-5.5" || cfg.Settings.CodexReasoning != "low" {
+		t.Fatalf("unexpected codex settings: %+v", cfg.Settings)
+	}
+	if cfg.Settings.ClaudeModel != "opus" || cfg.Settings.ClaudeEffort != "high" || cfg.Settings.CursorModel != "claude-4.6-sonnet-medium-thinking" {
+		t.Fatalf("unexpected settings: %+v", cfg.Settings)
+	}
+	if cfg.Roles["coordinator"] != "codex" {
+		t.Fatalf("expected coordinator role to parse, got %+v", cfg.Roles)
+	}
+}
+
+func TestResolveCodexCommandUsesModelSettings(t *testing.T) {
+	command, err := resolveAgentCommand("codex", agentSettings{CodexModel: "gpt-5.5", CodexReasoning: "low"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"codex exec --sandbox workspace-write",
+		"-m 'gpt-5.5'",
+		"-c 'model_reasoning_effort=\"low\"'",
+	} {
+		if !strings.Contains(command, want) {
+			t.Fatalf("codex command missing %q:\n%s", want, command)
+		}
+	}
+}
+
+func TestResolveAgentCommandUsesProviderModelSettings(t *testing.T) {
+	claudeCommand, err := resolveAgentCommand("claude", agentSettings{ClaudeModel: "opus", ClaudeEffort: "xhigh"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"claude -p", "--model 'opus'", "--effort 'xhigh'"} {
+		if !strings.Contains(claudeCommand, want) {
+			t.Fatalf("claude command missing %q:\n%s", want, claudeCommand)
+		}
+	}
+
+	cursorCommand, err := resolveAgentCommand("agent", agentSettings{CursorModel: "claude-4.6-sonnet-medium-thinking"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"agent -p", "--model 'claude-4.6-sonnet-medium-thinking'", "--force"} {
+		if !strings.Contains(cursorCommand, want) {
+			t.Fatalf("cursor command missing %q:\n%s", want, cursorCommand)
+		}
+	}
+}
+
+func TestResolveCodexCommandKeepsLegacyModelSettings(t *testing.T) {
+	command, err := resolveAgentCommand("codex", agentSettings{Model: "gpt-5.4", Reasoning: "medium"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"-m 'gpt-5.4'", "-c 'model_reasoning_effort=\"medium\"'"} {
+		if !strings.Contains(command, want) {
+			t.Fatalf("legacy codex command missing %q:\n%s", want, command)
+		}
+	}
+}
+
+func TestRunReportsMissingConfiguredAgent(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Missing Agent"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		cfg := "roles:\n  implementer: definitely-missing-agents-provider {prompt_file}\n  reviewer: codex\n  coordinator: codex\n"
+		if err := os.WriteFile(filepath.Join(cwd, ".agents", "config.yml"), []byte(cfg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return Run([]string{"run"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code == 0 {
+		t.Fatalf("expected missing provider to fail")
+	}
+	if strings.Contains(out.String(), "run log:") {
+		t.Fatalf("missing provider should fail before printing run log, got:\n%s", out.String())
+	}
+	got := errOut.String()
+	for _, want := range []string{
+		`implementer agent command "definitely-missing-agents-provider" was not found on PATH`,
+		"edit .agents/config.yml or install it",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing provider error should contain %q, got:\n%s", want, got)
+		}
+	}
+}
+
+func TestRunRequiresActiveTask(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		return Run([]string{"run"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code == 0 {
+		t.Fatalf("expected run without active task to fail")
+	}
+	if !strings.Contains(errOut.String(), "no active task") {
+		t.Fatalf("expected active task error, got %q", errOut.String())
+	}
+}
+
+func TestDispatchReviewerWaitsForHandoff(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Dispatch Task"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		return Run([]string{"dispatch", "reviewer"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code != 0 {
+		t.Fatalf("Run dispatch code=%d stderr=%s", code, errOut.String())
+	}
+	got := out.String()
+	for _, want := range []string{
+		"role: reviewer",
+		"action: wait for an implementer handoff before reviewing",
+		"boundary: handoff required",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("dispatch output missing %q, got:\n%s", want, got)
+		}
+	}
+}
+
+func TestDispatchShowsConfiguredAgent(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Dispatch Task"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(cwd, ".agents", "config.yml"), []byte("roles:\n  implementer: claude\n  reviewer: codex\n  coordinator: codex\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return Run([]string{"dispatch", "implementer"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code != 0 {
+		t.Fatalf("Run dispatch code=%d stderr=%s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "agent: claude") {
+		t.Fatalf("expected configured agent, got:\n%s", out.String())
+	}
+}
+
+func TestDispatchJSONShowsConfiguredAgent(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Dispatch JSON Task"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(cwd, ".agents", "config.yml"), []byte("roles:\n  implementer: claude\n  reviewer: codex\n  coordinator: codex\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return Run([]string{"dispatch", "implementer", "--json"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code != 0 {
+		t.Fatalf("Run dispatch --json code=%d stderr=%s", code, errOut.String())
+	}
+	var got dispatchJSON
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("dispatch JSON should decode: %v\n%s", err, out.String())
+	}
+	if got.Role != "implementer" || got.Agent != "claude" || !got.Configured || got.Task == nil {
+		t.Fatalf("unexpected dispatch JSON: %+v", got)
+	}
+}
+
+func TestDispatchJSONRejectsUnknownFlag(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Dispatch Task"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		return Run([]string{"dispatch", "implementer", "--later"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code == 0 {
+		t.Fatal("expected dispatch with unknown flag to fail")
+	}
+	if !strings.Contains(errOut.String(), "unknown flag --later") {
+		t.Fatalf("expected unknown flag error, got %q", errOut.String())
+	}
+}
+
+func TestDispatchShowsUnconfiguredAgent(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Dispatch Task"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		return Run([]string{"dispatch", "implementer"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code != 0 {
+		t.Fatalf("Run dispatch code=%d stderr=%s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "agent: not configured") {
+		t.Fatalf("expected unconfigured agent, got:\n%s", out.String())
+	}
+}
+
+func TestDispatchRejectsUnknownRole(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Dispatch Task"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		return Run([]string{"dispatch", "pilot"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code == 0 {
+		t.Fatalf("expected unknown role to fail")
+	}
+	if !strings.Contains(errOut.String(), "unknown role") {
+		t.Fatalf("expected unknown role error, got %q", errOut.String())
+	}
+}
+
+func withTempProcessEnv(t *testing.T, fn func(home, cwd string) int) int {
+	t.Helper()
+	origHome := os.Getenv("AGENTS_HOME")
+	origNoBanner := os.Getenv("AGENTS_NO_BANNER")
+	origPWD, _ := os.Getwd()
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "repo")
+	if err := os.Mkdir(repo, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chdir(origPWD)
+		_ = os.Setenv("AGENTS_HOME", origHome)
+		_ = os.Setenv("AGENTS_NO_BANNER", origNoBanner)
+	})
+	if err := os.Setenv("AGENTS_HOME", dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(repo); err != nil {
+		t.Fatal(err)
+	}
+	return fn(dir, repo)
+}
+
+func writeDemoActiveTask(t *testing.T, cwd string) {
+	t.Helper()
+	taskDir := filepath.Join(cwd, ".agents", "tasks", "2026-06-04-001-demo--demo-1")
+	if err := os.MkdirAll(taskDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cwd, ".agents", "active"), []byte("tasks/2026-06-04-001-demo--demo-1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	task := "# Demo Task\n\nstatus: active\n\nA demo task.\n"
+	if err := os.WriteFile(filepath.Join(taskDir, "task.md"), []byte(task), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeGitConfig(t *testing.T, repo, originURL string) {
+	t.Helper()
+	config := fmt.Sprintf("[remote \"origin\"]\n\turl = %s\n", originURL)
+	if err := os.WriteFile(filepath.Join(repo, ".git", "config"), []byte(config), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}

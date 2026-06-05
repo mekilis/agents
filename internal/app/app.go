@@ -1,0 +1,2944 @@
+package app
+
+import (
+	"bufio"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+	"unicode"
+
+	"golang.org/x/term"
+)
+
+const (
+	productName         = "Agents"
+	stateDir            = ".agents"
+	liveSuggestionLimit = 4
+)
+
+var errComposerInterrupted = errors.New("composer interrupted")
+
+type slashCommandSpec struct {
+	Name        string
+	Usage       string
+	Description string
+}
+
+var interactiveSlashCommands = []slashCommandSpec{
+	{Name: "/start", Usage: `/start "title" [--ref REF] "what to do"`, Description: "fast path: open a task and hand off to implementer"},
+	{Name: "/status", Usage: "/status", Description: "show workspace, active task, and record counts"},
+	{Name: "/trust", Usage: "/trust", Description: "trust this workspace"},
+	{Name: "/init", Usage: "/init [--share|--local]", Description: "initialize Agents task state"},
+	{Name: "/task", Usage: `/task open "title" [--ref REF]`, Description: "open or switch active tasks"},
+	{Name: "/decision", Usage: `/decision add "text"`, Description: "record a planning decision"},
+	{Name: "/handoff", Usage: `/handoff --to ROLE "text"`, Description: "route context to another role"},
+	{Name: "/finding", Usage: "/finding add|fix|verify ...", Description: "track review findings"},
+	{Name: "/dispatch", Usage: "/dispatch <role>", Description: "print a role packet"},
+	{Name: "/run", Usage: "/run", Description: "run the next configured role"},
+	{Name: "/archive", Usage: "/archive", Description: "archive the active task"},
+	{Name: "/help", Usage: "/help", Description: "show this command menu"},
+	{Name: "/quit", Usage: "/quit", Description: "exit the interactive terminal"},
+	{Name: "/exit", Usage: "/exit", Description: "exit the interactive terminal"},
+}
+
+type env struct {
+	cwd           string
+	home          string
+	isTTY         bool
+	disableBanner bool
+	trustPath     string
+}
+
+type config struct {
+	Roles    map[string]string
+	Settings agentSettings
+}
+
+type agentSettings struct {
+	Model          string
+	Reasoning      string
+	CodexModel     string
+	CodexReasoning string
+	ClaudeModel    string
+	ClaudeEffort   string
+	CursorModel    string
+}
+
+const promptFileMarker = "{prompt_file}"
+
+// Run is the CLI entry point for both scriptable commands and the interactive
+// terminal.
+func Run(args []string, in io.Reader, out, errOut io.Writer) int {
+	e, err := currentEnv(in)
+	if err != nil {
+		fmt.Fprintf(errOut, "agents: %v\n", err)
+		return 1
+	}
+
+	if len(args) > 0 {
+		return runOneShot(args, out, errOut, e)
+	}
+	return runInteractive(in, out, errOut, e)
+}
+
+func runOneShot(args []string, out, errOut io.Writer, e env) int {
+	switch args[0] {
+	case "-h", "--help", "help":
+		printHelp(out)
+		return 0
+	case "completion":
+		return runCompletionCommand(args[1:], out, errOut, e)
+	case "status":
+		jsonOut, err := parseJSONFlag(args[1:])
+		if err != nil {
+			fmt.Fprintf(errOut, "agents: status: %v\n", err)
+			return 2
+		}
+		if err := printStatus(out, e, jsonOut); err != nil {
+			fmt.Fprintf(errOut, "agents: read status: %v\n", err)
+			return 1
+		}
+		return 0
+	case "trust":
+		return runTrustCommand(args[1:], out, errOut, e)
+	case "init":
+		return runInitCommand(args[1:], out, errOut, e)
+	case "start":
+		return runStartCommand(args[1:], out, errOut, e)
+	case "task":
+		return runTaskCommand(args[1:], out, errOut, e)
+	case "decision":
+		return runDecisionCommand(args[1:], out, errOut, e)
+	case "handoff":
+		return runHandoffCommand(args[1:], out, errOut, e)
+	case "finding":
+		return runFindingCommand(args[1:], out, errOut, e)
+	case "archive":
+		return runArchiveCommand(args[1:], out, errOut, e)
+	case "dispatch":
+		return runDispatchCommand(args[1:], out, errOut, e)
+	case "run":
+		return runLoopCommand(args[1:], out, errOut, e)
+	default:
+		fmt.Fprintf(errOut, "agents: unknown command: %s\n", strings.Join(args, " "))
+		fmt.Fprintln(errOut, "Run `agents help` for usage.")
+		return 2
+	}
+}
+
+func runInteractive(in io.Reader, out, errOut io.Writer, e env) int {
+	reader := bufio.NewReader(in)
+
+	if e.isTTY && !e.disableBanner {
+		printBanner(out)
+		fmt.Fprintln(out)
+	}
+
+	trusted, err := isTrusted(e)
+	if err != nil {
+		fmt.Fprintf(errOut, "agents: read trust store: %v\n", err)
+		return 1
+	}
+	if !trusted {
+		if !e.isTTY {
+			fmt.Fprintf(errOut, "agents: %s is not trusted; run `agents trust` or open `agents` in an interactive terminal to trust this folder\n", e.cwd)
+			return 1
+		}
+		ok, err := promptTrust(reader, out, e.cwd)
+		if err != nil {
+			fmt.Fprintf(errOut, "agents: read trust prompt: %v\n", err)
+			return 1
+		}
+		if !ok {
+			fmt.Fprintln(out, "Not trusted. No changes made.")
+			return 0
+		}
+		if _, err := trustWorkspace(e); err != nil {
+			fmt.Fprintf(errOut, "agents: write trust store: %v\n", err)
+			return 1
+		}
+		fmt.Fprintln(out, "Trusted this folder.")
+		fmt.Fprintln(out)
+	}
+
+	return runTerminalLoop(in, reader, out, errOut, e)
+}
+
+func currentEnv(in io.Reader) (env, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return env{}, err
+	}
+	home := strings.TrimSpace(os.Getenv("AGENTS_HOME"))
+	if home == "" {
+		home, err = os.UserHomeDir()
+		if err != nil {
+			return env{}, err
+		}
+	}
+	trustPath := filepath.Join(home, ".agents", "trust.json")
+	return env{
+		cwd:           cwd,
+		home:          home,
+		isTTY:         isTerminalReader(in),
+		disableBanner: bannerDisabledFromEnv(os.Getenv("AGENTS_NO_BANNER")),
+		trustPath:     trustPath,
+	}, nil
+}
+
+func bannerDisabledFromEnv(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func isTerminalReader(r io.Reader) bool {
+	f, ok := r.(*os.File)
+	if !ok {
+		return false
+	}
+	info, err := f.Stat()
+	return err == nil && info.Mode()&os.ModeCharDevice != 0
+}
+
+func readConfig(cwd string) (config, error) {
+	cfg := config{Roles: map[string]string{}}
+	data, err := os.ReadFile(filepath.Join(cwd, stateDir, "config.yml"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return cfg, nil
+		}
+		return cfg, err
+	}
+	inRoles := false
+	inSettings := false
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.TrimSpace(line) == "" || strings.HasPrefix(strings.TrimSpace(line), "#") {
+			continue
+		}
+		trimmedLine := strings.TrimSpace(line)
+		if trimmedLine == "roles:" {
+			inRoles = true
+			inSettings = false
+			continue
+		}
+		if trimmedLine == "settings:" {
+			inRoles = false
+			inSettings = true
+			continue
+		}
+		if inRoles {
+			if !strings.HasPrefix(line, "  ") {
+				inRoles = false
+				continue
+			}
+			trimmed := strings.TrimSpace(line)
+			parts := strings.SplitN(trimmed, ":", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			role := strings.TrimSpace(parts[0])
+			value := strings.Trim(strings.TrimSpace(parts[1]), `"`)
+			if role == "implementer" || role == "reviewer" || role == "coordinator" {
+				cfg.Roles[role] = value
+			}
+			continue
+		}
+		if inSettings {
+			if !strings.HasPrefix(line, "  ") {
+				inSettings = false
+				continue
+			}
+			trimmed := strings.TrimSpace(line)
+			parts := strings.SplitN(trimmed, ":", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			key := strings.TrimSpace(parts[0])
+			value := strings.Trim(strings.TrimSpace(parts[1]), `"`)
+			switch key {
+			case "model":
+				cfg.Settings.Model = value
+			case "reasoning":
+				cfg.Settings.Reasoning = value
+			case "codex_model":
+				cfg.Settings.CodexModel = value
+			case "codex_reasoning":
+				cfg.Settings.CodexReasoning = value
+			case "claude_model":
+				cfg.Settings.ClaudeModel = value
+			case "claude_effort":
+				cfg.Settings.ClaudeEffort = value
+			case "cursor_model":
+				cfg.Settings.CursorModel = value
+			}
+		}
+	}
+	return cfg, nil
+}
+
+func configuredAgent(cwd, role string) (string, error) {
+	cfg, err := readConfig(cwd)
+	if err != nil {
+		return "", err
+	}
+	return cfg.Roles[role], nil
+}
+
+func printHelp(w io.Writer) {
+	fmt.Fprintln(w, "Agents is a terminal for coordinating AI coding agents.")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  agents          Open the interactive terminal")
+	fmt.Fprintln(w, "  agents trust [--json]")
+	fmt.Fprintln(w, "  agents init [--share|--local]")
+	fmt.Fprintln(w, "  agents start \"title\" [--ref REF] \"what to do\"")
+	fmt.Fprintln(w, "  agents status [--json]")
+	fmt.Fprintln(w, "  agents task open \"title\" [--ref REF]")
+	fmt.Fprintln(w, "  agents task use <task>")
+	fmt.Fprintln(w, "  agents decision add \"text\"")
+	fmt.Fprintln(w, "  agents handoff --to ROLE \"text\"")
+	fmt.Fprintln(w, "  agents finding add \"text\" [--severity low|medium|high]")
+	fmt.Fprintln(w, "  agents finding fix <finding>")
+	fmt.Fprintln(w, "  agents finding verify <finding>")
+	fmt.Fprintln(w, "  agents archive")
+	fmt.Fprintln(w, "  agents dispatch <implementer|reviewer|coordinator> [--json]")
+	fmt.Fprintln(w, "  agents run [--json]")
+	fmt.Fprintln(w, "  agents completion zsh")
+	fmt.Fprintln(w, "  agents completion install-zsh")
+}
+
+func runCompletionCommand(args []string, out, errOut io.Writer, e env) int {
+	if len(args) != 1 {
+		fmt.Fprintln(errOut, "agents: completion requires zsh or install-zsh")
+		return 2
+	}
+	switch args[0] {
+	case "zsh":
+		fmt.Fprint(out, zshCompletionScript())
+		return 0
+	case "install-zsh":
+		path, err := installZshCompletion(e.home)
+		if err != nil {
+			fmt.Fprintf(errOut, "agents: completion install-zsh: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(out, "installed: %s\n", path)
+		fmt.Fprintln(out, "restart zsh or run: exec zsh")
+		return 0
+	default:
+		fmt.Fprintf(errOut, "agents: unknown completion shell: %s\n", args[0])
+		return 2
+	}
+}
+
+func installZshCompletion(home string) (string, error) {
+	dir := filepath.Join(home, ".zsh", "completions")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, "_agents")
+	if err := os.WriteFile(path, []byte(zshCompletionScript()), 0o644); err != nil {
+		return "", err
+	}
+	zshrc := filepath.Join(home, ".zshrc")
+	block := "\n# Agents shell completion\nfpath=(~/.zsh/completions $fpath)\nautoload -Uz compinit\ncompinit\n"
+	data, err := os.ReadFile(zshrc)
+	if err != nil && !os.IsNotExist(err) {
+		return "", err
+	}
+	if !strings.Contains(string(data), ".zsh/completions") {
+		file, err := os.OpenFile(zshrc, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			return "", err
+		}
+		defer file.Close()
+		if _, err := file.WriteString(block); err != nil {
+			return "", err
+		}
+	}
+	return path, nil
+}
+
+func zshCompletionScript() string {
+	return `#compdef agents
+
+_agents() {
+  local -a commands
+  commands=(
+    'help:show help'
+    'trust:trust the current workspace'
+    'init:initialize Agents state'
+    'start:open a task and hand off to implementer'
+    'status:show workspace and task status'
+    'task:open or switch tasks'
+    'decision:record a decision'
+    'handoff:record a role handoff'
+    'finding:track review findings'
+    'archive:archive the active task'
+    'dispatch:print a role packet'
+    'run:run the next configured role'
+    'completion:generate shell completion'
+  )
+
+  local -a roles severities completion_cmds init_flags json_flags task_cmds finding_cmds
+  roles=('implementer:implementation role' 'reviewer:review role' 'coordinator:planning role')
+  severities=('low:low severity' 'medium:medium severity' 'high:high severity')
+  completion_cmds=('zsh:print zsh completion' 'install-zsh:install zsh completion locally')
+  init_flags=('--share:commit task state' '--local:ignore .agents in this repo')
+  json_flags=('--json:print JSON')
+  task_cmds=('open:open a new task' 'use:switch active task')
+  finding_cmds=('add:add a finding' 'fix:mark finding fixed' 'verify:mark finding verified')
+
+  _arguments -C \
+    '1:command:->cmds' \
+    '*::arg:->args'
+
+  case $state in
+    cmds)
+      _describe 'agents command' commands
+      ;;
+    args)
+      case $words[2] in
+        completion)
+          _describe 'completion command' completion_cmds
+          ;;
+        init)
+          _describe 'init option' init_flags
+          ;;
+        status|trust|run)
+          _describe 'option' json_flags
+          ;;
+        dispatch)
+          if (( CURRENT == 3 )); then
+            _describe 'role' roles
+          else
+            _describe 'option' json_flags
+          fi
+          ;;
+        task)
+          if (( CURRENT == 3 )); then
+            _describe 'task command' task_cmds
+          elif [[ $words[3] == open ]]; then
+            _arguments '--ref[task reference]:ref:'
+          elif [[ $words[3] == use ]]; then
+            _files
+          fi
+          ;;
+        finding)
+          if (( CURRENT == 3 )); then
+            _describe 'finding command' finding_cmds
+          elif [[ $words[3] == add ]]; then
+            _arguments '--severity[finding severity]:severity:->severity'
+            if [[ $state == severity ]]; then
+              _describe 'severity' severities
+            fi
+          else
+            _files
+          fi
+          ;;
+        handoff)
+          _arguments '--to[target role]:role:->role'
+          if [[ $state == role ]]; then
+            _describe 'role' roles
+          fi
+          ;;
+        start)
+          _arguments '--ref[task reference]:ref:'
+          ;;
+      esac
+      ;;
+  esac
+}
+
+_agents "$@"
+`
+}
+
+func printInteractiveHelp(w io.Writer) {
+	fmt.Fprintln(w, "Shortcuts:")
+	fmt.Fprintln(w, "  plain text  chat with the coordinator")
+	fmt.Fprintln(w, "  /           show slash commands")
+	fmt.Fprintln(w, "  ?           show this help")
+	fmt.Fprintln(w)
+	printSlashCommandSuggestions(w, "", false)
+}
+
+func printSlashCommandSuggestions(w io.Writer, prefix string, color bool) {
+	prefix = strings.TrimSpace(prefix)
+	matches := matchingSlashCommands(prefix)
+	if len(matches) == 0 {
+		fmt.Fprintf(w, "No slash commands match %q.\n", prefix)
+		fmt.Fprintln(w, `Type "/" to see commands, or type plain text to chat with the coordinator.`)
+		return
+	}
+	fmt.Fprintln(w, "Slash commands:")
+	for _, command := range matches {
+		usage := command.Usage
+		description := command.Description
+		if color {
+			usage = "\x1b[36m" + usage + "\x1b[0m"
+			description = "\x1b[2m" + description + "\x1b[0m"
+		}
+		fmt.Fprintf(w, "  %-42s %s\n", usage, description)
+	}
+}
+
+func matchingSlashCommands(prefix string) []slashCommandSpec {
+	if prefix == "" || prefix == "/" {
+		return interactiveSlashCommands
+	}
+	var matches []slashCommandSpec
+	for _, command := range interactiveSlashCommands {
+		if strings.HasPrefix(command.Name, prefix) {
+			matches = append(matches, command)
+		}
+	}
+	return matches
+}
+
+func resolveInteractiveSlashCommand(input string, out io.Writer, color bool) (string, bool) {
+	fields := strings.Fields(input)
+	if len(fields) == 0 {
+		return "", false
+	}
+	slashHead := fields[0]
+	matches := matchingSlashCommands(slashHead)
+	switch len(matches) {
+	case 0:
+		fmt.Fprintf(out, "No slash commands match %q.\n", slashHead)
+		fmt.Fprintln(out, `Type "/" to see commands, or type plain text to chat with the coordinator.`)
+		return "", false
+	case 1:
+		resolved := strings.TrimPrefix(matches[0].Name, "/")
+		if len(fields) > 1 {
+			return resolved + strings.TrimPrefix(input, slashHead), true
+		}
+		return resolved, true
+	default:
+		printSlashCommandSuggestions(out, slashHead, color)
+		return "", false
+	}
+}
+
+func printBanner(w io.Writer) {
+	fmt.Fprintln(w, `AGENTS`)
+	fmt.Fprintln(w, `    _                    _       `)
+	fmt.Fprintln(w, `   / \   __ _  ___ _ __ | |_ ___ `)
+	fmt.Fprintln(w, `  / _ \ / _' |/ _ \ '_ \| __/ __|`)
+	fmt.Fprintln(w, ` / ___ \ (_| |  __/ | | | |_\__ \`)
+	fmt.Fprintln(w, `/_/   \_\__, |\___|_| |_|\__|___/`)
+	fmt.Fprintln(w, `        |___/                     `)
+	fmt.Fprintln(w, `coding agents, coordinated`)
+}
+
+func promptTrust(in *bufio.Reader, out io.Writer, cwd string) (bool, error) {
+	fmt.Fprintln(out, "This folder is not trusted yet.")
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, cwd)
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, "Agents may read files, write .agents/ state, run configured agent commands,")
+	fmt.Fprintln(out, "and ask before irreversible actions.")
+	fmt.Fprintln(out)
+	fmt.Fprint(out, "Trust this folder? [y/N] ")
+
+	line, err := in.ReadString('\n')
+	if err != nil && err != io.EOF {
+		return false, err
+	}
+	answer := strings.TrimSpace(strings.ToLower(line))
+	return answer == "y" || answer == "yes", nil
+}
+
+func runTerminalLoop(rawIn io.Reader, in *bufio.Reader, out, errOut io.Writer, e env) int {
+	if err := printStatus(out, e, false); err != nil {
+		fmt.Fprintf(errOut, "agents: read status: %v\n", err)
+		return 1
+	}
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, `Type plain text to chat with the coordinator. "/" for commands, "?" for help.`)
+	if e.isTTY {
+		if inFile, ok := rawIn.(*os.File); ok {
+			return runTerminalLoopTTY(inFile, out, errOut, e)
+		}
+	}
+
+	for {
+		fmt.Fprint(out, "› ")
+		line, err := in.ReadString('\n')
+		if err != nil && err != io.EOF {
+			fmt.Fprintf(errOut, "agents: read command: %v\n", err)
+			return 1
+		}
+
+		rawCommand := strings.TrimSpace(line)
+		if rawCommand == "" {
+			if err == io.EOF {
+				fmt.Fprintln(out)
+				return 0
+			}
+		} else {
+			code, done := handleInteractiveCommand(rawCommand, out, errOut, e)
+			if done {
+				return code
+			}
+		}
+
+		if err == io.EOF {
+			fmt.Fprintln(out)
+			return 0
+		}
+	}
+}
+
+func handleInteractiveCommand(rawCommand string, out, errOut io.Writer, e env) (int, bool) {
+	switch {
+	case rawCommand == "/":
+		printSlashCommandSuggestions(out, rawCommand, e.isTTY)
+	case rawCommand == "?":
+		printInteractiveHelp(out)
+	case strings.HasPrefix(rawCommand, "/"):
+		normalizedCommand, ok := resolveInteractiveSlashCommand(rawCommand, out, e.isTTY)
+		if !ok {
+			return 0, false
+		}
+		switch normalizedCommand {
+		case "status":
+			if statusErr := printStatus(out, e, false); statusErr != nil {
+				fmt.Fprintf(errOut, "agents: read status: %v\n", statusErr)
+				return 1, true
+			}
+		case "help":
+			printInteractiveHelp(out)
+		case "quit", "exit":
+			fmt.Fprintln(out, "Goodbye.")
+			return 0, true
+		default:
+			args, parseErr := parseCommandLine(normalizedCommand)
+			if parseErr != nil {
+				fmt.Fprintf(errOut, "agents: parse command: %v\n", parseErr)
+			} else if len(args) > 0 {
+				code := runOneShot(args, out, errOut, e)
+				if code != 0 {
+					fmt.Fprintf(out, "command exited: %d\n", code)
+				}
+			}
+		}
+	default:
+		if chatErr := recordCoordinatorChat(e, rawCommand, out); chatErr != nil {
+			fmt.Fprintf(errOut, "agents: coordinator chat: %v\n", chatErr)
+			return 1, true
+		}
+		if e.isTTY {
+			if runErr := runCoordinatorChatResponse(e, out); runErr != nil {
+				fmt.Fprintf(errOut, "agents: coordinator response: %v\n", runErr)
+			}
+		}
+	}
+	return 0, false
+}
+
+func runTerminalLoopTTY(in *os.File, out, errOut io.Writer, e env) int {
+	fd := int(in.Fd())
+	oldState, err := term.MakeRaw(fd)
+	if err != nil {
+		fmt.Fprintf(errOut, "agents: enable raw terminal: %v\n", err)
+		return 1
+	}
+	defer term.Restore(fd, oldState)
+	fmt.Fprint(out, "\x1b[?2004h")
+	defer fmt.Fprint(out, "\x1b[?2004l")
+
+	for {
+		rawCommand, err := readComposerLine(in, out, e)
+		if err != nil {
+			if err == io.EOF {
+				fmt.Fprintln(out)
+				return 0
+			}
+			if errors.Is(err, errComposerInterrupted) {
+				printInterruptHint(out, e)
+				return 130
+			}
+			fmt.Fprintf(errOut, "agents: read command: %v\n", err)
+			return 1
+		}
+		if rawCommand == "" {
+			continue
+		}
+		term.Restore(fd, oldState)
+		code, done := handleInteractiveCommand(rawCommand, out, errOut, e)
+		if done {
+			return code
+		}
+		oldState, err = term.MakeRaw(fd)
+		if err != nil {
+			fmt.Fprintf(errOut, "agents: enable raw terminal: %v\n", err)
+			return 1
+		}
+	}
+}
+
+func printInterruptHint(out io.Writer, e env) {
+	active := readActiveTask(e.cwd)
+	if active.Title != "" {
+		fmt.Fprintf(out, "Active task: %s\n", active.Title)
+	}
+	fmt.Fprintln(out, "To continue this session, run agents")
+}
+
+func readComposerLine(in *os.File, out io.Writer, e env) (string, error) {
+	var line []rune
+	renderedLines := 0
+	renderedLines = renderComposer(out, string(line), e.isTTY, renderedLines)
+	buf := make([]byte, 1)
+	for {
+		n, err := in.Read(buf)
+		if err != nil {
+			return "", err
+		}
+		if n == 0 {
+			continue
+		}
+		switch b := buf[0]; b {
+		case 3:
+			fmt.Fprint(out, "\r\n")
+			return "", errComposerInterrupted
+		case '\r', '\n':
+			fmt.Fprint(out, "\r\n")
+			return strings.TrimSpace(string(line)), nil
+		case '\t':
+			if completed, ok := completeSlashInput(string(line)); ok {
+				line = []rune(completed)
+			}
+		case 27:
+			pasted, ok, err := readBracketedPaste(in)
+			if err != nil {
+				return "", err
+			}
+			if ok {
+				line = append(line, []rune(normalizePastedText(pasted))...)
+			}
+		case 127, 8:
+			if len(line) > 0 {
+				line = line[:len(line)-1]
+			}
+		default:
+			if b >= 32 {
+				line = append(line, rune(b))
+			}
+		}
+		renderedLines = renderComposer(out, string(line), e.isTTY, renderedLines)
+	}
+}
+
+func renderComposer(out io.Writer, line string, color bool, previousExtraLines int) int {
+	fmt.Fprint(out, "\r\033[J")
+	fmt.Fprintf(out, "› %s", line)
+	suggestions := composerSuggestionLines(line, color)
+	for _, suggestion := range suggestions {
+		fmt.Fprintf(out, "\r\n%s", suggestion)
+	}
+	if len(suggestions) > 0 {
+		fmt.Fprintf(out, "\033[%dA", len(suggestions))
+	}
+	fmt.Fprint(out, "\r")
+	if width := 2 + len(line); width > 0 {
+		fmt.Fprintf(out, "\033[%dC", width)
+	}
+	return len(suggestions)
+}
+
+func composerSuggestionLines(line string, color bool) []string {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" || !strings.HasPrefix(trimmed, "/") || strings.Contains(trimmed, " ") {
+		return nil
+	}
+	matches := matchingSlashCommands(trimmed)
+	if len(matches) == 0 {
+		return []string{fmt.Sprintf("No slash commands match %q.", trimmed)}
+	}
+	if len(matches) == 1 && matches[0].Name == trimmed {
+		return nil
+	}
+	var lines []string
+	visible := matches
+	if len(visible) > liveSuggestionLimit {
+		visible = visible[:liveSuggestionLimit]
+	}
+	for _, command := range visible {
+		usage := command.Usage
+		description := command.Description
+		if color {
+			usage = "\x1b[36m" + usage + "\x1b[0m"
+			description = "\x1b[2m" + description + "\x1b[0m"
+		}
+		lines = append(lines, fmt.Sprintf("  %-42s %s", usage, description))
+	}
+	if hidden := len(matches) - len(visible); hidden > 0 {
+		lines = append(lines, fmt.Sprintf("  ... %d more; type more, press Tab for unique match, or ? for all", hidden))
+	}
+	return lines
+}
+
+func readBracketedPaste(in *os.File) (string, bool, error) {
+	seq := make([]byte, 5)
+	if _, err := io.ReadFull(in, seq); err != nil {
+		return "", false, err
+	}
+	if string(seq) != "[200~" {
+		return "", false, nil
+	}
+	var b strings.Builder
+	window := make([]byte, 0, 6)
+	buf := make([]byte, 1)
+	for {
+		if _, err := in.Read(buf); err != nil {
+			return "", false, err
+		}
+		window = append(window, buf[0])
+		if len(window) > 6 {
+			b.WriteByte(window[0])
+			window = window[1:]
+		}
+		if string(window) == "\x1b[201~" {
+			return b.String(), true, nil
+		}
+	}
+}
+
+func normalizePastedText(text string) string {
+	return strings.Join(strings.Fields(text), " ")
+}
+
+func completeSlashInput(line string) (string, bool) {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" || !strings.HasPrefix(trimmed, "/") || strings.Contains(trimmed, " ") {
+		return line, false
+	}
+	matches := matchingSlashCommands(trimmed)
+	if len(matches) != 1 {
+		return line, false
+	}
+	return matches[0].Name + " ", true
+}
+
+func parseCommandLine(line string) ([]string, error) {
+	var args []string
+	var b strings.Builder
+	inQuote := false
+	quote := rune(0)
+	escaped := false
+	for _, r := range line {
+		if escaped {
+			b.WriteRune(r)
+			escaped = false
+			continue
+		}
+		if r == '\\' {
+			escaped = true
+			continue
+		}
+		if inQuote {
+			if r == quote {
+				inQuote = false
+			} else {
+				b.WriteRune(r)
+			}
+			continue
+		}
+		if r == '"' || r == '\'' {
+			inQuote = true
+			quote = r
+			continue
+		}
+		if unicode.IsSpace(r) {
+			if b.Len() > 0 {
+				args = append(args, b.String())
+				b.Reset()
+			}
+			continue
+		}
+		b.WriteRune(r)
+	}
+	if escaped {
+		b.WriteRune('\\')
+	}
+	if inQuote {
+		return nil, fmt.Errorf("unterminated quote")
+	}
+	if b.Len() > 0 {
+		args = append(args, b.String())
+	}
+	return args, nil
+}
+
+func recordCoordinatorChat(e env, text string, out io.Writer) error {
+	task := readActiveTask(e.cwd)
+	if task.Path == "" {
+		opened, err := openTask(e, []string{coordinatorChatTitle(text)}, time.Now().UTC())
+		if err != nil {
+			return err
+		}
+		task = opened
+		if e.isTTY {
+			fmt.Fprintf(out, "started intake: %s\n", task.Title)
+		} else {
+			fmt.Fprintf(out, "started coordinator intake: %s\n", task.Title)
+			fmt.Fprintf(out, "task path: %s\n", task.Path)
+		}
+	}
+	handoff, err := addHandoff(e, []string{"--to", "coordinator", text}, time.Now().UTC())
+	if err != nil {
+		return err
+	}
+	if e.isTTY {
+		fmt.Fprintln(out, "sent to coordinator")
+	} else {
+		fmt.Fprintf(out, "sent to coordinator\n")
+		fmt.Fprintf(out, "handoff path: %s\n", handoff.Path)
+		fmt.Fprintf(out, "next: /run to ask the coordinator, or keep typing to add context\n")
+	}
+	return nil
+}
+
+func runCoordinatorChatResponse(e env, out io.Writer) error {
+	state, err := analyzeLoopState(e)
+	if err != nil {
+		return err
+	}
+	if state.NextRole != "coordinator" {
+		printLoopState(out, state)
+		return nil
+	}
+	agent, err := configuredAgent(e.cwd, state.NextRole)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(agent) == "" {
+		fmt.Fprintln(out, "coordinator: not configured")
+		fmt.Fprintln(out, "next: configure roles.coordinator in .agents/config.yml or use /run later")
+		return nil
+	}
+	fmt.Fprintln(out, "coordinator is responding...")
+	result, err := runConfiguredRoleWithOptions(e, state, roleRunOptions{LiveOutput: io.Discard})
+	if err != nil {
+		return err
+	}
+	reply := cleanInteractiveAgentOutput(result.Agent, result.AgentOutput)
+	if strings.TrimSpace(reply) != "" {
+		fmt.Fprintln(out)
+		fmt.Fprintln(out, strings.TrimRight(reply, "\n"))
+	}
+	printInteractiveRoleTransition(out, result)
+	return nil
+}
+
+func printInteractiveRoleTransition(out io.Writer, result roleRunResult) {
+	if result.After.NextRole == "" || result.After.NextRole == result.Before.NextRole {
+		return
+	}
+	fmt.Fprintf(out, "\nnext: %s\n", result.After.NextRole)
+}
+
+func coordinatorChatTitle(text string) string {
+	words := strings.Fields(text)
+	if len(words) == 0 {
+		return "Coordinator intake"
+	}
+	title := strings.Join(words, " ")
+	if len(title) > 60 {
+		title = strings.TrimSpace(title[:60])
+	}
+	if title == "" {
+		return "Coordinator intake"
+	}
+	return title
+}
+
+func printStatus(w io.Writer, e env, jsonOut bool) error {
+	trusted, err := isTrusted(e)
+	if err != nil {
+		return err
+	}
+	active := readActiveTask(e.cwd)
+	if jsonOut {
+		payload := statusJSON{
+			Workspace: e.cwd,
+			Trust:     trustStatus(trusted),
+		}
+		if active.Path != "" {
+			stats, err := readTaskStats(e.cwd, active.Path)
+			if err != nil {
+				return err
+			}
+			payload.ActiveTask = taskPayload(active, stats)
+		}
+		return writeJSON(w, payload)
+	}
+
+	fmt.Fprintf(w, "workspace: %s\n", e.cwd)
+	fmt.Fprintf(w, "trust: %s\n", trustStatus(trusted))
+	if active.Path == "" {
+		fmt.Fprintln(w, "active task: none")
+	} else {
+		fmt.Fprintf(w, "active task: %s\n", active.Title)
+		if active.Status != "" {
+			fmt.Fprintf(w, "task status: %s\n", active.Status)
+		}
+		fmt.Fprintf(w, "task path: %s\n", active.Path)
+		stats, err := readTaskStats(e.cwd, active.Path)
+		if err != nil {
+			return err
+		}
+		printTaskStats(w, stats)
+	}
+	return nil
+}
+
+type statusJSON struct {
+	Workspace  string    `json:"workspace"`
+	Trust      string    `json:"trust"`
+	ActiveTask *taskJSON `json:"active_task"`
+}
+
+type taskJSON struct {
+	Title    string       `json:"title"`
+	Status   string       `json:"status,omitempty"`
+	Path     string       `json:"path"`
+	Next     string       `json:"next,omitempty"`
+	Findings findingsJSON `json:"findings"`
+	Records  recordsJSON  `json:"records"`
+}
+
+type findingsJSON struct {
+	Open     int `json:"open"`
+	Fixed    int `json:"fixed"`
+	Verified int `json:"verified"`
+}
+
+type recordsJSON struct {
+	Decisions    int `json:"decisions"`
+	Handoffs     int `json:"handoffs"`
+	Verification int `json:"verification"`
+}
+
+type dispatchJSON struct {
+	Role       string    `json:"role"`
+	Agent      string    `json:"agent,omitempty"`
+	Configured bool      `json:"configured"`
+	Task       *taskJSON `json:"task"`
+	Action     string    `json:"action"`
+	Boundary   string    `json:"boundary,omitempty"`
+}
+
+type loopJSON struct {
+	Task       *taskJSON `json:"task"`
+	NextRole   string    `json:"next_role"`
+	NextAction string    `json:"next_action"`
+	Boundary   string    `json:"boundary,omitempty"`
+}
+
+type trustJSON struct {
+	Workspace string `json:"workspace"`
+	Trust     string `json:"trust"`
+	User      string `json:"user,omitempty"`
+	Host      string `json:"host,omitempty"`
+	GitRemote string `json:"git_remote,omitempty"`
+}
+
+func trustStatus(trusted bool) string {
+	if trusted {
+		return "trusted"
+	}
+	return "not trusted"
+}
+
+func taskPayload(task activeTask, stats taskStats) *taskJSON {
+	return &taskJSON{
+		Title:  task.Title,
+		Status: task.Status,
+		Path:   task.Path,
+		Next:   stats.Next,
+		Findings: findingsJSON{
+			Open:     stats.FindingsOpen,
+			Fixed:    stats.FindingsFixed,
+			Verified: stats.FindingsVerified,
+		},
+		Records: recordsJSON{
+			Decisions:    stats.Decisions,
+			Handoffs:     stats.Handoffs,
+			Verification: stats.Verification,
+		},
+	}
+}
+
+func writeJSON(w io.Writer, v any) error {
+	encoder := json.NewEncoder(w)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(v)
+}
+
+func parseJSONFlag(args []string) (bool, error) {
+	jsonOut := false
+	for _, arg := range args {
+		switch strings.TrimSpace(arg) {
+		case "":
+			continue
+		case "--json":
+			jsonOut = true
+		default:
+			return false, fmt.Errorf("unknown flag %s", arg)
+		}
+	}
+	return jsonOut, nil
+}
+
+func runTrustCommand(args []string, out, errOut io.Writer, e env) int {
+	jsonOut, err := parseJSONFlag(args)
+	if err != nil {
+		fmt.Fprintf(errOut, "agents: trust: %v\n", err)
+		return 2
+	}
+	record, err := trustWorkspace(e)
+	if err != nil {
+		fmt.Fprintf(errOut, "agents: trust: %v\n", err)
+		return 1
+	}
+	if jsonOut {
+		if err := writeJSON(out, trustPayload(e.cwd, record)); err != nil {
+			fmt.Fprintf(errOut, "agents: trust: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	fmt.Fprintf(out, "trusted: %s\n", e.cwd)
+	if record.GitRemote != "" {
+		fmt.Fprintf(out, "git remote: %s\n", record.GitRemote)
+	}
+	return 0
+}
+
+func trustPayload(cwd string, record trustedWorkspace) trustJSON {
+	return trustJSON{
+		Workspace: cwd,
+		Trust:     "trusted",
+		User:      record.User,
+		Host:      record.Host,
+		GitRemote: record.GitRemote,
+	}
+}
+
+type activeTask struct {
+	Path   string
+	Title  string
+	Status string
+}
+
+type taskStats struct {
+	Next             string
+	Decisions        int
+	Handoffs         int
+	LatestHandoffTo  string
+	Verification     int
+	FindingsOpen     int
+	FindingsFixed    int
+	FindingsVerified int
+}
+
+func readActiveTask(cwd string) activeTask {
+	data, err := os.ReadFile(filepath.Join(cwd, stateDir, "active"))
+	if err != nil {
+		return activeTask{}
+	}
+	activePath := strings.TrimSpace(string(data))
+	if activePath == "" {
+		return activeTask{}
+	}
+	cleanPath, ok := cleanActivePath(activePath)
+	if !ok {
+		return activeTask{}
+	}
+
+	task := activeTask{
+		Path:  cleanPath,
+		Title: cleanPath,
+	}
+	taskData, err := os.ReadFile(filepath.Join(cwd, stateDir, cleanPath, "task.md"))
+	if err != nil {
+		return task
+	}
+	title, status := parseTaskSummary(string(taskData))
+	if title != "" {
+		task.Title = title
+	}
+	task.Status = status
+	return task
+}
+
+func cleanActivePath(activePath string) (string, bool) {
+	cleaned := filepath.Clean(activePath)
+	if cleaned == "." || filepath.IsAbs(cleaned) {
+		return "", false
+	}
+	if cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	return cleaned, true
+}
+
+func parseTaskSummary(markdown string) (title, status string) {
+	for _, line := range strings.Split(markdown, "\n") {
+		t := strings.TrimSpace(line)
+		if title == "" && strings.HasPrefix(t, "# ") {
+			title = strings.TrimSpace(strings.TrimPrefix(t, "# "))
+			continue
+		}
+		if status == "" && strings.HasPrefix(strings.ToLower(t), "status:") {
+			status = strings.TrimSpace(t[len("status:"):])
+		}
+	}
+	return title, status
+}
+
+func runInitCommand(args []string, out, errOut io.Writer, e env) int {
+	mode, err := parseInitArgs(args)
+	if err != nil {
+		fmt.Fprintf(errOut, "agents: init: %v\n", err)
+		return 2
+	}
+	created, err := initWorkspace(e, mode)
+	if err != nil {
+		fmt.Fprintf(errOut, "agents: init: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(out, "initialized: %s\n", filepath.Join(e.cwd, stateDir))
+	fmt.Fprintf(out, "task state: %s\n", mode)
+	if created.Config {
+		fmt.Fprintln(out, "created: .agents/config.yml")
+	} else {
+		fmt.Fprintln(out, "kept: .agents/config.yml")
+	}
+	if created.Gitignore {
+		fmt.Fprintln(out, "updated: .gitignore")
+	}
+	return 0
+}
+
+type initCreated struct {
+	Config    bool
+	Gitignore bool
+}
+
+func parseInitArgs(args []string) (string, error) {
+	mode := "share"
+	for _, arg := range args {
+		switch strings.TrimSpace(arg) {
+		case "":
+			continue
+		case "--share":
+			mode = "share"
+		case "--local":
+			mode = "local"
+		default:
+			return "", fmt.Errorf("unknown flag %s", arg)
+		}
+	}
+	return mode, nil
+}
+
+func initWorkspace(e env, mode string) (initCreated, error) {
+	var created initCreated
+	statePath := filepath.Join(e.cwd, stateDir)
+	for _, dir := range []string{
+		statePath,
+		filepath.Join(statePath, "tasks"),
+		filepath.Join(statePath, "archive"),
+	} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return created, err
+		}
+	}
+	if err := ensureAgentsGitignore(statePath); err != nil {
+		return created, err
+	}
+	activePath := filepath.Join(statePath, "active")
+	if _, err := os.Stat(activePath); err != nil {
+		if os.IsNotExist(err) {
+			if err := os.WriteFile(activePath, []byte(""), 0o644); err != nil {
+				return created, err
+			}
+		} else {
+			return created, err
+		}
+	}
+	configPath := filepath.Join(statePath, "config.yml")
+	if _, err := os.Stat(configPath); err != nil {
+		if os.IsNotExist(err) {
+			if err := os.WriteFile(configPath, []byte(defaultConfig(mode)), 0o644); err != nil {
+				return created, err
+			}
+			created.Config = true
+		} else {
+			return created, err
+		}
+	}
+	if mode == "local" {
+		updated, err := ensureGitignoreLine(e.cwd, ".agents/")
+		if err != nil {
+			return created, err
+		}
+		created.Gitignore = updated
+	}
+	return created, nil
+}
+
+func ensureAgentsGitignore(statePath string) error {
+	path := filepath.Join(statePath, ".gitignore")
+	data, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	needed := []string{"runs/"}
+	existing := map[string]bool{}
+	for _, line := range strings.Split(string(data), "\n") {
+		existing[strings.TrimSpace(line)] = true
+	}
+	var b strings.Builder
+	b.Write(data)
+	for _, line := range needed {
+		if existing[line] {
+			continue
+		}
+		if b.Len() > 0 && !strings.HasSuffix(b.String(), "\n") {
+			b.WriteByte('\n')
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	return os.WriteFile(path, []byte(b.String()), 0o644)
+}
+
+func defaultConfig(mode string) string {
+	commitChunks := "true"
+	if mode == "local" {
+		commitChunks = "false"
+	}
+	return fmt.Sprintf(`version: 1
+storage:
+  commit_chunks: %s
+  cleanup_on_archive: true
+  cleanup_mode: summarize_then_prune
+  keep:
+    active_tasks: true
+    archived_summaries: true
+    decisions: promoted_only
+    findings: unresolved_only
+settings:
+  # Codex CLI: model examples: gpt-5.5, gpt-5.4, gpt-5-codex, codex-mini-latest
+  # Codex reasoning examples: minimal, low, medium, high, xhigh
+  codex_model: ""
+  codex_reasoning: ""
+  # Claude Code: model aliases: default, best, sonnet, opus, haiku, opusplan, sonnet[1m], opus[1m]
+  # Claude effort: low, medium, high, xhigh, max; supported levels depend on the selected model
+  claude_model: ""
+  claude_effort: ""
+  # Cursor Agent: run 'agent models' or 'cursor-agent --list-models' for account-specific choices
+  # Common examples from CLI help: gpt-5, claude-4.6-sonnet-medium, claude-4.6-sonnet-medium-thinking
+  cursor_model: ""
+roles:
+  implementer: agent
+  reviewer: codex
+  coordinator: codex
+`, commitChunks)
+}
+
+func ensureGitignoreLine(cwd, line string) (bool, error) {
+	path := filepath.Join(cwd, ".gitignore")
+	data, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return false, err
+	}
+	for _, existing := range strings.Split(string(data), "\n") {
+		if strings.TrimSpace(existing) == line {
+			return false, nil
+		}
+	}
+	var b strings.Builder
+	b.Write(data)
+	if len(data) > 0 && !strings.HasSuffix(string(data), "\n") {
+		b.WriteByte('\n')
+	}
+	b.WriteString(line)
+	b.WriteByte('\n')
+	return true, os.WriteFile(path, []byte(b.String()), 0o644)
+}
+
+func readTaskStats(cwd, activePath string) (taskStats, error) {
+	taskDir := filepath.Join(cwd, stateDir, activePath)
+	decisions, err := countMarkdownFiles(filepath.Join(taskDir, "decisions"))
+	if err != nil {
+		return taskStats{}, err
+	}
+	handoffs, err := countMarkdownFiles(filepath.Join(taskDir, "handoffs"))
+	if err != nil {
+		return taskStats{}, err
+	}
+	latestHandoffTo, err := readLatestHandoffTo(filepath.Join(taskDir, "handoffs"))
+	if err != nil {
+		return taskStats{}, err
+	}
+	verification, err := countMarkdownFiles(filepath.Join(taskDir, "verification"))
+	if err != nil {
+		return taskStats{}, err
+	}
+	openFindings, fixedFindings, verifiedFindings, err := countFindingStatuses(filepath.Join(taskDir, "findings"))
+	if err != nil {
+		return taskStats{}, err
+	}
+	next, err := readNextLine(filepath.Join(taskDir, "next.md"))
+	if err != nil {
+		return taskStats{}, err
+	}
+	return taskStats{
+		Next:             next,
+		Decisions:        decisions,
+		Handoffs:         handoffs,
+		LatestHandoffTo:  latestHandoffTo,
+		Verification:     verification,
+		FindingsOpen:     openFindings,
+		FindingsFixed:    fixedFindings,
+		FindingsVerified: verifiedFindings,
+	}, nil
+}
+
+func printTaskStats(w io.Writer, stats taskStats) {
+	if stats.Next != "" {
+		fmt.Fprintf(w, "next: %s\n", stats.Next)
+	}
+	fmt.Fprintf(w, "findings: open=%d fixed=%d verified=%d\n", stats.FindingsOpen, stats.FindingsFixed, stats.FindingsVerified)
+	fmt.Fprintf(w, "records: decisions=%d handoffs=%d verification=%d\n", stats.Decisions, stats.Handoffs, stats.Verification)
+}
+
+func readNextLine(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		t := strings.TrimSpace(line)
+		if t == "" || strings.HasPrefix(t, "#") {
+			continue
+		}
+		return strings.TrimSpace(strings.TrimPrefix(t, "-")), nil
+	}
+	return "", nil
+}
+
+func readLatestHandoffTo(dir string) (string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	latest := ""
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md") {
+			continue
+		}
+		if latest == "" || entry.Name() > latest {
+			latest = entry.Name()
+		}
+	}
+	if latest == "" {
+		return "", nil
+	}
+	data, err := os.ReadFile(filepath.Join(dir, latest))
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(strings.ToLower(trimmed), "to:") {
+			return strings.ToLower(strings.TrimSpace(strings.TrimPrefix(trimmed, "To:"))), nil
+		}
+	}
+	return "", nil
+}
+
+func runStartCommand(args []string, out, errOut io.Writer, e env) int {
+	title, ref, text, err := parseStartArgs(args)
+	if err != nil {
+		fmt.Fprintf(errOut, "agents: start: %v\n", err)
+		return 2
+	}
+	taskArgs := []string{title}
+	if ref != "" {
+		taskArgs = append(taskArgs, "--ref", ref)
+	}
+	task, err := openTask(e, taskArgs, time.Now().UTC())
+	if err != nil {
+		fmt.Fprintf(errOut, "agents: start: %v\n", err)
+		return 1
+	}
+	handoff, err := addHandoff(e, []string{"--to", "implementer", text}, time.Now().UTC())
+	if err != nil {
+		fmt.Fprintf(errOut, "agents: start: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(out, "started task: %s\n", task.Title)
+	fmt.Fprintf(out, "task path: %s\n", task.Path)
+	fmt.Fprintf(out, "handoff to: %s\n", handoff.To)
+	fmt.Fprintf(out, "handoff path: %s\n", handoff.Path)
+	return 0
+}
+
+func parseStartArgs(args []string) (title, ref, text string, err error) {
+	for i := 0; i < len(args); i++ {
+		arg := strings.TrimSpace(args[i])
+		switch arg {
+		case "":
+			continue
+		case "--ref":
+			if i+1 >= len(args) || strings.TrimSpace(args[i+1]) == "" {
+				return "", "", "", fmt.Errorf("--ref requires a value")
+			}
+			ref = strings.TrimSpace(args[i+1])
+			i++
+		default:
+			if strings.HasPrefix(arg, "--") {
+				return "", "", "", fmt.Errorf("unknown flag %s", arg)
+			}
+			if title == "" {
+				title = arg
+				continue
+			}
+			if text == "" {
+				text = arg
+				continue
+			}
+			return "", "", "", fmt.Errorf("start accepts exactly one title and one instruction")
+		}
+	}
+	if title == "" {
+		return "", "", "", fmt.Errorf("task title is required")
+	}
+	if text == "" {
+		return "", "", "", fmt.Errorf("instruction text is required")
+	}
+	return title, ref, text, nil
+}
+
+func runTaskCommand(args []string, out, errOut io.Writer, e env) int {
+	if len(args) == 0 {
+		fmt.Fprintln(errOut, "agents: task command requires a subcommand")
+		fmt.Fprintln(errOut, "Run `agents help` for usage.")
+		return 2
+	}
+
+	switch args[0] {
+	case "open":
+		task, err := openTask(e, args[1:], time.Now().UTC())
+		if err != nil {
+			fmt.Fprintf(errOut, "agents: task open: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(out, "opened task: %s\n", task.Title)
+		fmt.Fprintf(out, "task path: %s\n", task.Path)
+		return 0
+	case "use":
+		if len(args) != 2 {
+			fmt.Fprintln(errOut, "agents: task use requires exactly one task path")
+			return 2
+		}
+		task, err := useTask(e, args[1])
+		if err != nil {
+			fmt.Fprintf(errOut, "agents: task use: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(out, "active task: %s\n", task.Title)
+		fmt.Fprintf(out, "task path: %s\n", task.Path)
+		return 0
+	default:
+		fmt.Fprintf(errOut, "agents: unknown task command: %s\n", args[0])
+		return 2
+	}
+}
+
+func openTask(e env, args []string, now time.Time) (activeTask, error) {
+	title, ref, err := parseTaskOpenArgs(args)
+	if err != nil {
+		return activeTask{}, err
+	}
+	date := now.Format("2006-01-02")
+	seq, err := nextTaskSequence(filepath.Join(e.cwd, stateDir, "tasks"), date)
+	if err != nil {
+		return activeTask{}, err
+	}
+
+	slug := slugify(title)
+	if slug == "" {
+		slug = "task"
+	}
+	dirName := fmt.Sprintf("%s-%03d-%s", date, seq, slug)
+	if ref != "" {
+		dirName += "--" + slugify(ref)
+	}
+	cleanPath := filepath.Join("tasks", dirName)
+	taskDir := filepath.Join(e.cwd, stateDir, cleanPath)
+	if err := os.MkdirAll(taskDir, 0o755); err != nil {
+		return activeTask{}, err
+	}
+	if err := writeTaskFiles(taskDir, title, ref, date); err != nil {
+		return activeTask{}, err
+	}
+	if err := writeActiveTask(e.cwd, cleanPath); err != nil {
+		return activeTask{}, err
+	}
+
+	return activeTask{Path: cleanPath, Title: title, Status: "active"}, nil
+}
+
+func parseTaskOpenArgs(args []string) (title, ref string, err error) {
+	for i := 0; i < len(args); i++ {
+		arg := strings.TrimSpace(args[i])
+		switch arg {
+		case "":
+			continue
+		case "--ref":
+			if i+1 >= len(args) || strings.TrimSpace(args[i+1]) == "" {
+				return "", "", fmt.Errorf("--ref requires a value")
+			}
+			ref = strings.TrimSpace(args[i+1])
+			i++
+		default:
+			if strings.HasPrefix(arg, "--") {
+				return "", "", fmt.Errorf("unknown flag %s", arg)
+			}
+			if title != "" {
+				return "", "", fmt.Errorf("task title must be one argument")
+			}
+			title = arg
+		}
+	}
+	if title == "" {
+		return "", "", fmt.Errorf("task title is required")
+	}
+	return title, ref, nil
+}
+
+func nextTaskSequence(tasksDir, date string) (int, error) {
+	entries, err := os.ReadDir(tasksDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 1, nil
+		}
+		return 0, err
+	}
+	maxSeq := 0
+	prefix := date + "-"
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), prefix) {
+			continue
+		}
+		rest := strings.TrimPrefix(entry.Name(), prefix)
+		if len(rest) < 3 {
+			continue
+		}
+		seq, err := strconv.Atoi(rest[:3])
+		if err == nil && seq > maxSeq {
+			maxSeq = seq
+		}
+	}
+	return maxSeq + 1, nil
+}
+
+func writeTaskFiles(taskDir, title, ref, date string) error {
+	var task strings.Builder
+	fmt.Fprintf(&task, "# %s\n\n", title)
+	if ref != "" {
+		fmt.Fprintf(&task, "ref: %s\n", ref)
+	}
+	fmt.Fprintf(&task, "date: %s\n", date)
+	fmt.Fprintln(&task, "status: active")
+
+	if err := os.WriteFile(filepath.Join(taskDir, "task.md"), []byte(task.String()), 0o644); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(taskDir, "scope.md"), []byte("# Scope\n\n- define scope\n"), 0o644); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(taskDir, "status.md"), []byte("# Status\n\nStarting task.\n"), 0o644); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(taskDir, "next.md"), []byte("# Next\n\n- decide next step\n"), 0o644)
+}
+
+func useTask(e env, activePath string) (activeTask, error) {
+	cleanPath, ok := cleanActivePath(activePath)
+	if !ok {
+		return activeTask{}, fmt.Errorf("task path must stay inside .agents")
+	}
+	taskMarkdown := filepath.Join(e.cwd, stateDir, cleanPath, "task.md")
+	if _, err := os.Stat(taskMarkdown); err != nil {
+		if os.IsNotExist(err) {
+			return activeTask{}, fmt.Errorf("task not found: %s", cleanPath)
+		}
+		return activeTask{}, err
+	}
+	if err := writeActiveTask(e.cwd, cleanPath); err != nil {
+		return activeTask{}, err
+	}
+	task := readActiveTask(e.cwd)
+	if task.Path == "" {
+		return activeTask{}, fmt.Errorf("could not read active task after switch")
+	}
+	return task, nil
+}
+
+func writeActiveTask(cwd, cleanPath string) error {
+	activeFile := filepath.Join(cwd, stateDir, "active")
+	if err := os.MkdirAll(filepath.Dir(activeFile), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(activeFile, []byte(cleanPath+"\n"), 0o644)
+}
+
+func slugify(s string) string {
+	var b strings.Builder
+	lastDash := false
+	for _, r := range strings.ToLower(s) {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			b.WriteRune(r)
+			lastDash = false
+			continue
+		}
+		if !lastDash && b.Len() > 0 {
+			b.WriteByte('-')
+			lastDash = true
+		}
+	}
+	return strings.Trim(b.String(), "-")
+}
+
+func runDecisionCommand(args []string, out, errOut io.Writer, e env) int {
+	if len(args) == 0 {
+		fmt.Fprintln(errOut, "agents: decision command requires a subcommand")
+		return 2
+	}
+	switch args[0] {
+	case "add":
+		record, err := addDecision(e, args[1:], time.Now().UTC())
+		if err != nil {
+			fmt.Fprintf(errOut, "agents: decision add: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(out, "decision: %s\n", record.Title)
+		fmt.Fprintf(out, "path: %s\n", record.Path)
+		return 0
+	default:
+		fmt.Fprintf(errOut, "agents: unknown decision command: %s\n", args[0])
+		return 2
+	}
+}
+
+func runHandoffCommand(args []string, out, errOut io.Writer, e env) int {
+	record, err := addHandoff(e, args, time.Now().UTC())
+	if err != nil {
+		fmt.Fprintf(errOut, "agents: handoff: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(out, "handoff to: %s\n", record.To)
+	fmt.Fprintf(out, "path: %s\n", record.Path)
+	return 0
+}
+
+type chunkRecord struct {
+	Path  string
+	Title string
+	To    string
+}
+
+func addDecision(e env, args []string, now time.Time) (chunkRecord, error) {
+	text, err := parseSingleTextArg(args, "decision text")
+	if err != nil {
+		return chunkRecord{}, err
+	}
+	title := text
+	if len(title) > 80 {
+		title = strings.TrimSpace(title[:80])
+	}
+	body := fmt.Sprintf("# Decision: %s\n\nStatus: proposed\n\n%s\n", title, text)
+	record, err := writeActiveTaskChunk(e, "decisions", title, body, now)
+	if err != nil {
+		return chunkRecord{}, err
+	}
+	return record, nil
+}
+
+func addHandoff(e env, args []string, now time.Time) (chunkRecord, error) {
+	to, text, err := parseHandoffArgs(args)
+	if err != nil {
+		return chunkRecord{}, err
+	}
+	title := "Handoff to " + to
+	body := fmt.Sprintf("# Handoff: %s\n\nTo: %s\n\n%s\n", to, to, text)
+	record, err := writeActiveTaskChunk(e, "handoffs", title, body, now)
+	if err != nil {
+		return chunkRecord{}, err
+	}
+	record.To = to
+	return record, nil
+}
+
+func parseSingleTextArg(args []string, name string) (string, error) {
+	if len(args) != 1 || strings.TrimSpace(args[0]) == "" {
+		return "", fmt.Errorf("%s must be one argument", name)
+	}
+	return strings.TrimSpace(args[0]), nil
+}
+
+func parseHandoffArgs(args []string) (to, text string, err error) {
+	for i := 0; i < len(args); i++ {
+		arg := strings.TrimSpace(args[i])
+		switch arg {
+		case "":
+			continue
+		case "--to":
+			if i+1 >= len(args) || strings.TrimSpace(args[i+1]) == "" {
+				return "", "", fmt.Errorf("--to requires a role")
+			}
+			to = strings.TrimSpace(args[i+1])
+			i++
+		default:
+			if strings.HasPrefix(arg, "--") {
+				return "", "", fmt.Errorf("unknown flag %s", arg)
+			}
+			if text != "" {
+				return "", "", fmt.Errorf("handoff text must be one argument")
+			}
+			text = arg
+		}
+	}
+	if to == "" {
+		return "", "", fmt.Errorf("--to is required")
+	}
+	if text == "" {
+		return "", "", fmt.Errorf("handoff text is required")
+	}
+	return to, text, nil
+}
+
+func writeActiveTaskChunk(e env, kind, title, body string, now time.Time) (chunkRecord, error) {
+	active := readActiveTask(e.cwd)
+	if active.Path == "" {
+		return chunkRecord{}, fmt.Errorf("no active task")
+	}
+	taskDir := filepath.Join(e.cwd, stateDir, active.Path)
+	if _, err := os.Stat(filepath.Join(taskDir, "task.md")); err != nil {
+		if os.IsNotExist(err) {
+			return chunkRecord{}, fmt.Errorf("active task not found: %s", active.Path)
+		}
+		return chunkRecord{}, err
+	}
+
+	dir := filepath.Join(taskDir, kind)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return chunkRecord{}, err
+	}
+	stamp := now.Format("2006-01-02T150405Z")
+	name := stamp + "-" + slugify(title)
+	if name == stamp+"-" {
+		name += "note"
+	}
+	name, err := uniqueChunkName(dir, name)
+	if err != nil {
+		return chunkRecord{}, err
+	}
+	relPath := filepath.Join(active.Path, kind, name+".md")
+	path := filepath.Join(e.cwd, stateDir, relPath)
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		return chunkRecord{}, err
+	}
+	return chunkRecord{Path: relPath, Title: title}, nil
+}
+
+func uniqueChunkName(dir, base string) (string, error) {
+	name := base
+	for i := 2; ; i++ {
+		path := filepath.Join(dir, name+".md")
+		if _, err := os.Stat(path); err != nil {
+			if os.IsNotExist(err) {
+				return name, nil
+			}
+			return "", err
+		}
+		name = fmt.Sprintf("%s-%d", base, i)
+	}
+}
+
+func runFindingCommand(args []string, out, errOut io.Writer, e env) int {
+	if len(args) == 0 {
+		fmt.Fprintln(errOut, "agents: finding command requires a subcommand")
+		return 2
+	}
+	switch args[0] {
+	case "add":
+		record, err := addFinding(e, args[1:], time.Now().UTC())
+		if err != nil {
+			fmt.Fprintf(errOut, "agents: finding add: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(out, "finding: %s\n", record.Title)
+		fmt.Fprintf(out, "path: %s\n", record.Path)
+		return 0
+	case "fix":
+		record, err := updateFindingStatus(e, args[1:], "fixed", "Fixed", time.Now().UTC())
+		if err != nil {
+			fmt.Fprintf(errOut, "agents: finding fix: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(out, "fixed finding: %s\n", record.Path)
+		return 0
+	case "verify":
+		record, err := updateFindingStatus(e, args[1:], "verified", "Verification", time.Now().UTC())
+		if err != nil {
+			fmt.Fprintf(errOut, "agents: finding verify: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(out, "verified finding: %s\n", record.Path)
+		return 0
+	default:
+		fmt.Fprintf(errOut, "agents: unknown finding command: %s\n", args[0])
+		return 2
+	}
+}
+
+func addFinding(e env, args []string, now time.Time) (chunkRecord, error) {
+	text, severity, err := parseFindingAddArgs(args)
+	if err != nil {
+		return chunkRecord{}, err
+	}
+	title := text
+	if len(title) > 80 {
+		title = strings.TrimSpace(title[:80])
+	}
+	body := fmt.Sprintf("# Finding: %s\n\nStatus: open\nSeverity: %s\n\n%s\n", title, severity, text)
+	return writeActiveTaskChunk(e, "findings", title, body, now)
+}
+
+func parseFindingAddArgs(args []string) (text, severity string, err error) {
+	severity = "medium"
+	for i := 0; i < len(args); i++ {
+		arg := strings.TrimSpace(args[i])
+		switch arg {
+		case "":
+			continue
+		case "--severity":
+			if i+1 >= len(args) || strings.TrimSpace(args[i+1]) == "" {
+				return "", "", fmt.Errorf("--severity requires a value")
+			}
+			severity = strings.ToLower(strings.TrimSpace(args[i+1]))
+			if severity != "low" && severity != "medium" && severity != "high" {
+				return "", "", fmt.Errorf("severity must be low, medium, or high")
+			}
+			i++
+		default:
+			if strings.HasPrefix(arg, "--") {
+				return "", "", fmt.Errorf("unknown flag %s", arg)
+			}
+			if text != "" {
+				return "", "", fmt.Errorf("finding text must be one argument")
+			}
+			text = arg
+		}
+	}
+	if text == "" {
+		return "", "", fmt.Errorf("finding text is required")
+	}
+	return text, severity, nil
+}
+
+func updateFindingStatus(e env, args []string, status, section string, now time.Time) (chunkRecord, error) {
+	findingArg, err := parseSingleTextArg(args, "finding path")
+	if err != nil {
+		return chunkRecord{}, err
+	}
+	active := readActiveTask(e.cwd)
+	if active.Path == "" {
+		return chunkRecord{}, fmt.Errorf("no active task")
+	}
+	relPath, path, err := resolveFindingPath(e, active.Path, findingArg)
+	if err != nil {
+		return chunkRecord{}, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return chunkRecord{}, err
+	}
+	updated := replaceStatusLine(string(data), status)
+	var b strings.Builder
+	b.WriteString(strings.TrimRight(updated, "\n"))
+	fmt.Fprintf(&b, "\n\n## %s\n\nRecorded at: %s\n", section, now.Format(time.RFC3339))
+	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
+		return chunkRecord{}, err
+	}
+	return chunkRecord{Path: relPath}, nil
+}
+
+func resolveFindingPath(e env, activePath, findingArg string) (relPath, absPath string, err error) {
+	cleaned := filepath.Clean(strings.TrimSpace(findingArg))
+	if cleaned == "." || filepath.IsAbs(cleaned) || cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
+		return "", "", fmt.Errorf("finding path must stay inside active task findings")
+	}
+	if !strings.HasSuffix(cleaned, ".md") {
+		cleaned += ".md"
+	}
+	if strings.Contains(cleaned, string(filepath.Separator)) {
+		cleaned, ok := cleanActivePath(cleaned)
+		if !ok {
+			return "", "", fmt.Errorf("finding path must stay inside active task findings")
+		}
+		prefix := filepath.Join(activePath, "findings") + string(filepath.Separator)
+		if !strings.HasPrefix(cleaned, prefix) {
+			return "", "", fmt.Errorf("finding path must stay inside active task findings")
+		}
+		relPath = cleaned
+	} else {
+		relPath = filepath.Join(activePath, "findings", cleaned)
+	}
+	absPath = filepath.Join(e.cwd, stateDir, relPath)
+	if _, err := os.Stat(absPath); err != nil {
+		if os.IsNotExist(err) {
+			return "", "", fmt.Errorf("finding not found: %s", findingArg)
+		}
+		return "", "", err
+	}
+	return relPath, absPath, nil
+}
+
+func replaceStatusLine(markdown, status string) string {
+	lines := strings.Split(markdown, "\n")
+	replaced := false
+	for i, line := range lines {
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(line)), "status:") {
+			lines[i] = "Status: " + status
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		return "Status: " + status + "\n" + markdown
+	}
+	return strings.Join(lines, "\n")
+}
+
+func runArchiveCommand(args []string, out, errOut io.Writer, e env) int {
+	if len(args) != 0 {
+		fmt.Fprintln(errOut, "agents: archive does not accept arguments yet")
+		return 2
+	}
+	record, err := archiveActiveTask(e, time.Now().UTC())
+	if err != nil {
+		fmt.Fprintf(errOut, "agents: archive: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(out, "archived task: %s\n", record.Title)
+	fmt.Fprintf(out, "archive path: %s\n", record.Path)
+	return 0
+}
+
+func archiveActiveTask(e env, now time.Time) (chunkRecord, error) {
+	active := readActiveTask(e.cwd)
+	if active.Path == "" {
+		return chunkRecord{}, fmt.Errorf("no active task")
+	}
+	taskDir := filepath.Join(e.cwd, stateDir, active.Path)
+	if _, err := os.Stat(filepath.Join(taskDir, "task.md")); err != nil {
+		if os.IsNotExist(err) {
+			return chunkRecord{}, fmt.Errorf("active task not found: %s", active.Path)
+		}
+		return chunkRecord{}, err
+	}
+
+	archiveRel := filepath.Join("archive", filepath.Base(active.Path))
+	archiveDir := filepath.Join(e.cwd, stateDir, archiveRel)
+	if err := os.MkdirAll(archiveDir, 0o755); err != nil {
+		return chunkRecord{}, err
+	}
+	if err := writeArchiveSummary(taskDir, archiveDir, active, now); err != nil {
+		return chunkRecord{}, err
+	}
+	if err := copyMarkdownDir(filepath.Join(taskDir, "decisions"), filepath.Join(archiveDir, "decisions"), nil); err != nil {
+		return chunkRecord{}, err
+	}
+	if err := copyMarkdownDir(filepath.Join(taskDir, "findings"), filepath.Join(archiveDir, "findings"), shouldKeepArchivedFinding); err != nil {
+		return chunkRecord{}, err
+	}
+	if err := os.RemoveAll(taskDir); err != nil {
+		return chunkRecord{}, err
+	}
+	if err := clearActiveTask(e.cwd); err != nil {
+		return chunkRecord{}, err
+	}
+	return chunkRecord{Path: archiveRel, Title: active.Title}, nil
+}
+
+func writeArchiveSummary(taskDir, archiveDir string, active activeTask, now time.Time) error {
+	decisionCount, err := countMarkdownFiles(filepath.Join(taskDir, "decisions"))
+	if err != nil {
+		return err
+	}
+	handoffCount, err := countMarkdownFiles(filepath.Join(taskDir, "handoffs"))
+	if err != nil {
+		return err
+	}
+	verificationCount, err := countMarkdownFiles(filepath.Join(taskDir, "verification"))
+	if err != nil {
+		return err
+	}
+	openFindings, fixedFindings, verifiedFindings, err := countFindingStatuses(filepath.Join(taskDir, "findings"))
+	if err != nil {
+		return err
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "# %s\n\n", active.Title)
+	fmt.Fprintln(&b, "status: archived")
+	if active.Status != "" {
+		fmt.Fprintf(&b, "previous_status: %s\n", active.Status)
+	}
+	fmt.Fprintf(&b, "archived_at: %s\n", now.Format(time.RFC3339))
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "Summary:")
+	fmt.Fprintf(&b, "- decisions: %d\n", decisionCount)
+	fmt.Fprintf(&b, "- handoffs: %d\n", handoffCount)
+	fmt.Fprintf(&b, "- verification records: %d\n", verificationCount)
+	fmt.Fprintf(&b, "- findings open: %d\n", openFindings)
+	fmt.Fprintf(&b, "- findings fixed: %d\n", fixedFindings)
+	fmt.Fprintf(&b, "- findings verified: %d\n", verifiedFindings)
+	fmt.Fprintln(&b)
+	appendArchiveSection(&b, "Scope", filepath.Join(taskDir, "scope.md"))
+	appendArchiveSection(&b, "Final Status", filepath.Join(taskDir, "status.md"))
+	fmt.Fprintln(&b, "Detailed transient chunks remain available in git history.")
+	return os.WriteFile(filepath.Join(archiveDir, "summary.md"), []byte(b.String()), 0o644)
+}
+
+func appendArchiveSection(b *strings.Builder, title, path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	body := strings.TrimSpace(stripFirstMarkdownHeading(string(data)))
+	if body == "" {
+		return
+	}
+	fmt.Fprintf(b, "## %s\n\n", title)
+	fmt.Fprintln(b, body)
+	fmt.Fprintln(b)
+}
+
+func stripFirstMarkdownHeading(markdown string) string {
+	lines := strings.Split(markdown, "\n")
+	if len(lines) == 0 {
+		return markdown
+	}
+	if strings.HasPrefix(strings.TrimSpace(lines[0]), "# ") {
+		return strings.Join(lines[1:], "\n")
+	}
+	return markdown
+}
+
+func countMarkdownFiles(dir string) (int, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	count := 0
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".md") {
+			count++
+		}
+	}
+	return count, nil
+}
+
+func countFindingStatuses(dir string) (openCount, fixedCount, verifiedCount int, err error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, 0, 0, nil
+		}
+		return 0, 0, 0, err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			return 0, 0, 0, err
+		}
+		switch findingStatus(string(data)) {
+		case "verified":
+			verifiedCount++
+		case "fixed":
+			fixedCount++
+		default:
+			openCount++
+		}
+	}
+	return openCount, fixedCount, verifiedCount, nil
+}
+
+func findingStatus(markdown string) string {
+	for _, line := range strings.Split(markdown, "\n") {
+		t := strings.TrimSpace(line)
+		if strings.HasPrefix(strings.ToLower(t), "status:") {
+			return strings.ToLower(strings.TrimSpace(t[len("status:"):]))
+		}
+	}
+	return "open"
+}
+
+func copyMarkdownDir(src, dst string, keep func(string) bool) error {
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	wrote := false
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(src, entry.Name()))
+		if err != nil {
+			return err
+		}
+		if keep != nil && !keep(string(data)) {
+			continue
+		}
+		if !wrote {
+			if err := os.MkdirAll(dst, 0o755); err != nil {
+				return err
+			}
+			wrote = true
+		}
+		if err := os.WriteFile(filepath.Join(dst, entry.Name()), data, 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func shouldKeepArchivedFinding(markdown string) bool {
+	return findingStatus(markdown) != "verified"
+}
+
+func clearActiveTask(cwd string) error {
+	activeFile := filepath.Join(cwd, stateDir, "active")
+	if err := os.MkdirAll(filepath.Dir(activeFile), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(activeFile, []byte(""), 0o644)
+}
+
+func runDispatchCommand(args []string, out, errOut io.Writer, e env) int {
+	role, jsonOut, err := parseDispatchArgs(args)
+	if err != nil {
+		fmt.Fprintf(errOut, "agents: dispatch: %v\n", err)
+		return 2
+	}
+	if role == "" {
+		fmt.Fprintln(errOut, "agents: dispatch requires exactly one role")
+		return 2
+	}
+	packet, err := dispatchPacket(e, role)
+	if err != nil {
+		fmt.Fprintf(errOut, "agents: dispatch: %v\n", err)
+		return 1
+	}
+	if jsonOut {
+		if err := writeJSON(out, dispatchPayload(packet)); err != nil {
+			fmt.Fprintf(errOut, "agents: dispatch: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	printDispatchPacket(out, packet)
+	return 0
+}
+
+func runLoopCommand(args []string, out, errOut io.Writer, e env) int {
+	jsonOut, err := parseJSONFlag(args)
+	if err != nil {
+		fmt.Fprintf(errOut, "agents: run: %v\n", err)
+		return 2
+	}
+	state, err := analyzeLoopState(e)
+	if err != nil {
+		fmt.Fprintf(errOut, "agents: run: %v\n", err)
+		return 1
+	}
+	if jsonOut {
+		if err := writeJSON(out, loopPayload(state)); err != nil {
+			fmt.Fprintf(errOut, "agents: run: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+	if state.NextRole == "human" {
+		printLoopState(out, state)
+		return 0
+	}
+	agent, err := configuredAgent(e.cwd, state.NextRole)
+	if err != nil {
+		fmt.Fprintf(errOut, "agents: run: %v\n", err)
+		return 1
+	}
+	if strings.TrimSpace(agent) == "" {
+		printLoopState(out, state)
+		fmt.Fprintf(out, "agent: not configured for %s\n", state.NextRole)
+		return 0
+	}
+	result, err := runConfiguredRole(e, state, out)
+	if err != nil {
+		fmt.Fprintf(errOut, "agents: run: %v\n", err)
+		return 1
+	}
+	printRoleRunResult(out, result)
+	return 0
+}
+
+func parseDispatchArgs(args []string) (role string, jsonOut bool, err error) {
+	for _, arg := range args {
+		trimmed := strings.TrimSpace(arg)
+		switch trimmed {
+		case "":
+			continue
+		case "--json":
+			jsonOut = true
+		default:
+			if strings.HasPrefix(trimmed, "--") {
+				return "", false, fmt.Errorf("unknown flag %s", trimmed)
+			}
+			if role != "" {
+				return "", false, fmt.Errorf("dispatch requires exactly one role")
+			}
+			role = strings.ToLower(trimmed)
+		}
+	}
+	return role, jsonOut, nil
+}
+
+type dispatchInfo struct {
+	Role     string
+	Agent    string
+	Task     activeTask
+	Stats    taskStats
+	Action   string
+	Boundary string
+}
+
+type loopState struct {
+	Task       activeTask
+	Stats      taskStats
+	NextRole   string
+	NextAction string
+	Boundary   string
+}
+
+type roleRunResult struct {
+	Role         string
+	Agent        string
+	Command      string
+	PromptPath   string
+	LogPath      string
+	Before       loopState
+	After        loopState
+	AgentOutput  string
+	AgentSkipped bool
+}
+
+type roleRunOptions struct {
+	ShowRunHeader bool
+	LiveOutput    io.Writer
+}
+
+type runArtifactPaths struct {
+	ID     string
+	Prompt string
+	Log    string
+}
+
+func dispatchPacket(e env, role string) (dispatchInfo, error) {
+	if role != "implementer" && role != "reviewer" && role != "coordinator" {
+		return dispatchInfo{}, fmt.Errorf("unknown role: %s", role)
+	}
+	state, err := analyzeLoopState(e)
+	if err != nil {
+		return dispatchInfo{}, err
+	}
+	config, err := readConfig(e.cwd)
+	if err != nil {
+		return dispatchInfo{}, err
+	}
+	info := dispatchInfo{
+		Role:  role,
+		Agent: config.Roles[role],
+		Task:  state.Task,
+		Stats: state.Stats,
+	}
+	switch role {
+	case "implementer":
+		if state.Stats.FindingsOpen > 0 {
+			info.Action = "fix open findings, run relevant checks, then write a handoff"
+		} else if state.Stats.LatestHandoffTo == "implementer" {
+			info.Action = "act on latest handoff, run relevant checks, then write a handoff to reviewer"
+		} else {
+			info.Action = "implement the next task step, run relevant checks, then write a handoff"
+		}
+	case "reviewer":
+		if state.Stats.LatestHandoffTo != "reviewer" {
+			info.Action = "wait for an implementer handoff before reviewing"
+			info.Boundary = "handoff required"
+		} else {
+			info.Action = "review code, tests, and task chunks; add findings or verify fixes"
+		}
+	case "coordinator":
+		info.Action = "summarize task state, route the next role, and protect human approval boundaries"
+	}
+	return info, nil
+}
+
+func analyzeLoopState(e env) (loopState, error) {
+	active := readActiveTask(e.cwd)
+	if active.Path == "" {
+		return loopState{}, fmt.Errorf("no active task")
+	}
+	stats, err := readTaskStats(e.cwd, active.Path)
+	if err != nil {
+		return loopState{}, err
+	}
+	state := loopState{Task: active, Stats: stats}
+	switch {
+	case stats.FindingsOpen > 0:
+		state.NextRole = "implementer"
+		state.NextAction = "fix open findings"
+	case stats.FindingsFixed > 0:
+		state.NextRole = "reviewer"
+		state.NextAction = "verify fixed findings independently"
+	case stats.LatestHandoffTo == "reviewer":
+		state.NextRole = "reviewer"
+		state.NextAction = "review latest handoff"
+	case stats.LatestHandoffTo == "implementer":
+		state.NextRole = "implementer"
+		state.NextAction = "act on latest handoff"
+	case stats.LatestHandoffTo == "coordinator":
+		state.NextRole = "coordinator"
+		state.NextAction = "continue intake and planning"
+	case stats.Verification > 0 && stats.FindingsOpen == 0 && stats.FindingsFixed == 0:
+		state.NextRole = "human"
+		state.NextAction = "approve archive, commit, or next task"
+		state.Boundary = "human approval required"
+	default:
+		state.NextRole = "implementer"
+		state.NextAction = "start or continue implementation"
+	}
+	return state, nil
+}
+
+func runConfiguredRole(e env, state loopState, out io.Writer) (roleRunResult, error) {
+	return runConfiguredRoleWithOptions(e, state, roleRunOptions{ShowRunHeader: true, LiveOutput: out})
+}
+
+func runConfiguredRoleWithOptions(e env, state loopState, options roleRunOptions) (roleRunResult, error) {
+	if state.NextRole != "implementer" && state.NextRole != "reviewer" && state.NextRole != "coordinator" {
+		return roleRunResult{}, fmt.Errorf("cannot run role %q", state.NextRole)
+	}
+	config, err := readConfig(e.cwd)
+	if err != nil {
+		return roleRunResult{}, err
+	}
+	agent := strings.TrimSpace(config.Roles[state.NextRole])
+	if agent == "" {
+		return roleRunResult{}, fmt.Errorf("no agent configured for %s", state.NextRole)
+	}
+	commandTemplate, err := resolveAgentCommand(agent, config.Settings)
+	if err != nil {
+		return roleRunResult{}, err
+	}
+	prompt, err := buildRolePrompt(e, state)
+	if err != nil {
+		return roleRunResult{}, err
+	}
+	artifacts, err := writePromptFile(e.cwd, state.NextRole, prompt)
+	if err != nil {
+		return roleRunResult{}, err
+	}
+	command := substitutePromptFile(commandTemplate, artifacts.Prompt)
+	if err := ensureShellCommandAvailable(command, state.NextRole); err != nil {
+		return roleRunResult{}, err
+	}
+	live := options.LiveOutput
+	if live == nil {
+		live = io.Discard
+	}
+	if options.ShowRunHeader {
+		fmt.Fprintf(live, "run id: %s\n", artifacts.ID)
+		fmt.Fprintf(live, "run log: %s\n\n", relPathOrSelf(artifacts.Log, ""))
+	}
+	output, err := runStreamingShellCommand(e.cwd, command, artifacts, state, agent, config.Settings, live)
+	if err != nil {
+		return roleRunResult{}, fmt.Errorf("%s command failed: %w\n%s", state.NextRole, err, strings.TrimSpace(output))
+	}
+	after, err := analyzeLoopState(e)
+	if err != nil {
+		return roleRunResult{}, err
+	}
+	return roleRunResult{
+		Role:        state.NextRole,
+		Agent:       agent,
+		Command:     command,
+		PromptPath:  artifacts.Prompt,
+		LogPath:     artifacts.Log,
+		Before:      state,
+		After:       after,
+		AgentOutput: output,
+	}, nil
+}
+
+func resolveAgentCommand(agent string, settings agentSettings) (string, error) {
+	agent = strings.TrimSpace(agent)
+	if agent == "" {
+		return "", fmt.Errorf("agent is empty")
+	}
+	if strings.Contains(agent, promptFileMarker) {
+		return agent, nil
+	}
+	switch strings.ToLower(agent) {
+	case "cursor", "cursor-agent", "agent":
+		args := []string{"agent -p"}
+		if strings.TrimSpace(settings.CursorModel) != "" {
+			args = append(args, "--model "+shellQuote(strings.TrimSpace(settings.CursorModel)))
+		}
+		args = append(args, `"$(cat `+promptFileMarker+`)" --force`)
+		return strings.Join(args, " "), nil
+	case "codex":
+		args := []string{"codex exec --sandbox workspace-write"}
+		codexModel := firstNonEmpty(settings.CodexModel, settings.Model)
+		codexReasoning := firstNonEmpty(settings.CodexReasoning, settings.Reasoning)
+		if strings.TrimSpace(codexModel) != "" {
+			args = append(args, "-m "+shellQuote(strings.TrimSpace(codexModel)))
+		}
+		if strings.TrimSpace(codexReasoning) != "" {
+			args = append(args, "-c "+shellQuote("model_reasoning_effort="+quoteTOMLString(strings.TrimSpace(codexReasoning))))
+		}
+		args = append(args, `"$(cat `+promptFileMarker+`)" < /dev/null`)
+		return strings.Join(args, " "), nil
+	case "claude":
+		args := []string{"claude -p"}
+		if strings.TrimSpace(settings.ClaudeModel) != "" {
+			args = append(args, "--model "+shellQuote(strings.TrimSpace(settings.ClaudeModel)))
+		}
+		if strings.TrimSpace(settings.ClaudeEffort) != "" {
+			args = append(args, "--effort "+shellQuote(strings.TrimSpace(settings.ClaudeEffort)))
+		}
+		args = append(args, `"$(cat `+promptFileMarker+`)"`)
+		return strings.Join(args, " "), nil
+	default:
+		return "", fmt.Errorf("unknown agent %q: use cursor, cursor-agent, agent, codex, claude, or a command containing %s", agent, promptFileMarker)
+	}
+}
+
+func substitutePromptFile(command, promptPath string) string {
+	return strings.ReplaceAll(command, promptFileMarker, shellQuote(promptPath))
+}
+
+func ensureShellCommandAvailable(command, role string) error {
+	executable, err := shellCommandExecutable(command)
+	if err != nil {
+		return err
+	}
+	if executable == "" {
+		return nil
+	}
+	if strings.ContainsRune(executable, filepath.Separator) {
+		info, err := os.Stat(executable)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return fmt.Errorf("%s agent command %q was not found; edit .agents/config.yml or install it", role, executable)
+			}
+			return err
+		}
+		if info.IsDir() || info.Mode()&0o111 == 0 {
+			return fmt.Errorf("%s agent command %q is not executable; edit .agents/config.yml or fix permissions", role, executable)
+		}
+		return nil
+	}
+	if _, err := exec.LookPath(executable); err != nil {
+		return fmt.Errorf("%s agent command %q was not found on PATH; edit .agents/config.yml or install it", role, executable)
+	}
+	return nil
+}
+
+func shellCommandExecutable(command string) (string, error) {
+	args, err := parseCommandLine(command)
+	if err != nil {
+		return "", fmt.Errorf("parse agent command: %w", err)
+	}
+	for _, arg := range args {
+		if strings.Contains(arg, "=") && !strings.HasPrefix(arg, "-") {
+			parts := strings.SplitN(arg, "=", 2)
+			if parts[0] != "" && parts[1] != "" && !strings.ContainsAny(parts[0], "/.") {
+				continue
+			}
+		}
+		return arg, nil
+	}
+	return "", nil
+}
+
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
+}
+
+func quoteTOMLString(s string) string {
+	return `"` + strings.ReplaceAll(strings.ReplaceAll(s, `\`, `\\`), `"`, `\"`) + `"`
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func runStreamingShellCommand(cwd, command string, artifacts runArtifactPaths, state loopState, agent string, settings agentSettings, live io.Writer) (string, error) {
+	cmd := exec.Command("sh", "-c", command)
+	cmd.Dir = cwd
+	if err := os.MkdirAll(filepath.Dir(artifacts.Log), 0o755); err != nil {
+		return "", err
+	}
+	logFile, err := os.Create(artifacts.Log)
+	if err != nil {
+		return "", err
+	}
+	defer logFile.Close()
+	var output strings.Builder
+	marker := runLaunchMarker(artifacts, state, agent, settings)
+	if _, err := logFile.WriteString(marker); err != nil {
+		return "", err
+	}
+	writer := io.MultiWriter(&output, logFile, live)
+	cmd.Stdout = writer
+	cmd.Stderr = writer
+	err = cmd.Run()
+	return output.String(), err
+}
+
+func runLaunchMarker(artifacts runArtifactPaths, state loopState, agent string, settings agentSettings) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "# Agents run %s\n", artifacts.ID)
+	fmt.Fprintf(&b, "started_at: %s\n", time.Now().UTC().Format(time.RFC3339))
+	fmt.Fprintf(&b, "role: %s\n", state.NextRole)
+	fmt.Fprintf(&b, "agent: %s\n", agent)
+	fmt.Fprintf(&b, "model: %s\n", settingOrDefault(effectiveModelSetting(agent, settings)))
+	fmt.Fprintf(&b, "reasoning: %s\n", settingOrDefault(effectiveReasoningSetting(agent, settings)))
+	fmt.Fprintf(&b, "task: %s\n", state.Task.Title)
+	fmt.Fprintf(&b, "prompt: %s\n", relPathOrSelf(artifacts.Prompt, ""))
+	fmt.Fprintln(&b)
+	fmt.Fprintln(&b, "--- provider output ---")
+	return b.String()
+}
+
+func effectiveModelSetting(agent string, settings agentSettings) string {
+	switch strings.ToLower(strings.TrimSpace(agent)) {
+	case "codex":
+		return firstNonEmpty(settings.CodexModel, settings.Model)
+	case "claude":
+		return settings.ClaudeModel
+	case "cursor", "cursor-agent", "agent":
+		return settings.CursorModel
+	default:
+		return settings.Model
+	}
+}
+
+func effectiveReasoningSetting(agent string, settings agentSettings) string {
+	switch strings.ToLower(strings.TrimSpace(agent)) {
+	case "codex":
+		return firstNonEmpty(settings.CodexReasoning, settings.Reasoning)
+	case "claude":
+		return settings.ClaudeEffort
+	default:
+		return settings.Reasoning
+	}
+}
+
+func settingOrDefault(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "provider default"
+	}
+	return strings.TrimSpace(value)
+}
+
+func cleanInteractiveAgentOutput(agent, output string) string {
+	text := strings.TrimSpace(output)
+	if text == "" {
+		return ""
+	}
+	if strings.EqualFold(strings.TrimSpace(agent), "codex") {
+		if cleaned := cleanCodexExecOutput(text); cleaned != "" {
+			return cleanAgentsCLIRecordOutput(cleaned)
+		}
+	}
+	return cleanAgentsCLIRecordOutput(text)
+}
+
+func cleanCodexExecOutput(output string) string {
+	lines := strings.Split(output, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if strings.TrimSpace(lines[i]) != "tok"+"ens used" {
+			continue
+		}
+		j := i + 1
+		if j < len(lines) {
+			j++
+		}
+		for j < len(lines) && strings.TrimSpace(lines[j]) == "" {
+			j++
+		}
+		reply := strings.TrimSpace(strings.Join(lines[j:], "\n"))
+		if reply != "" {
+			return reply
+		}
+	}
+	for i := len(lines) - 1; i >= 0; i-- {
+		if strings.TrimSpace(lines[i]) != "codex" {
+			continue
+		}
+		reply := strings.TrimSpace(strings.Join(lines[i+1:], "\n"))
+		if reply != "" && !strings.HasPrefix(reply, "exec\n") {
+			return reply
+		}
+	}
+	return ""
+}
+
+func cleanAgentsCLIRecordOutput(output string) string {
+	var kept []string
+	for _, line := range strings.Split(output, "\n") {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(trimmed, "handoff to:"):
+			continue
+		case strings.HasPrefix(trimmed, "path:"):
+			continue
+		case strings.HasPrefix(trimmed, "decision:"):
+			continue
+		case strings.HasPrefix(trimmed, "finding:"):
+			continue
+		case strings.HasPrefix(trimmed, "fixed finding:"):
+			continue
+		case strings.HasPrefix(trimmed, "verified finding:"):
+			continue
+		default:
+			kept = append(kept, line)
+		}
+	}
+	return strings.TrimSpace(strings.Join(kept, "\n"))
+}
+
+func writePromptFile(cwd, role, prompt string) (runArtifactPaths, error) {
+	id := time.Now().UTC().Format("2006-01-02T150405Z") + "-" + role
+	promptDir := filepath.Join(cwd, stateDir, "runs", "prompts")
+	logDir := filepath.Join(cwd, stateDir, "runs", "logs")
+	for _, dir := range []string{promptDir, logDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return runArtifactPaths{}, err
+		}
+	}
+	artifacts := runArtifactPaths{
+		ID:     id,
+		Prompt: filepath.Join(promptDir, id+".txt"),
+		Log:    filepath.Join(logDir, id+".log"),
+	}
+	return artifacts, os.WriteFile(artifacts.Prompt, []byte(prompt), 0o600)
+}
+
+func buildRolePrompt(e env, state loopState) (string, error) {
+	var b strings.Builder
+	switch state.NextRole {
+	case "implementer":
+		fmt.Fprintf(&b, "You are the implementer for this Agents task.\n\n")
+		fmt.Fprintf(&b, "Task: %s\nPath: %s\nNext action: %s\n\n", state.Task.Title, state.Task.Path, state.NextAction)
+		appendPromptFile(&b, e.cwd, state.Task.Path, "scope.md", "Scope")
+		appendPromptFile(&b, e.cwd, state.Task.Path, "status.md", "Status")
+		appendPromptFile(&b, e.cwd, state.Task.Path, "next.md", "Next")
+		appendPromptDir(&b, e.cwd, state.Task.Path, "decisions", "Decisions")
+		appendPromptDir(&b, e.cwd, state.Task.Path, "findings", "Findings")
+		fmt.Fprintln(&b, "Working agreement:")
+		fmt.Fprintln(&b, "- Edit the working tree to implement the task or fix open findings.")
+		fmt.Fprintln(&b, "- Run relevant checks.")
+		fmt.Fprintln(&b, "- Record a handoff when ready for review:")
+		fmt.Fprintln(&b, `  agents handoff --to reviewer "what changed and how it was verified"`)
+		fmt.Fprintln(&b, "- Mark fixed findings with `agents finding fix <finding>`.")
+		fmt.Fprintln(&b, "- Do not commit; leave changes for review.")
+	case "reviewer":
+		fmt.Fprintf(&b, "You are the reviewer for this Agents task.\n\n")
+		fmt.Fprintf(&b, "Task: %s\nPath: %s\nNext action: %s\n\n", state.Task.Title, state.Task.Path, state.NextAction)
+		appendPromptFile(&b, e.cwd, state.Task.Path, "scope.md", "Scope")
+		appendPromptFile(&b, e.cwd, state.Task.Path, "status.md", "Status")
+		appendPromptDir(&b, e.cwd, state.Task.Path, "handoffs", "Handoffs")
+		appendPromptDir(&b, e.cwd, state.Task.Path, "findings", "Findings")
+		fmt.Fprintln(&b, "Working agreement:")
+		fmt.Fprintln(&b, "- Review the working tree, tests, and task chunks.")
+		fmt.Fprintln(&b, "- Record real issues with `agents finding add \"summary\" --severity low|medium|high`.")
+		fmt.Fprintln(&b, "- Verify fixed findings with `agents finding verify <finding>` only after independent checks.")
+		fmt.Fprintln(&b, "- Do not edit implementation code.")
+	case "coordinator":
+		fmt.Fprintf(&b, "You are the coordinator for this Agents task.\n\n")
+		fmt.Fprintf(&b, "Task: %s\nPath: %s\nNext action: %s\n\n", state.Task.Title, state.Task.Path, state.NextAction)
+		appendPromptFile(&b, e.cwd, state.Task.Path, "scope.md", "Scope")
+		appendPromptFile(&b, e.cwd, state.Task.Path, "status.md", "Status")
+		appendPromptFile(&b, e.cwd, state.Task.Path, "next.md", "Next")
+		appendPromptDir(&b, e.cwd, state.Task.Path, "handoffs", "Handoffs")
+		appendPromptDir(&b, e.cwd, state.Task.Path, "decisions", "Decisions")
+		fmt.Fprintln(&b, "Working agreement:")
+		fmt.Fprintln(&b, "- Treat user handoffs to coordinator as conversational planning context.")
+		fmt.Fprintln(&b, "- Ask concise follow-up questions when the task, desired behavior, ref, constraints, or verification are unclear.")
+		fmt.Fprintln(&b, "- Record decisions when the plan becomes concrete.")
+		fmt.Fprintln(&b, "- When ready for implementation, hand off to implementer:")
+		fmt.Fprintln(&b, `  agents handoff --to implementer "clear implementation request with context and verification"`)
+		fmt.Fprintln(&b, "- Do not edit implementation code.")
+	}
+	return b.String(), nil
+}
+
+func appendPromptFile(b *strings.Builder, cwd, taskPath, name, heading string) {
+	data, err := os.ReadFile(filepath.Join(cwd, stateDir, taskPath, name))
+	if err != nil {
+		return
+	}
+	fmt.Fprintf(b, "## %s\n\n%s\n\n", heading, strings.TrimSpace(string(data)))
+}
+
+func appendPromptDir(b *strings.Builder, cwd, taskPath, dir, heading string) {
+	entries, err := os.ReadDir(filepath.Join(cwd, stateDir, taskPath, dir))
+	if err != nil || len(entries) == 0 {
+		return
+	}
+	fmt.Fprintf(b, "## %s\n\n", heading)
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(cwd, stateDir, taskPath, dir, entry.Name()))
+		if err != nil {
+			continue
+		}
+		fmt.Fprintf(b, "### %s\n\n%s\n\n", entry.Name(), strings.TrimSpace(string(data)))
+	}
+}
+
+func printDispatchPacket(w io.Writer, info dispatchInfo) {
+	fmt.Fprintf(w, "role: %s\n", info.Role)
+	if info.Agent != "" {
+		fmt.Fprintf(w, "agent: %s\n", info.Agent)
+	} else {
+		fmt.Fprintln(w, "agent: not configured")
+	}
+	fmt.Fprintf(w, "active task: %s\n", info.Task.Title)
+	fmt.Fprintf(w, "task path: %s\n", info.Task.Path)
+	fmt.Fprintf(w, "action: %s\n", info.Action)
+	if info.Boundary != "" {
+		fmt.Fprintf(w, "boundary: %s\n", info.Boundary)
+	}
+	printTaskStats(w, info.Stats)
+}
+
+func printLoopState(w io.Writer, state loopState) {
+	fmt.Fprintf(w, "active task: %s\n", state.Task.Title)
+	fmt.Fprintf(w, "task path: %s\n", state.Task.Path)
+	fmt.Fprintf(w, "next role: %s\n", state.NextRole)
+	fmt.Fprintf(w, "next action: %s\n", state.NextAction)
+	if state.Boundary != "" {
+		fmt.Fprintf(w, "boundary: %s\n", state.Boundary)
+	}
+	printTaskStats(w, state.Stats)
+}
+
+func printRoleRunResult(w io.Writer, result roleRunResult) {
+	printRoleRunSummary(w, result, true)
+}
+
+func printRoleRunSummary(w io.Writer, result roleRunResult, includeOutput bool) {
+	fmt.Fprintf(w, "ran role: %s\n", result.Role)
+	fmt.Fprintf(w, "agent: %s\n", result.Agent)
+	fmt.Fprintf(w, "prompt: %s\n", relPathOrSelf(result.PromptPath, result.Before.Task.Path))
+	fmt.Fprintf(w, "log: %s\n", relPathOrSelf(result.LogPath, result.Before.Task.Path))
+	if includeOutput && strings.TrimSpace(result.AgentOutput) != "" {
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "agent output:")
+		fmt.Fprintln(w, strings.TrimRight(result.AgentOutput, "\n"))
+	}
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "after:")
+	printLoopState(w, result.After)
+}
+
+func relPathOrSelf(path, _ string) string {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return path
+	}
+	rel, err := filepath.Rel(cwd, path)
+	if err != nil || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return path
+	}
+	return rel
+}
+
+func dispatchPayload(info dispatchInfo) dispatchJSON {
+	return dispatchJSON{
+		Role:       info.Role,
+		Agent:      info.Agent,
+		Configured: info.Agent != "",
+		Task:       taskPayload(info.Task, info.Stats),
+		Action:     info.Action,
+		Boundary:   info.Boundary,
+	}
+}
+
+func loopPayload(state loopState) loopJSON {
+	return loopJSON{
+		Task:       taskPayload(state.Task, state.Stats),
+		NextRole:   state.NextRole,
+		NextAction: state.NextAction,
+		Boundary:   state.Boundary,
+	}
+}
