@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -24,6 +25,22 @@ const (
 )
 
 var errComposerInterrupted = errors.New("composer interrupted")
+
+var versionInfo = VersionInfo{
+	Version: "dev",
+	Commit:  "none",
+	Date:    "unknown",
+}
+
+type VersionInfo struct {
+	Version string
+	Commit  string
+	Date    string
+}
+
+func SetVersion(version, commit, date string) {
+	versionInfo = VersionInfo{Version: version, Commit: commit, Date: date}
+}
 
 type slashCommandSpec struct {
 	Name        string
@@ -92,6 +109,9 @@ func runOneShot(args []string, out, errOut io.Writer, e env) int {
 	switch args[0] {
 	case "-h", "--help", "help":
 		printHelp(out)
+		return 0
+	case "version":
+		printVersion(out)
 		return 0
 	case "completion":
 		return runCompletionCommand(args[1:], out, errOut, e)
@@ -316,6 +336,11 @@ func printHelp(w io.Writer) {
 	fmt.Fprintln(w, "  agents run [--json]")
 	fmt.Fprintln(w, "  agents completion zsh")
 	fmt.Fprintln(w, "  agents completion install-zsh")
+	fmt.Fprintln(w, "  agents version")
+}
+
+func printVersion(w io.Writer) {
+	fmt.Fprintf(w, "agents %s (%s, %s)\n", versionInfo.Version, versionInfo.Commit, versionInfo.Date)
 }
 
 func runCompletionCommand(args []string, out, errOut io.Writer, e env) int {
@@ -643,6 +668,9 @@ func handleInteractiveCommand(rawCommand string, out, errOut io.Writer, e env) (
 			if runErr := runCoordinatorChatResponse(e, out); runErr != nil {
 				fmt.Fprintf(errOut, "agents: coordinator response: %v\n", runErr)
 			}
+			if runErr := runInteractiveQueuedRoles(e, out); runErr != nil {
+				fmt.Fprintf(errOut, "agents: loop: %v\n", runErr)
+			}
 		}
 	}
 	return 0, false
@@ -891,9 +919,7 @@ func recordCoordinatorChat(e env, text string, out io.Writer) error {
 			return err
 		}
 		task = opened
-		if e.isTTY {
-			fmt.Fprintf(out, "started intake: %s\n", task.Title)
-		} else {
+		if !e.isTTY {
 			fmt.Fprintf(out, "started coordinator intake: %s\n", task.Title)
 			fmt.Fprintf(out, "task path: %s\n", task.Path)
 		}
@@ -903,7 +929,8 @@ func recordCoordinatorChat(e env, text string, out io.Writer) error {
 		return err
 	}
 	if e.isTTY {
-		fmt.Fprintln(out, "sent to coordinator")
+		// Chat mode should feel conversational; the handoff is durable state,
+		// but not user-facing ceremony.
 	} else {
 		fmt.Fprintf(out, "sent to coordinator\n")
 		fmt.Fprintf(out, "handoff path: %s\n", handoff.Path)
@@ -927,15 +954,29 @@ func runCoordinatorChatResponse(e env, out io.Writer) error {
 	}
 	if strings.TrimSpace(agent) == "" {
 		fmt.Fprintln(out, "coordinator: not configured")
-		fmt.Fprintln(out, "next: configure roles.coordinator in .agents/config.yml or use /run later")
+		fmt.Fprintln(out, "next: configure roles.coordinator in .agents/config.yml and try again")
 		return nil
 	}
-	fmt.Fprintln(out, "coordinator is responding...")
-	result, err := runConfiguredRoleWithOptions(e, state, roleRunOptions{LiveOutput: io.Discard})
+	progress := newProgressWriter(out, "coordinator is thinking")
+	progress.Start()
+	result, err := runConfiguredRoleWithOptions(e, state, roleRunOptions{ShowRunHeader: true, LiveOutput: progress})
+	progress.Stop()
 	if err != nil {
 		return err
 	}
 	reply := cleanInteractiveAgentOutput(result.Agent, result.AgentOutput)
+	directive, directiveOK := parseCoordinatorDirective(reply)
+	if directiveOK {
+		if err := applyCoordinatorDirective(e, directive); err != nil {
+			return err
+		}
+		reply = removeCoordinatorDirective(reply)
+		after, err := analyzeLoopState(e)
+		if err != nil {
+			return err
+		}
+		result.After = after
+	}
 	if strings.TrimSpace(reply) != "" {
 		fmt.Fprintln(out)
 		fmt.Fprintln(out, strings.TrimRight(reply, "\n"))
@@ -944,11 +985,181 @@ func runCoordinatorChatResponse(e env, out io.Writer) error {
 	return nil
 }
 
+type coordinatorDirective struct {
+	Role string
+	Text string
+}
+
+func parseCoordinatorDirective(text string) (coordinatorDirective, bool) {
+	start := strings.LastIndex(text, "```agents-handoff")
+	if start < 0 {
+		return coordinatorDirective{}, false
+	}
+	blockStart := strings.Index(text[start:], "\n")
+	if blockStart < 0 {
+		return coordinatorDirective{}, false
+	}
+	contentStart := start + blockStart + 1
+	endRel := strings.Index(text[contentStart:], "```")
+	if endRel < 0 {
+		return coordinatorDirective{}, false
+	}
+	content := text[contentStart : contentStart+endRel]
+	var directive coordinatorDirective
+	var textLines []string
+	inText := false
+	for _, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(trimmed, "role:"):
+			directive.Role = strings.ToLower(strings.TrimSpace(strings.TrimPrefix(trimmed, "role:")))
+			inText = false
+		case strings.HasPrefix(trimmed, "text:"):
+			textLines = append(textLines, strings.TrimSpace(strings.TrimPrefix(trimmed, "text:")))
+			inText = true
+		case inText:
+			textLines = append(textLines, strings.TrimRight(line, " \t"))
+		}
+	}
+	directive.Text = strings.TrimSpace(strings.Join(textLines, "\n"))
+	if directive.Role == "" || directive.Text == "" {
+		return coordinatorDirective{}, false
+	}
+	return directive, true
+}
+
+func removeCoordinatorDirective(text string) string {
+	start := strings.LastIndex(text, "```agents-handoff")
+	if start < 0 {
+		return text
+	}
+	blockStart := strings.Index(text[start:], "\n")
+	if blockStart < 0 {
+		return text
+	}
+	contentStart := start + blockStart + 1
+	endRel := strings.Index(text[contentStart:], "```")
+	if endRel < 0 {
+		return text
+	}
+	end := contentStart + endRel + len("```")
+	return strings.TrimSpace(text[:start] + text[end:])
+}
+
+func applyCoordinatorDirective(e env, directive coordinatorDirective) error {
+	switch directive.Role {
+	case "implementer", "reviewer", "coordinator":
+	default:
+		return fmt.Errorf("coordinator requested unknown handoff role %q", directive.Role)
+	}
+	_, err := addHandoff(e, []string{"--to", directive.Role, directive.Text}, time.Now().UTC())
+	return err
+}
+
+type progressWriter struct {
+	out     io.Writer
+	label   string
+	stop    chan struct{}
+	done    chan struct{}
+	once    sync.Once
+	mu      sync.Mutex
+	started bool
+}
+
+func newProgressWriter(out io.Writer, label string) *progressWriter {
+	return &progressWriter{
+		out:   out,
+		label: label,
+		stop:  make(chan struct{}),
+		done:  make(chan struct{}),
+	}
+}
+
+func (w *progressWriter) Start() {
+	w.mu.Lock()
+	w.started = true
+	w.mu.Unlock()
+	fmt.Fprintf(w.out, "\r%s |", w.label)
+	go func() {
+		frames := []rune{'|', '/', '-', '\\'}
+		ticker := time.NewTicker(120 * time.Millisecond)
+		defer ticker.Stop()
+		defer close(w.done)
+		i := 0
+		for {
+			select {
+			case <-w.stop:
+				fmt.Fprintf(w.out, "\r\033[2K")
+				return
+			case <-ticker.C:
+				fmt.Fprintf(w.out, "\r%s %c", w.label, frames[i%len(frames)])
+				i++
+			}
+		}
+	}()
+}
+
+func (w *progressWriter) Stop() {
+	w.once.Do(func() {
+		close(w.stop)
+		<-w.done
+	})
+}
+
+func (w *progressWriter) Write(p []byte) (int, error) {
+	text := string(p)
+	if strings.HasPrefix(text, "run id:") || strings.HasPrefix(text, "run log:") {
+		_, _ = fmt.Fprint(w.out, text)
+	}
+	return len(p), nil
+}
+
 func printInteractiveRoleTransition(out io.Writer, result roleRunResult) {
 	if result.After.NextRole == "" || result.After.NextRole == result.Before.NextRole {
 		return
 	}
 	fmt.Fprintf(out, "\nnext: %s\n", result.After.NextRole)
+}
+
+func runInteractiveQueuedRoles(e env, out io.Writer) error {
+	const maxInteractiveRoleRuns = 6
+	for i := 0; i < maxInteractiveRoleRuns; i++ {
+		state, err := analyzeLoopState(e)
+		if err != nil {
+			return err
+		}
+		switch state.NextRole {
+		case "human":
+			fmt.Fprintln(out)
+			printLoopState(out, state)
+			return nil
+		case "coordinator":
+			return nil
+		case "implementer", "reviewer":
+		default:
+			return fmt.Errorf("cannot run role %q", state.NextRole)
+		}
+		agent, err := configuredAgent(e.cwd, state.NextRole)
+		if err != nil {
+			return err
+		}
+		if strings.TrimSpace(agent) == "" {
+			fmt.Fprintf(out, "\nnext: %s\n", state.NextRole)
+			fmt.Fprintf(out, "agent: not configured for %s\n", state.NextRole)
+			return nil
+		}
+		fmt.Fprintf(out, "\nrunning %s...\n", state.NextRole)
+		result, err := runConfiguredRole(e, state, out)
+		if err != nil {
+			return err
+		}
+		printRoleRunResult(out, result)
+		if result.After.NextRole == "" || result.After.NextRole == state.NextRole {
+			return nil
+		}
+	}
+	fmt.Fprintf(out, "\nloop paused after %d role runs; use /run to continue\n", maxInteractiveRoleRuns)
+	return nil
 }
 
 func coordinatorChatTitle(text string) string {
@@ -1349,8 +1560,9 @@ settings:
   # Codex reasoning examples: minimal, low, medium, high, xhigh
   codex_model: ""
   codex_reasoning: ""
-  # Claude Code: model aliases: default, best, sonnet, opus, haiku, opusplan, sonnet[1m], opus[1m]
-  # Claude effort: low, medium, high, xhigh, max; supported levels depend on the selected model
+  # Claude Code: model names and aliases vary by account and CLI version.
+  # Run 'claude --help' or use Claude's in-app model controls for current choices.
+  # Claude effort: low, medium, high, xhigh, max; supported levels depend on the selected model.
   claude_model: ""
   claude_effort: ""
   # Cursor Agent: run 'agent models' or 'cursor-agent --list-models' for account-specific choices
@@ -2507,11 +2719,15 @@ func runConfiguredRoleWithOptions(e env, state loopState, options roleRunOptions
 	}
 	if options.ShowRunHeader {
 		fmt.Fprintf(live, "run id: %s\n", artifacts.ID)
-		fmt.Fprintf(live, "run log: %s\n\n", relPathOrSelf(artifacts.Log, ""))
+		fmt.Fprintf(live, "run log: %s\n\n", relPathFrom(e.cwd, artifacts.Log))
 	}
 	output, err := runStreamingShellCommand(e.cwd, command, artifacts, state, agent, config.Settings, live)
 	if err != nil {
 		return roleRunResult{}, fmt.Errorf("%s command failed: %w\n%s", state.NextRole, err, strings.TrimSpace(output))
+	}
+	output, err = applyRoleOutputDirectives(e, output)
+	if err != nil {
+		return roleRunResult{}, err
 	}
 	after, err := analyzeLoopState(e)
 	if err != nil {
@@ -2656,8 +2872,83 @@ func runStreamingShellCommand(cwd, command string, artifacts runArtifactPaths, s
 	writer := io.MultiWriter(&output, logFile, live)
 	cmd.Stdout = writer
 	cmd.Stderr = writer
-	err = cmd.Run()
+	if err := cmd.Start(); err != nil {
+		return output.String(), err
+	}
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case now := <-ticker.C:
+				fmt.Fprintf(logFile, "\n[agents] still running at %s\n", now.UTC().Format(time.RFC3339))
+			}
+		}
+	}()
+	completedByHandoff := make(chan string, 1)
+	if target := completionHandoffTarget(state.NextRole); target != "" {
+		go watchForCompletionHandoff(cwd, state.Task.Path, target, completedByHandoff, done)
+	}
+	waitErr := make(chan error, 1)
+	go func() {
+		waitErr <- cmd.Wait()
+	}()
+	var completedBy string
+	select {
+	case err = <-waitErr:
+	case completedBy = <-completedByHandoff:
+		fmt.Fprintf(logFile, "\n[agents] detected completion handoff to %s at %s\n", completedBy, time.Now().UTC().Format(time.RFC3339))
+		_ = cmd.Process.Signal(os.Interrupt)
+		select {
+		case err = <-waitErr:
+		case <-time.After(5 * time.Second):
+			fmt.Fprintf(logFile, "[agents] process did not exit after completion handoff; killing at %s\n", time.Now().UTC().Format(time.RFC3339))
+			_ = cmd.Process.Kill()
+			err = <-waitErr
+		}
+		if completedBy != "" {
+			err = nil
+		}
+	}
+	close(done)
+	if err != nil {
+		fmt.Fprintf(logFile, "\n[agents] exited at %s with error: %v\n", time.Now().UTC().Format(time.RFC3339), err)
+	} else {
+		fmt.Fprintf(logFile, "\n[agents] completed at %s\n", time.Now().UTC().Format(time.RFC3339))
+	}
 	return output.String(), err
+}
+
+func completionHandoffTarget(role string) string {
+	switch role {
+	case "implementer":
+		return "reviewer"
+	default:
+		return ""
+	}
+}
+
+func watchForCompletionHandoff(cwd, taskPath, target string, completed chan<- string, done <-chan struct{}) {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			stats, err := readTaskStats(cwd, taskPath)
+			if err == nil && stats.LatestHandoffTo == target {
+				select {
+				case completed <- target:
+				default:
+				}
+				return
+			}
+		}
+	}
 }
 
 func runLaunchMarker(artifacts runArtifactPaths, state loopState, agent string, settings agentSettings) string {
@@ -2799,6 +3090,7 @@ func buildRolePrompt(e env, state loopState) (string, error) {
 		appendPromptFile(&b, e.cwd, state.Task.Path, "scope.md", "Scope")
 		appendPromptFile(&b, e.cwd, state.Task.Path, "status.md", "Status")
 		appendPromptFile(&b, e.cwd, state.Task.Path, "next.md", "Next")
+		appendPromptDir(&b, e.cwd, state.Task.Path, "handoffs", "Handoffs")
 		appendPromptDir(&b, e.cwd, state.Task.Path, "decisions", "Decisions")
 		appendPromptDir(&b, e.cwd, state.Task.Path, "findings", "Findings")
 		fmt.Fprintln(&b, "Working agreement:")
@@ -2817,8 +3109,14 @@ func buildRolePrompt(e env, state loopState) (string, error) {
 		appendPromptDir(&b, e.cwd, state.Task.Path, "findings", "Findings")
 		fmt.Fprintln(&b, "Working agreement:")
 		fmt.Fprintln(&b, "- Review the working tree, tests, and task chunks.")
-		fmt.Fprintln(&b, "- Record real issues with `agents finding add \"summary\" --severity low|medium|high`.")
-		fmt.Fprintln(&b, "- Verify fixed findings with `agents finding verify <finding>` only after independent checks.")
+		fmt.Fprintln(&b, "- Report real issues first in your response.")
+		fmt.Fprintln(&b, "- Do not run `agents` commands yourself; the parent Agents process records coordination state.")
+		fmt.Fprintln(&b, "- If there are no findings, end your response with exactly one directive block:")
+		fmt.Fprintln(&b, "```agents-handoff")
+		fmt.Fprintln(&b, "role: coordinator")
+		fmt.Fprintln(&b, "text: review approved; include verification performed and residual risk")
+		fmt.Fprintln(&b, "```")
+		fmt.Fprintln(&b, "- If there are findings, include them in the response and end with a coordinator handoff directive summarizing that review found issues.")
 		fmt.Fprintln(&b, "- Do not edit implementation code.")
 	case "coordinator":
 		fmt.Fprintf(&b, "You are the coordinator for this Agents task.\n\n")
@@ -2830,13 +3128,35 @@ func buildRolePrompt(e env, state loopState) (string, error) {
 		appendPromptDir(&b, e.cwd, state.Task.Path, "decisions", "Decisions")
 		fmt.Fprintln(&b, "Working agreement:")
 		fmt.Fprintln(&b, "- Treat user handoffs to coordinator as conversational planning context.")
+		fmt.Fprintln(&b, "- You may inspect the repository in read-only mode to answer planning or project-understanding questions.")
+		fmt.Fprintln(&b, "- Use whatever read-only tools are available; do not block only because a preferred search tool is unavailable.")
+		fmt.Fprintln(&b, "- If evidence is limited, answer with what you can infer and name the missing context briefly.")
 		fmt.Fprintln(&b, "- Ask concise follow-up questions when the task, desired behavior, ref, constraints, or verification are unclear.")
 		fmt.Fprintln(&b, "- Record decisions when the plan becomes concrete.")
-		fmt.Fprintln(&b, "- When ready for implementation, hand off to implementer:")
-		fmt.Fprintln(&b, `  agents handoff --to implementer "clear implementation request with context and verification"`)
-		fmt.Fprintln(&b, "- Do not edit implementation code.")
+		fmt.Fprintln(&b, "- Do not run `agents` commands yourself; the parent Agents process records coordination state.")
+		fmt.Fprintln(&b, "- When ready for another role, end your response with exactly one directive block:")
+		fmt.Fprintln(&b, "```agents-handoff")
+		fmt.Fprintln(&b, "role: implementer")
+		fmt.Fprintln(&b, "text: clear implementation request with context and verification")
+		fmt.Fprintln(&b, "```")
+		fmt.Fprintln(&b, "- Do not edit implementation code or coordination files directly.")
 	}
 	return b.String(), nil
+}
+
+func applyRoleOutputDirectives(e env, output string) (string, error) {
+	cleaned := output
+	for {
+		directive, ok := parseCoordinatorDirective(cleaned)
+		if !ok {
+			break
+		}
+		if err := applyCoordinatorDirective(e, directive); err != nil {
+			return cleaned, err
+		}
+		cleaned = removeCoordinatorDirective(cleaned)
+	}
+	return cleaned, nil
 }
 
 func appendPromptFile(b *strings.Builder, cwd, taskPath, name, heading string) {
@@ -2916,6 +3236,10 @@ func relPathOrSelf(path, _ string) string {
 	if err != nil {
 		return path
 	}
+	return relPathFrom(cwd, path)
+}
+
+func relPathFrom(cwd, path string) string {
 	rel, err := filepath.Rel(cwd, path)
 	if err != nil || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return path

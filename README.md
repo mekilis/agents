@@ -37,6 +37,12 @@ agents completion install-zsh
 exec zsh
 ```
 
+Check the installed binary version:
+
+```bash
+agents version
+```
+
 The completion script comes from the `agents` binary. If you prefer to install
 it yourself, write `agents completion zsh` to a directory on your zsh `fpath`.
 
@@ -73,13 +79,15 @@ Build up a feature or bug fix conversationally:
 ```text
 › I want to improve bookmark search, but I am not sure about the exact scope yet.
 › It should probably handle uppercase titles and maybe tags too.
-› /run
+› local-only browser storage is fine for the MVP
 ```
 
 Plain text in the interactive terminal is coordinator chat. Slash commands are
-reserved for controls, so `/run` asks the coordinator to continue planning,
-ask for missing details such as a ref, or hand off to implementation when the
-request is clear. If you already know the task, `/start` is still the fast path.
+reserved for controls. When a coordinator role is configured, chat immediately
+runs the coordinator so it can answer, ask for missing details such as a ref,
+or route a clear request to another role. If you already know the task, `/start`
+is still the fast path. Use `/run` for script-style loops or when you want to
+manually run the next queued role.
 
 Hide the startup banner when you want a quieter interactive terminal:
 
@@ -148,11 +156,11 @@ settings:
   codex_reasoning: low
 
   # Claude Code:
-  #   model aliases: default, best, sonnet, opus, haiku, opusplan,
-  #                  sonnet[1m], opus[1m]
-  #   effort: low, medium, high, xhigh, max
+  #   model names and aliases change by account and CLI version.
+  #   Run `claude --help` or use Claude's in-app model controls for current choices.
+  #   effort examples: low, medium, high, xhigh, max
   #   note: supported effort levels depend on the selected Claude model.
-  claude_model: sonnet
+  claude_model: ""
   claude_effort: high
 
   # Cursor Agent:
@@ -189,6 +197,8 @@ Interactive input model:
   composer.
 - In an interactive terminal, chat immediately runs the configured coordinator
   so it can ask for constraints, refs, or approval before routing work.
+- Coordinators do not write `.agents/` state directly; Agents records any
+  requested role handoff from the parent process.
 - In scripts or pipes, chat is recorded and `/run` drives the next role.
 - Type slash commands for internal controls.
 - Type `/` to show the command menu, or a partial command such as `/st` to

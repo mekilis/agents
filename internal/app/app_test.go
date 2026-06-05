@@ -252,6 +252,22 @@ func TestRunUnknownCommandUsesPublicCLIError(t *testing.T) {
 	}
 }
 
+func TestRunVersionCommand(t *testing.T) {
+	old := versionInfo
+	t.Cleanup(func() { versionInfo = old })
+	SetVersion("v1.2.3", "abc123", "2026-06-05")
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		return Run([]string{"version"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code != 0 {
+		t.Fatalf("Run version code=%d stderr=%s", code, errOut.String())
+	}
+	if got := out.String(); !strings.Contains(got, "agents v1.2.3 (abc123, 2026-06-05)") {
+		t.Fatalf("unexpected version output: %q", got)
+	}
+}
+
 func TestHelpShowsTrustCommand(t *testing.T) {
 	var out, errOut bytes.Buffer
 	code := withTempProcessEnv(t, func(home, cwd string) int {
@@ -1038,6 +1054,102 @@ func TestCleanInteractiveAgentOutputHidesAgentsRecordOutput(t *testing.T) {
 	}
 }
 
+func TestProgressWriterSuppressesProviderOutput(t *testing.T) {
+	var out bytes.Buffer
+	writer := newProgressWriter(&out, "coordinator is thinking")
+	if n, err := writer.Write([]byte("raw provider transcript")); err != nil || n != len("raw provider transcript") {
+		t.Fatalf("progress writer Write n=%d err=%v", n, err)
+	}
+	if strings.Contains(out.String(), "raw provider transcript") {
+		t.Fatalf("progress writer should not echo provider output, got %q", out.String())
+	}
+}
+
+func TestCoordinatorDirectiveParsesAndRemovesHandoffBlock(t *testing.T) {
+	raw := "Ready to build.\n\n```agents-handoff\nrole: implementer\ntext: Build the bookmark MVP.\nInclude README.\n```\n"
+	directive, ok := parseCoordinatorDirective(raw)
+	if !ok {
+		t.Fatal("expected directive to parse")
+	}
+	if directive.Role != "implementer" {
+		t.Fatalf("role got %q", directive.Role)
+	}
+	if directive.Text != "Build the bookmark MVP.\nInclude README." {
+		t.Fatalf("text got %q", directive.Text)
+	}
+	if got := removeCoordinatorDirective(raw); got != "Ready to build." {
+		t.Fatalf("removeCoordinatorDirective got %q", got)
+	}
+}
+
+func TestApplyCoordinatorDirectiveWritesHandoffFromParent(t *testing.T) {
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		task, err := openTask(e, []string{"Brokered Handoff"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		directive := coordinatorDirective{Role: "implementer", Text: "Build the MVP."}
+		if err := applyCoordinatorDirective(e, directive); err != nil {
+			t.Fatal(err)
+		}
+		entries, err := os.ReadDir(filepath.Join(cwd, ".agents", task.Path, "handoffs"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) != 1 {
+			t.Fatalf("expected one handoff, got %d", len(entries))
+		}
+		data, err := os.ReadFile(filepath.Join(cwd, ".agents", task.Path, "handoffs", entries[0].Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := string(data); !strings.Contains(got, "To: implementer") || !strings.Contains(got, "Build the MVP.") {
+			t.Fatalf("unexpected handoff:\n%s", got)
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
+func TestApplyRoleOutputDirectivesBrokersReviewerHandoff(t *testing.T) {
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		task, err := openTask(e, []string{"Reviewer Broker"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw := "No findings.\n\n```agents-handoff\nrole: coordinator\ntext: Review approved. node --check passed.\n```\n"
+		cleaned, err := applyRoleOutputDirectives(e, raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(cleaned, "agents-handoff") {
+			t.Fatalf("expected directive removed, got:\n%s", cleaned)
+		}
+		entries, err := os.ReadDir(filepath.Join(cwd, ".agents", task.Path, "handoffs"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) != 1 {
+			t.Fatalf("expected one handoff, got %d", len(entries))
+		}
+		data, err := os.ReadFile(filepath.Join(cwd, ".agents", task.Path, "handoffs", entries[0].Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := string(data); !strings.Contains(got, "To: coordinator") || !strings.Contains(got, "Review approved") {
+			t.Fatalf("unexpected handoff:\n%s", got)
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
 func TestInteractiveRequiresSlashForCommandsAndChatsWithCoordinator(t *testing.T) {
 	var out, errOut bytes.Buffer
 	code := withTempProcessEnv(t, func(home, cwd string) int {
@@ -1113,8 +1225,9 @@ func TestInteractiveTTYChatRunsCoordinatorResponse(t *testing.T) {
 	}
 	got := out.String()
 	for _, want := range []string{
-		"sent to coordinator",
-		"coordinator is responding...",
+		"run id:",
+		"run log: .agents/runs/logs/",
+		"coordinator is thinking",
 		"Hi. What constraints or reference should I use?",
 	} {
 		if !strings.Contains(got, want) {
@@ -1122,14 +1235,84 @@ func TestInteractiveTTYChatRunsCoordinatorResponse(t *testing.T) {
 		}
 	}
 	for _, unwanted := range []string{
+		"started intake:",
+		"sent to coordinator",
 		"handoff to:",
 		"path:",
 		"ran role:",
 		"prompt:",
-		"log:",
 	} {
 		if strings.Contains(got, unwanted) {
 			t.Fatalf("interactive coordinator response should hide %q, got:\n%s", unwanted, got)
+		}
+	}
+}
+
+func TestInteractiveTTYChatContinuesIntoImplementerAfterCoordinatorHandoff(t *testing.T) {
+	var out bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{
+			cwd:       cwd,
+			home:      home,
+			isTTY:     true,
+			trustPath: filepath.Join(home, ".agents", "trust.json"),
+		}
+		if _, err := trustWorkspace(e); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := initWorkspace(e, "share"); err != nil {
+			t.Fatal(err)
+		}
+		coordinator := filepath.Join(cwd, "coordinator.sh")
+		coordinatorBody := strings.Join([]string{
+			"#!/bin/sh",
+			"set -eu",
+			"cat <<'EOF'",
+			"Ready to build.",
+			"",
+			"```agents-handoff",
+			"role: implementer",
+			"text: Build the bookmark MVP.",
+			"```",
+			"EOF",
+			"",
+		}, "\n")
+		if err := os.WriteFile(coordinator, []byte(coordinatorBody), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		implementer := filepath.Join(cwd, "implementer.sh")
+		implementerBody := "#!/bin/sh\nset -eu\nprintf 'implemented bookmark MVP\\n'\n"
+		if err := os.WriteFile(implementer, []byte(implementerBody), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cfg := "roles:\n  implementer: " + implementer + " {prompt_file}\n  reviewer: codex\n  coordinator: " + coordinator + " {prompt_file}\n"
+		if err := os.WriteFile(filepath.Join(cwd, ".agents", "config.yml"), []byte(cfg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := recordCoordinatorChat(e, "go on", &out); err != nil {
+			t.Fatal(err)
+		}
+		if err := runCoordinatorChatResponse(e, &out); err != nil {
+			t.Fatal(err)
+		}
+		if err := runInteractiveQueuedRoles(e, &out); err != nil {
+			t.Fatal(err)
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+	got := out.String()
+	for _, want := range []string{
+		"Ready to build.",
+		"next: implementer",
+		"running implementer...",
+		"implemented bookmark MVP",
+		"ran role: implementer",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("interactive loop output missing %q, got:\n%s", want, got)
 		}
 	}
 }
@@ -1921,6 +2104,7 @@ func TestRunExecutesConfiguredImplementer(t *testing.T) {
 		"--- provider output ---",
 		"implemented from",
 		"checked stderr too",
+		"[agents] completed at ",
 	} {
 		if !strings.Contains(logText, want) {
 			t.Fatalf("run log missing %q:\n%s", want, logText)
@@ -1928,6 +2112,63 @@ func TestRunExecutesConfiguredImplementer(t *testing.T) {
 	}
 	if !strings.Contains(logText, "implemented from") || !strings.Contains(logText, "checked stderr too") {
 		t.Fatalf("run log missing streamed output:\n%s", logText)
+	}
+}
+
+func TestRunStopsImplementerAfterReviewerHandoff(t *testing.T) {
+	var out, errOut bytes.Buffer
+	var runCwd string
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		runCwd = cwd
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		task, err := openTask(e, []string{"Completion Handoff"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		script := filepath.Join(cwd, "implementer.sh")
+		body := strings.Join([]string{
+			"#!/bin/sh",
+			"set -eu",
+			"trap 'exit 0' INT TERM",
+			"mkdir -p " + shellQuote(filepath.Join(".agents", task.Path, "handoffs")),
+			"cat > " + shellQuote(filepath.Join(".agents", task.Path, "handoffs", "2026-06-05T100100Z-handoff-to-reviewer.md")) + " <<'EOF'",
+			"# Handoff: reviewer",
+			"",
+			"To: reviewer",
+			"",
+			"Ready for review.",
+			"EOF",
+			"while :; do sleep 1; done",
+			"",
+		}, "\n")
+		if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cfg := "roles:\n  implementer: " + script + " {prompt_file}\n  reviewer: codex\n  coordinator: codex\n"
+		if err := os.WriteFile(filepath.Join(cwd, ".agents", "config.yml"), []byte(cfg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return Run([]string{"run"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code != 0 {
+		t.Fatalf("Run run code=%d stderr=%s stdout=%s", code, errOut.String(), out.String())
+	}
+	if !strings.Contains(out.String(), "ran role: implementer") {
+		t.Fatalf("expected implementer run to finish, got:\n%s", out.String())
+	}
+	logs, err := filepath.Glob(filepath.Join(runCwd, ".agents", "runs", "logs", "*-implementer.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 1 {
+		t.Fatalf("expected one implementer log, got %d: %v", len(logs), logs)
+	}
+	data, err := os.ReadFile(logs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "[agents] detected completion handoff to reviewer") {
+		t.Fatalf("expected completion handoff marker in log:\n%s", string(data))
 	}
 }
 
