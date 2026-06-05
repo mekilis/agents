@@ -2856,6 +2856,7 @@ func firstNonEmpty(values ...string) string {
 func runStreamingShellCommand(cwd, command string, artifacts runArtifactPaths, state loopState, agent string, settings agentSettings, live io.Writer) (string, error) {
 	cmd := exec.Command("sh", "-c", command)
 	cmd.Dir = cwd
+	configureManagedProcess(cmd)
 	if err := os.MkdirAll(filepath.Dir(artifacts.Log), 0o755); err != nil {
 		return "", err
 	}
@@ -2901,12 +2902,12 @@ func runStreamingShellCommand(cwd, command string, artifacts runArtifactPaths, s
 	case err = <-waitErr:
 	case completedBy = <-completedByHandoff:
 		fmt.Fprintf(logFile, "\n[agents] detected completion handoff to %s at %s\n", completedBy, time.Now().UTC().Format(time.RFC3339))
-		_ = cmd.Process.Signal(os.Interrupt)
+		_ = interruptManagedProcess(cmd)
 		select {
 		case err = <-waitErr:
 		case <-time.After(5 * time.Second):
 			fmt.Fprintf(logFile, "[agents] process did not exit after completion handoff; killing at %s\n", time.Now().UTC().Format(time.RFC3339))
-			_ = cmd.Process.Kill()
+			_ = killManagedProcess(cmd)
 			err = <-waitErr
 		}
 		if completedBy != "" {
