@@ -2676,6 +2676,106 @@ func TestStaleVerificationDoesNotReachHumanBoundary(t *testing.T) {
 	}
 }
 
+func TestVerifyCmdRequiresActiveTaskBeforeRunningCommand(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		marker := filepath.Join(cwd, "evidence-ran")
+		code := Run([]string{"verify", "no task yet", "--cmd", "touch " + marker, "--by", "reviewer"}, bytes.NewBuffer(nil), &out, &errOut)
+		if code == 0 {
+			t.Fatalf("expected failure without an active task, got success")
+		}
+		if _, err := os.Stat(marker); !os.IsNotExist(err) {
+			t.Fatalf("evidence command must not run without an active task (marker exists, err=%v)", err)
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
+func TestVerificationCommandTimesOut(t *testing.T) {
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		task, err := openTask(e, []string{"Timeout Evidence"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		prev := verificationCommandTimeout
+		verificationCommandTimeout = 100 * time.Millisecond
+		defer func() { verificationCommandTimeout = prev }()
+		record, pass, err := addVerification(e, []string{"slow evidence", "--cmd", "sleep 5", "--by", "reviewer"}, time.Date(2026, 6, 5, 10, 1, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pass {
+			t.Fatalf("timed-out evidence must be recorded as a failure")
+		}
+		data, err := os.ReadFile(filepath.Join(cwd, ".agents", record.Path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := string(data)
+		if !strings.Contains(body, "exit: 124") || !strings.Contains(body, "timed out") {
+			t.Fatalf("expected timeout evidence in chunk, got:\n%s", body)
+		}
+		stats, err := readTaskStats(cwd, task.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stats.VerificationFail != 1 {
+			t.Fatalf("expected timeout to count as failed verification, got %+v", stats)
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
+func TestVerificationCurrentComparesTimestampsOnly(t *testing.T) {
+	// Same-second tie: slug text must not decide ordering. The verification
+	// slug sorts before the handoff slug, yet the evidence is current.
+	tie := taskStats{
+		LatestVerificationName: "2026-06-05T100200Z-aaa-evidence",
+		LatestHandoffName:      "2026-06-05T100200Z-zzz-handoff",
+	}
+	if !verificationCurrent(tie) {
+		t.Fatalf("same-second verification must be treated as current regardless of slug order")
+	}
+	stale := taskStats{
+		LatestVerificationName: "2026-06-05T100100Z-zzz-evidence",
+		LatestHandoffName:      "2026-06-05T100200Z-aaa-handoff",
+	}
+	if verificationCurrent(stale) {
+		t.Fatalf("verification recorded before the latest handoff must be stale")
+	}
+}
+
+func TestStatusJSONIncludesFailedVerification(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"JSON Failures"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if code := Run([]string{"verify", "tests fail", "--cmd", "false", "--by", "reviewer"}, bytes.NewBuffer(nil), &out, &errOut); code != 1 {
+			t.Fatalf("expected exit 1 for failing evidence, got %d stderr=%s", code, errOut.String())
+		}
+		out.Reset()
+		if code := Run([]string{"status", "--json"}, bytes.NewBuffer(nil), &out, &errOut); code != 0 {
+			t.Fatalf("status --json code=%d stderr=%s", code, errOut.String())
+		}
+		if !strings.Contains(out.String(), `"verification_failed": 1`) {
+			t.Fatalf("expected verification_failed in JSON, got:\n%s", out.String())
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
 func TestReadConfigParsesPerRoleOverrides(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(dir, ".agents"), 0o755); err != nil {

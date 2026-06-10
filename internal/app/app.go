@@ -2,6 +2,7 @@ package app
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1444,9 +1445,10 @@ type findingsJSON struct {
 }
 
 type recordsJSON struct {
-	Decisions    int `json:"decisions"`
-	Handoffs     int `json:"handoffs"`
-	Verification int `json:"verification"`
+	Decisions          int `json:"decisions"`
+	Handoffs           int `json:"handoffs"`
+	Verification       int `json:"verification"`
+	VerificationFailed int `json:"verification_failed,omitempty"`
 }
 
 type dispatchJSON struct {
@@ -1492,9 +1494,10 @@ func taskPayload(task activeTask, stats taskStats) *taskJSON {
 			Verified: stats.FindingsVerified,
 		},
 		Records: recordsJSON{
-			Decisions:    stats.Decisions,
-			Handoffs:     stats.Handoffs,
-			Verification: stats.Verification,
+			Decisions:          stats.Decisions,
+			Handoffs:           stats.Handoffs,
+			Verification:       stats.Verification,
+			VerificationFailed: stats.VerificationFail,
 		},
 	}
 }
@@ -2717,6 +2720,11 @@ func addVerification(e env, args []string, now time.Time) (chunkRecord, bool, er
 	result := "pass"
 	var commandSection string
 	if strings.TrimSpace(command) != "" {
+		// Refuse to execute the evidence command when there is no active task
+		// to record the result into.
+		if active := readActiveTask(e.cwd); active.Path == "" {
+			return chunkRecord{}, false, fmt.Errorf("no active task")
+		}
 		output, exitCode, runErr := runVerificationCommand(e.cwd, command)
 		if runErr != nil {
 			return chunkRecord{}, false, runErr
@@ -2744,12 +2752,24 @@ func addVerification(e env, args []string, now time.Time) (chunkRecord, bool, er
 	return record, result == "pass", nil
 }
 
+// verificationCommandTimeout caps evidence command runtime so a hung command
+// cannot stall the CLI or the managed run loop. Var so tests can shrink it.
+var verificationCommandTimeout = 10 * time.Minute
+
 // runVerificationCommand executes an evidence command and returns its
 // combined output and exit code. A non-zero exit is evidence, not an error.
+// Commands that exceed verificationCommandTimeout are killed and reported as
+// exit 124 with a timeout note appended to the output.
 func runVerificationCommand(cwd, command string) (string, int, error) {
-	cmd := exec.Command("sh", "-c", command)
+	ctx, cancel := context.WithTimeout(context.Background(), verificationCommandTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "sh", "-c", command)
 	cmd.Dir = cwd
 	output, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		note := fmt.Sprintf("%s\n[agents] command timed out after %s", strings.TrimRight(string(output), "\n"), verificationCommandTimeout)
+		return note, 124, nil
+	}
 	if err == nil {
 		return string(output), 0, nil
 	}
@@ -3323,9 +3343,11 @@ func analyzeLoopState(e env) (loopState, error) {
 }
 
 // verificationCurrent reports whether passing verification evidence exists
-// that is at least as new as the latest handoff. Chunk filenames begin with a
-// UTC timestamp, so lexicographic comparison orders them. Stale evidence
-// recorded before the latest handoff does not satisfy the human boundary.
+// that is at least as new as the latest handoff. Only the UTC timestamp
+// prefix of each chunk filename is compared — never the slug text — so
+// same-second ties resolve in favor of the verification (the common flow is
+// handoff first, evidence after). Stale evidence recorded before the latest
+// handoff does not satisfy the human boundary.
 func verificationCurrent(stats taskStats) bool {
 	if stats.FindingsOpen > 0 || stats.FindingsFixed > 0 {
 		return false
@@ -3333,7 +3355,17 @@ func verificationCurrent(stats taskStats) bool {
 	if stats.LatestVerificationName == "" {
 		return false
 	}
-	return stats.LatestVerificationName >= stats.LatestHandoffName
+	return chunkStamp(stats.LatestVerificationName) >= chunkStamp(stats.LatestHandoffName)
+}
+
+// chunkStamp returns the leading UTC timestamp of a chunk filename
+// (e.g. "2026-06-10T112546Z"), or the whole name if it is shorter.
+func chunkStamp(name string) string {
+	const stampLen = len("2006-01-02T150405Z")
+	if len(name) >= stampLen {
+		return name[:stampLen]
+	}
+	return name
 }
 
 func runConfiguredRole(e env, state loopState, out io.Writer) (roleRunResult, error) {
