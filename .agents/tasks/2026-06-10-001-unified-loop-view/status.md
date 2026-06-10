@@ -1,3 +1,3 @@
 # Status
 
-M0 verified and committed. M1 (agents go) implemented: runGoCommand opens task + scope + handoff and drives the loop via shared runLoopToStop; help/completion/README updated; 124 tests pass, gofmt/vet clean
+M2 implemented: loopview.go renderer + runLoopWithView wired into agents go (alt screen, raw mode, 200ms redraw, resize-aware via GetSize); activity language and stop translations; 7 new tests, 132 total pass; PTY smoke test via python pty verified both lanes, status bar, and plain ending

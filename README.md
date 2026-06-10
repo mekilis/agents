@@ -110,7 +110,17 @@ condition. No role configuration questions are asked of the user:
 agents go "Add /history command"                       # text is title and scope
 agents go "History: support /history in the terminal"  # "title: instruction" splits
 agents go "Fix flaky test" --ref BUG-7 --max-iterations 8
+agents go "Add /history command" --plain               # force plain loop output
 ```
+
+On a terminal, `go` renders the unified loop view: two lanes — Building and
+Checking — with live agent output, and a status bar tracking iterations and
+the findings burn-down. The waiting lane shows why it waits; roles never lead
+the UI (they stay in records and logs). Press `q` twice to stop after the
+current run, `p` to pause after the current run; endings are translated to
+plain language ("Done and independently checked — your call.", "The agents
+are stuck — …"). When stdout is not a terminal — CI, pipes — or with
+`--plain`, `go` falls back to today's plain loop output automatically.
 
 Like `agents run`, `go` executes commands from `.agents/config.yml`, so it
 refuses untrusted workspaces before creating any task state.

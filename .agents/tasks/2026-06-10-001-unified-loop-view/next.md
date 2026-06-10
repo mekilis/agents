@@ -1,3 +1,3 @@
 # Next
 
-Review M1; then M2 (unified split view renderer) per qa/unified-loop-view-plan.md
+Review M2; then M3 (Ready-for-you screen) per qa/unified-loop-view-plan.md

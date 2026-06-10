@@ -139,7 +139,7 @@ func Run(args []string, in io.Reader, out, errOut io.Writer) int {
 	}
 
 	if len(args) > 0 {
-		return runOneShot(args, out, errOut, e)
+		return runOneShot(args, in, out, errOut, e)
 	}
 	return runInteractive(in, out, errOut, e)
 }
@@ -175,7 +175,7 @@ func isWorkspaceDir(statePath string) bool {
 	return false
 }
 
-func runOneShot(args []string, out, errOut io.Writer, e env) int {
+func runOneShot(args []string, in io.Reader, out, errOut io.Writer, e env) int {
 	switch args[0] {
 	case "-h", "--help", "help":
 		printHelp(out)
@@ -203,7 +203,7 @@ func runOneShot(args []string, out, errOut io.Writer, e env) int {
 	case "start":
 		return runStartCommand(args[1:], out, errOut, e)
 	case "go":
-		return runGoCommand(args[1:], out, errOut, e)
+		return runGoCommand(args[1:], in, out, errOut, e)
 	case "task":
 		return runTaskCommand(args[1:], out, errOut, e)
 	case "decision":
@@ -558,7 +558,7 @@ func printHelp(w io.Writer) {
 	fmt.Fprintln(w, "  agents          Open the interactive terminal")
 	fmt.Fprintln(w, "  agents trust [--json]")
 	fmt.Fprintln(w, "  agents init [--share|--local]")
-	fmt.Fprintln(w, "  agents go \"what you want\" [--ref REF] [--max-iterations N]")
+	fmt.Fprintln(w, "  agents go \"what you want\" [--ref REF] [--max-iterations N] [--plain]")
 	fmt.Fprintln(w, "  agents start \"title\" [--ref REF] \"what to do\"")
 	fmt.Fprintln(w, "  agents status [--json]")
 	fmt.Fprintln(w, "  agents task open \"title\" [--ref REF]")
@@ -693,7 +693,7 @@ _agents() {
           _arguments '--json[print JSON]' '--once[run a single role]' '--max-iterations[role run budget]:count:'
           ;;
         go)
-          _arguments '--ref[task reference]:ref:' '--max-iterations[role run budget]:count:'
+          _arguments '--ref[task reference]:ref:' '--max-iterations[role run budget]:count:' '--plain[plain output instead of the split view]'
           ;;
         verify)
           _arguments '--cmd[evidence command]:command:' '--by[actor]:actor:'
@@ -907,7 +907,9 @@ func handleInteractiveCommand(rawCommand string, out, errOut io.Writer, e env) (
 			if parseErr != nil {
 				fmt.Fprintf(errOut, "agents: parse command: %v\n", parseErr)
 			} else if len(args) > 0 {
-				code := runOneShot(args, out, errOut, e)
+				// The composer owns stdin here; a non-file reader makes
+				// TTY-gated commands (go's view) fall back to plain output.
+				code := runOneShot(args, strings.NewReader(""), out, errOut, e)
 				if code != 0 {
 					fmt.Fprintf(out, "command exited: %d\n", code)
 				}
@@ -1394,7 +1396,7 @@ func printInteractiveRoleTransition(out io.Writer, result roleRunResult) {
 }
 
 func runInteractiveQueuedRoles(e env, out io.Writer) error {
-	stop, err := runManagedLoop(e, out, defaultMaxLoopRuns, true, nil)
+	stop, err := runManagedLoop(e, out, defaultMaxLoopRuns, true, nil, nil)
 	if err != nil {
 		return err
 	}
@@ -2088,9 +2090,11 @@ func parseStartArgs(args []string) (title, ref, text string, err error) {
 
 // runGoCommand is the one-command entry point: open a task, record scope,
 // hand off to the implementer, and drive the managed loop to a stop
-// condition. `agents go "what you want"` — no role homework.
-func runGoCommand(args []string, out, errOut io.Writer, e env) int {
-	text, ref, maxRuns, err := parseGoArgs(args)
+// condition. `agents go "what you want"` — no role homework. On a TTY the
+// loop renders the unified split view; non-TTY (and --plain) falls back to
+// the plain loop output automatically.
+func runGoCommand(args []string, in io.Reader, out, errOut io.Writer, e env) int {
+	text, ref, maxRuns, plain, err := parseGoArgs(args)
 	if err != nil {
 		fmt.Fprintf(errOut, "agents: go: %v\n", err)
 		return 2
@@ -2124,49 +2128,56 @@ func runGoCommand(args []string, out, errOut io.Writer, e env) int {
 		fmt.Fprintf(errOut, "agents: go: %v\n", err)
 		return 1
 	}
+	if !plain && e.isTTY {
+		if inFile, outFile, ok := loopViewTerminals(in, out); ok {
+			return runLoopWithView(inFile, outFile, errOut, e, task.Title, maxRuns)
+		}
+	}
 	fmt.Fprintf(out, "task: %s\n", task.Title)
 	fmt.Fprintf(out, "task path: %s\n", task.Path)
 	fmt.Fprintln(out)
 	return runLoopToStop("go", out, errOut, e, maxRuns, nil)
 }
 
-func parseGoArgs(args []string) (text, ref string, maxRuns int, err error) {
+func parseGoArgs(args []string) (text, ref string, maxRuns int, plain bool, err error) {
 	maxRuns = defaultMaxLoopRuns
 	for i := 0; i < len(args); i++ {
 		arg := strings.TrimSpace(args[i])
 		switch arg {
 		case "":
 			continue
+		case "--plain":
+			plain = true
 		case "--ref":
 			if i+1 >= len(args) || strings.TrimSpace(args[i+1]) == "" {
-				return "", "", 0, fmt.Errorf("--ref requires a value")
+				return "", "", 0, false, fmt.Errorf("--ref requires a value")
 			}
 			ref = strings.TrimSpace(args[i+1])
 			i++
 		case "--max-iterations":
 			if i+1 >= len(args) {
-				return "", "", 0, fmt.Errorf("--max-iterations requires a number")
+				return "", "", 0, false, fmt.Errorf("--max-iterations requires a number")
 			}
 			n, convErr := strconv.Atoi(strings.TrimSpace(args[i+1]))
 			if convErr != nil || n < 1 {
-				return "", "", 0, fmt.Errorf("--max-iterations requires a positive number")
+				return "", "", 0, false, fmt.Errorf("--max-iterations requires a positive number")
 			}
 			maxRuns = n
 			i++
 		default:
 			if strings.HasPrefix(arg, "--") {
-				return "", "", 0, fmt.Errorf("unknown flag %s", arg)
+				return "", "", 0, false, fmt.Errorf("unknown flag %s", arg)
 			}
 			if text != "" {
-				return "", "", 0, fmt.Errorf("go accepts exactly one instruction")
+				return "", "", 0, false, fmt.Errorf("go accepts exactly one instruction")
 			}
 			text = arg
 		}
 	}
 	if text == "" {
-		return "", "", 0, fmt.Errorf("instruction text is required, e.g. agents go \"Add /history command\"")
+		return "", "", 0, false, fmt.Errorf("instruction text is required, e.g. agents go \"Add /history command\"")
 	}
-	return text, ref, maxRuns, nil
+	return text, ref, maxRuns, plain, nil
 }
 
 // splitGoText derives a task title from the instruction. "title: what to do"
@@ -3311,8 +3322,10 @@ func statePayload(state loopState) *loopJSON {
 // approval boundary, an unconfigured role, no recorded progress after a run,
 // or the run budget. With stopAtCoordinator the loop yields to the caller
 // instead of running the coordinator (used by the interactive terminal where
-// coordinator turns belong to chat).
-func runManagedLoop(e env, out io.Writer, maxRuns int, stopAtCoordinator bool, events loopEventSink) (loopStop, error) {
+// coordinator turns belong to chat). A non-nil control lets the caller stop
+// the loop between role runs (quit/pause from the unified view); the current
+// run always completes so records stay consistent.
+func runManagedLoop(e env, out io.Writer, maxRuns int, stopAtCoordinator bool, events loopEventSink, control *loopControl) (loopStop, error) {
 	emit := func(ev loopEvent) {
 		if events != nil {
 			events(ev)
@@ -3330,6 +3343,11 @@ func runManagedLoop(e env, out io.Writer, maxRuns int, stopAtCoordinator bool, e
 			return loopStop{}, err
 		}
 		emit(loopEvent{Event: "state_changed", State: statePayload(state)})
+		if control != nil {
+			if reason := control.requested(); reason != "" {
+				return stopped(loopStop{Reason: reason, State: state, Runs: runs}), nil
+			}
+		}
 		switch state.NextRole {
 		case "human":
 			return stopped(loopStop{Reason: "human", State: state, Runs: runs}), nil
@@ -3416,7 +3434,7 @@ func runLoopCommand(args []string, out, errOut io.Writer, e env) int {
 // the stop into plain output and an exit code. Shared by `agents run` and
 // `agents go`; cmd names the invoking command in error output.
 func runLoopToStop(cmd string, loopOut, errOut io.Writer, e env, maxRuns int, events loopEventSink) int {
-	stop, err := runManagedLoop(e, loopOut, maxRuns, false, events)
+	stop, err := runManagedLoop(e, loopOut, maxRuns, false, events, nil)
 	if err != nil {
 		if errors.Is(err, errRunInterrupted) {
 			printInterruptHint(loopOut, e)
