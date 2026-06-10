@@ -131,10 +131,48 @@ func Run(args []string, in io.Reader, out, errOut io.Writer) int {
 		return 1
 	}
 
+	// Resolve the workspace root by walking up to the nearest .agents
+	// workspace so commands work from subdirectories. init and trust always
+	// operate on the literal cwd (creating or trusting a new workspace).
+	if len(args) == 0 || (args[0] != "init" && args[0] != "trust") {
+		e.cwd = findWorkspaceRoot(e.cwd)
+	}
+
 	if len(args) > 0 {
 		return runOneShot(args, out, errOut, e)
 	}
 	return runInteractive(in, out, errOut, e)
+}
+
+// findWorkspaceRoot walks up from cwd to the nearest directory containing an
+// agents workspace. A bare .agents directory is not enough: the user-level
+// trust store also lives in ~/.agents, so a workspace must carry config.yml,
+// an active pointer, or a tasks directory. Returns cwd when nothing is found.
+func findWorkspaceRoot(cwd string) string {
+	dir := cwd
+	for {
+		if isWorkspaceDir(filepath.Join(dir, stateDir)) {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return cwd
+		}
+		dir = parent
+	}
+}
+
+func isWorkspaceDir(statePath string) bool {
+	info, err := os.Stat(statePath)
+	if err != nil || !info.IsDir() {
+		return false
+	}
+	for _, marker := range []string{"config.yml", "active", "tasks"} {
+		if _, err := os.Stat(filepath.Join(statePath, marker)); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 func runOneShot(args []string, out, errOut io.Writer, e env) int {
@@ -1410,6 +1448,9 @@ func printStatus(w io.Writer, e env, jsonOut bool) error {
 		fmt.Fprintln(w, "active task: none")
 	} else {
 		fmt.Fprintf(w, "active task: %s\n", active.Title)
+		if active.Missing {
+			fmt.Fprintln(w, "warning: active task directory is missing; run `agents task use <task>` or `agents task open`")
+		}
 		if active.Status != "" {
 			fmt.Fprintf(w, "task status: %s\n", active.Status)
 		}
@@ -1433,6 +1474,7 @@ type taskJSON struct {
 	Title    string       `json:"title"`
 	Status   string       `json:"status,omitempty"`
 	Path     string       `json:"path"`
+	Missing  bool         `json:"missing,omitempty"`
 	Next     string       `json:"next,omitempty"`
 	Findings findingsJSON `json:"findings"`
 	Records  recordsJSON  `json:"records"`
@@ -1484,10 +1526,11 @@ func trustStatus(trusted bool) string {
 
 func taskPayload(task activeTask, stats taskStats) *taskJSON {
 	return &taskJSON{
-		Title:  task.Title,
-		Status: task.Status,
-		Path:   task.Path,
-		Next:   stats.Next,
+		Title:   task.Title,
+		Status:  task.Status,
+		Path:    task.Path,
+		Missing: task.Missing,
+		Next:    stats.Next,
 		Findings: findingsJSON{
 			Open:     stats.FindingsOpen,
 			Fixed:    stats.FindingsFixed,
@@ -1562,6 +1605,9 @@ type activeTask struct {
 	Path   string
 	Title  string
 	Status string
+	// Missing reports a dangling active pointer: the pointer resolves but the
+	// task directory no longer exists.
+	Missing bool
 }
 
 type taskStats struct {
@@ -1600,6 +1646,7 @@ func readActiveTask(cwd string) activeTask {
 	}
 	taskData, err := os.ReadFile(filepath.Join(cwd, stateDir, cleanPath, "task.md"))
 	if err != nil {
+		task.Missing = os.IsNotExist(err)
 		return task
 	}
 	title, status := parseTaskSummary(string(taskData))
@@ -2251,6 +2298,10 @@ func writeActiveTask(cwd, cleanPath string) error {
 	return os.WriteFile(activeFile, []byte(cleanPath+"\n"), 0o644)
 }
 
+// maxSlugBytes bounds slug length so task and chunk filenames stay well under
+// filesystem name limits (255 bytes) even with date prefixes and refs.
+const maxSlugBytes = 80
+
 func slugify(s string) string {
 	var b strings.Builder
 	lastDash := false
@@ -2265,7 +2316,12 @@ func slugify(s string) string {
 			lastDash = true
 		}
 	}
-	return strings.Trim(b.String(), "-")
+	slug := strings.Trim(b.String(), "-")
+	for len(slug) > maxSlugBytes {
+		runes := []rune(slug)
+		slug = strings.TrimRight(string(runes[:len(runes)-1]), "-")
+	}
+	return slug
 }
 
 func runDecisionCommand(args []string, out, errOut io.Writer, e env) int {
@@ -3137,6 +3193,18 @@ func runLoopCommand(args []string, out, errOut io.Writer, e env) int {
 			return 1
 		}
 		return 0
+	}
+	// run executes shell command templates from .agents/config.yml, so an
+	// untrusted workspace (e.g. a freshly cloned repo) must refuse before
+	// anything is dispatched.
+	trusted, err := isTrusted(e)
+	if err != nil {
+		fmt.Fprintf(errOut, "agents: run: %v\n", err)
+		return 1
+	}
+	if !trusted {
+		fmt.Fprintf(errOut, "agents: run: %s is not trusted; `agents run` executes commands from .agents/config.yml — review it, then run `agents trust`\n", e.cwd)
+		return 1
 	}
 	if flags.Once {
 		return runLoopOnce(out, errOut, e, state)

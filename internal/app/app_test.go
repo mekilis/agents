@@ -1857,6 +1857,9 @@ func TestRunRoutesOpenFindingsToImplementer(t *testing.T) {
 	var out, errOut bytes.Buffer
 	code := withTempProcessEnv(t, func(home, cwd string) int {
 		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := trustWorkspace(e); err != nil {
+			t.Fatal(err)
+		}
 		if _, err := openTask(e, []string{"Loop Task"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
 			t.Fatal(err)
 		}
@@ -1921,6 +1924,9 @@ func TestRunRoutesFixedFindingsToReviewer(t *testing.T) {
 	var out, errOut bytes.Buffer
 	code := withTempProcessEnv(t, func(home, cwd string) int {
 		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := trustWorkspace(e); err != nil {
+			t.Fatal(err)
+		}
 		if _, err := openTask(e, []string{"Loop Task"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
 			t.Fatal(err)
 		}
@@ -1945,6 +1951,9 @@ func TestRunRoutesHandoffToImplementerToImplementer(t *testing.T) {
 	var out, errOut bytes.Buffer
 	code := withTempProcessEnv(t, func(home, cwd string) int {
 		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := trustWorkspace(e); err != nil {
+			t.Fatal(err)
+		}
 		if _, err := openTask(e, []string{"Loop Task"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
 			t.Fatal(err)
 		}
@@ -1971,6 +1980,9 @@ func TestRunRoutesHandoffToCoordinatorToCoordinator(t *testing.T) {
 	var out, errOut bytes.Buffer
 	code := withTempProcessEnv(t, func(home, cwd string) int {
 		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := trustWorkspace(e); err != nil {
+			t.Fatal(err)
+		}
 		if _, err := openTask(e, []string{"Planning Task"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
 			t.Fatal(err)
 		}
@@ -1997,6 +2009,9 @@ func TestRunRoutesHandoffToReviewerToReviewer(t *testing.T) {
 	var out, errOut bytes.Buffer
 	code := withTempProcessEnv(t, func(home, cwd string) int {
 		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := trustWorkspace(e); err != nil {
+			t.Fatal(err)
+		}
 		if _, err := openTask(e, []string{"Loop Task"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
 			t.Fatal(err)
 		}
@@ -2017,6 +2032,9 @@ func TestRunStopsAtHumanBoundaryAfterVerification(t *testing.T) {
 	var out, errOut bytes.Buffer
 	code := withTempProcessEnv(t, func(home, cwd string) int {
 		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := trustWorkspace(e); err != nil {
+			t.Fatal(err)
+		}
 		task, err := openTask(e, []string{"Loop Task"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
 		if err != nil {
 			t.Fatal(err)
@@ -2052,6 +2070,9 @@ func TestRunExecutesConfiguredImplementer(t *testing.T) {
 	code := withTempProcessEnv(t, func(home, cwd string) int {
 		runCwd = cwd
 		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := trustWorkspace(e); err != nil {
+			t.Fatal(err)
+		}
 		if _, err := openTask(e, []string{"Executable Loop"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
 			t.Fatal(err)
 		}
@@ -2130,6 +2151,9 @@ func TestRunStopsImplementerAfterReviewerHandoff(t *testing.T) {
 	code := withTempProcessEnv(t, func(home, cwd string) int {
 		runCwd = cwd
 		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := trustWorkspace(e); err != nil {
+			t.Fatal(err)
+		}
 		task, err := openTask(e, []string{"Completion Handoff"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
 		if err != nil {
 			t.Fatal(err)
@@ -2272,6 +2296,9 @@ func TestRunReportsMissingConfiguredAgent(t *testing.T) {
 	var out, errOut bytes.Buffer
 	code := withTempProcessEnv(t, func(home, cwd string) int {
 		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := trustWorkspace(e); err != nil {
+			t.Fatal(err)
+		}
 		if _, err := openTask(e, []string{"Missing Agent"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
 			t.Fatal(err)
 		}
@@ -2777,6 +2804,134 @@ func TestStatusJSONIncludesFailedVerification(t *testing.T) {
 	}
 }
 
+func TestRunRefusesUntrustedWorkspace(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		// Init the workspace but never trust it; a config commits a command
+		// template exactly like a malicious cloned repo would.
+		if code := Run([]string{"init"}, bytes.NewBuffer(nil), &out, &errOut); code != 0 {
+			t.Fatalf("init code=%d stderr=%s", code, errOut.String())
+		}
+		marker := filepath.Join(cwd, "pwned")
+		cfg := "roles:\n  implementer:\n    cmd: \"touch " + marker + " #{prompt_file}\"\n"
+		if err := os.WriteFile(filepath.Join(cwd, ".agents", "config.yml"), []byte(cfg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Untrusted Run"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		code := Run([]string{"run", "--once"}, bytes.NewBuffer(nil), &out, &errOut)
+		if code == 0 {
+			t.Fatalf("run must refuse an untrusted workspace")
+		}
+		if !strings.Contains(errOut.String(), "not trusted") {
+			t.Fatalf("expected trust refusal, got stderr:\n%s", errOut.String())
+		}
+		if _, err := os.Stat(marker); !os.IsNotExist(err) {
+			t.Fatalf("config command must not run in an untrusted workspace")
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
+func TestSlugifyCapsLength(t *testing.T) {
+	long := strings.Repeat("x", 300)
+	slug := slugify(long)
+	if len(slug) > maxSlugBytes {
+		t.Fatalf("slug exceeds %d bytes: %d", maxSlugBytes, len(slug))
+	}
+	multibyte := strings.Repeat("ü", 300)
+	slug = slugify(multibyte)
+	if len(slug) > maxSlugBytes {
+		t.Fatalf("multibyte slug exceeds %d bytes: %d", maxSlugBytes, len(slug))
+	}
+	if slugify("short title") != "short-title" {
+		t.Fatalf("short slugs must be unchanged")
+	}
+}
+
+func TestTaskOpenAcceptsLongTitle(t *testing.T) {
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		task, err := openTask(e, []string{strings.Repeat("very long title ", 30)}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatalf("long titles must not fail task open: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(cwd, ".agents", task.Path, "task.md")); err != nil {
+			t.Fatal(err)
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
+func TestCommandsResolveWorkspaceRootFromSubdir(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Root Task"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := initWorkspace(e, "share"); err != nil {
+			t.Fatal(err)
+		}
+		sub := filepath.Join(cwd, "sub", "dir")
+		if err := os.MkdirAll(sub, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chdir(sub); err != nil {
+			t.Fatal(err)
+		}
+		defer os.Chdir(cwd)
+		if code := Run([]string{"status"}, bytes.NewBuffer(nil), &out, &errOut); code != 0 {
+			t.Fatalf("status code=%d stderr=%s", code, errOut.String())
+		}
+		if !strings.Contains(out.String(), "Root Task") {
+			t.Fatalf("status from subdir must resolve the workspace root, got:\n%s", out.String())
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
+func TestStatusWarnsOnDanglingActivePointer(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Ghost Task"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(cwd, ".agents", "active"), []byte("tasks/gone-task\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if code := Run([]string{"status"}, bytes.NewBuffer(nil), &out, &errOut); code != 0 {
+			t.Fatalf("status code=%d stderr=%s", code, errOut.String())
+		}
+		if !strings.Contains(out.String(), "warning: active task directory is missing") {
+			t.Fatalf("expected dangling pointer warning, got:\n%s", out.String())
+		}
+		out.Reset()
+		if code := Run([]string{"status", "--json"}, bytes.NewBuffer(nil), &out, &errOut); code != 0 {
+			t.Fatalf("status --json code=%d stderr=%s", code, errOut.String())
+		}
+		if !strings.Contains(out.String(), `"missing": true`) {
+			t.Fatalf("expected missing flag in JSON, got:\n%s", out.String())
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
 func TestReadConfigParsesPerRoleOverrides(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(dir, ".agents"), 0o755); err != nil {
@@ -2830,6 +2985,9 @@ func TestRunLoopStopsWhenRoleRecordsNoProgress(t *testing.T) {
 	var out, errOut bytes.Buffer
 	code := withTempProcessEnv(t, func(home, cwd string) int {
 		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := trustWorkspace(e); err != nil {
+			t.Fatal(err)
+		}
 		if _, err := openTask(e, []string{"Stalled Loop"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
 			t.Fatal(err)
 		}
@@ -2855,6 +3013,9 @@ func TestRunLoopChainsRolesToHumanBoundary(t *testing.T) {
 	var out, errOut bytes.Buffer
 	code := withTempProcessEnv(t, func(home, cwd string) int {
 		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := trustWorkspace(e); err != nil {
+			t.Fatal(err)
+		}
 		task, err := openTask(e, []string{"Full Loop"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
 		if err != nil {
 			t.Fatal(err)
@@ -2923,6 +3084,9 @@ func TestRunLoopStopsAtMaxIterations(t *testing.T) {
 	var out, errOut bytes.Buffer
 	code := withTempProcessEnv(t, func(home, cwd string) int {
 		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := trustWorkspace(e); err != nil {
+			t.Fatal(err)
+		}
 		task, err := openTask(e, []string{"Churning Loop"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
 		if err != nil {
 			t.Fatal(err)

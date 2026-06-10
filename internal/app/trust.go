@@ -27,12 +27,22 @@ func isTrusted(e env) (bool, error) {
 		return false, err
 	}
 	currentRemote := readGitRemote(e.cwd)
+	cwd := canonicalPath(e.cwd)
 	for _, ws := range store.Workspaces {
-		if ws.Path == e.cwd && trustRemoteMatches(ws.GitRemote, currentRemote) {
+		if canonicalPath(ws.Path) == cwd && trustRemoteMatches(ws.GitRemote, currentRemote) {
 			return true, nil
 		}
 	}
 	return false, nil
+}
+
+// canonicalPath resolves symlinks so trust survives path aliases (on macOS
+// /tmp and /var are symlinks into /private). Unresolvable paths compare as-is.
+func canonicalPath(path string) string {
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return resolved
+	}
+	return path
 }
 
 func trustWorkspace(e env) (trustedWorkspace, error) {
