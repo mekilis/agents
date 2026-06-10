@@ -1,3 +1,3 @@
 # Next
 
-Review M2; then M3 (Ready-for-you screen) per qa/unified-loop-view-plan.md
+Review M3; all plan milestones (M0-M3) then complete

@@ -366,7 +366,9 @@ func loopViewTerminals(in io.Reader, out io.Writer) (*os.File, *os.File, bool) {
 // view on a TTY. The loop runs in a goroutine; events stream to the
 // renderer; q (confirmed) and p stop after the current run. When the loop
 // stops, the view flips to a plain-language summary in the normal screen
-// buffer so the ending survives in scrollback.
+// buffer so the ending survives in scrollback; at the human boundary the
+// summary is the Ready-for-you screen with one decision — accept, iterate,
+// or abandon.
 func runLoopWithView(in, out *os.File, errOut io.Writer, e env, taskTitle string, maxRuns int) int {
 	fd := int(in.Fd())
 	oldState, err := term.MakeRaw(fd)
@@ -374,7 +376,6 @@ func runLoopWithView(in, out *os.File, errOut io.Writer, e env, taskTitle string
 		fmt.Fprintf(errOut, "agents: go: enable raw terminal: %v\n", err)
 		return 1
 	}
-	fmt.Fprint(out, "\x1b[?1049h\x1b[?25l")
 	restore := func() {
 		_ = term.Restore(fd, oldState)
 		fmt.Fprint(out, "\x1b[?25h\x1b[?1049l")
@@ -389,10 +390,62 @@ func runLoopWithView(in, out *os.File, errOut io.Writer, e env, taskTitle string
 	signal.Notify(interrupts, os.Interrupt)
 	defer signal.Stop(interrupts)
 
+	keys := make(chan byte, 16)
+	go func() {
+		buf := make([]byte, 1)
+		for {
+			n, readErr := in.Read(buf)
+			if readErr != nil {
+				close(keys)
+				return
+			}
+			if n > 0 {
+				keys <- buf[0]
+			}
+		}
+	}()
+
+	// Each pass runs the loop inside the split view; iterate from the ready
+	// screen records the feedback handoff and re-enters the loop.
+	for {
+		result := watchLoopInView(out, e, taskTitle, maxRuns, keys, interrupts)
+		if result.err != nil || result.stop.Reason != "human" {
+			restore()
+			return printLoopViewEnding(out, errOut, e, result)
+		}
+		// Human boundary: leave the alternate screen so the summary lands
+		// in scrollback; keep raw mode for single-key decisions.
+		fmt.Fprint(out, "\x1b[?25h\x1b[?1049l")
+		summary := gatherReadySummary(e, result.stop.State, result.stop.Runs)
+		action, feedback := runReadyScreen(out, keys, summary)
+		switch action {
+		case readyAccept:
+			restore()
+			return acceptReadyTask(out, errOut, e, summary)
+		case readyIterate:
+			if _, handoffErr := addHandoff(e, []string{"--to", "implementer", feedback}, time.Now().UTC()); handoffErr != nil {
+				restore()
+				fmt.Fprintf(errOut, "agents: go: iterate: %v\n", handoffErr)
+				return 1
+			}
+			writeRawLines(out, []string{"", "Sent — running another round…"})
+		case readyAbandon:
+			restore()
+			fmt.Fprintln(out, "Left as is — the task stays active; rerun `agents run` or `agents` anytime.")
+			fmt.Fprintln(out)
+			printLoopState(out, result.stop.State)
+			return 0
+		}
+	}
+}
+
+// watchLoopInView runs one managed-loop pass while rendering the view and
+// handling keys, returning the loop result when it stops.
+func watchLoopInView(out *os.File, e env, taskTitle string, maxRuns int, keys <-chan byte, interrupts <-chan os.Signal) loopResult {
+	fmt.Fprint(out, "\x1b[?1049h\x1b[?25l")
 	view := newLoopView(taskTitle, maxRuns)
 	control := &loopControl{}
 	events := make(chan loopEvent, 256)
-	keys := make(chan byte, 16)
 	loopDone := make(chan loopResult, 1)
 
 	go func() {
@@ -400,18 +453,6 @@ func runLoopWithView(in, out *os.File, errOut io.Writer, e env, taskTitle string
 			events <- ev
 		}, control)
 		loopDone <- loopResult{stop: stop, err: loopErr}
-	}()
-	go func() {
-		buf := make([]byte, 1)
-		for {
-			n, readErr := in.Read(buf)
-			if readErr != nil {
-				return
-			}
-			if n > 0 {
-				keys <- buf[0]
-			}
-		}
 	}()
 
 	draw := func() {
@@ -442,7 +483,15 @@ func runLoopWithView(in, out *os.File, errOut io.Writer, e env, taskTitle string
 		case <-interrupts:
 			control.request("quit")
 			view.notice = "interrupted — stopping after the current run…"
-		case key := <-keys:
+		case key, ok := <-keys:
+			if !ok {
+				// Input closed: stop after the current run and block this
+				// case (a nil channel never fires) instead of spinning.
+				keys = nil
+				control.request("quit")
+				view.notice = "input closed — stopping after the current run…"
+				break
+			}
 			switch key {
 			case 'q', 'Q':
 				if confirmQuit {
@@ -464,8 +513,8 @@ func runLoopWithView(in, out *os.File, errOut io.Writer, e env, taskTitle string
 				view.notice = ""
 			}
 		case result := <-loopDone:
-			// Drain events emitted before the loop returned, show the final
-			// frame briefly, then flip to the plain summary.
+			// Drain events emitted before the loop returned and show the
+			// final frame before the caller flips to the plain summary.
 			for {
 				select {
 				case ev := <-events:
@@ -476,8 +525,7 @@ func runLoopWithView(in, out *os.File, errOut io.Writer, e env, taskTitle string
 				break
 			}
 			draw()
-			restore()
-			return printLoopViewEnding(out, errOut, e, result)
+			return result
 		}
 		draw()
 	}

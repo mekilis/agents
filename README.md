@@ -122,6 +122,15 @@ plain language ("Done and independently checked — your call.", "The agents
 are stuck — …"). When stdout is not a terminal — CI, pipes — or with
 `--plain`, `go` falls back to today's plain loop output automatically.
 
+When the loop reaches the human boundary, the view flips to the
+**Ready for you** screen: what was asked (scope), what changed
+(`git diff --stat`), the findings history, and the verification evidence —
+then one decision. `a` accepts: the task is archived and a commit message is
+suggested (agents never commit; that stays behind human approval). `i`
+iterates: describe what should change, and the feedback becomes a handoff
+that re-enters the loop in the same view. `x` abandons: everything is left
+as is and the task stays active.
+
 Like `agents run`, `go` executes commands from `.agents/config.yml`, so it
 refuses untrusted workspaces before creating any task state.
 
