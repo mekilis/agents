@@ -3450,7 +3450,9 @@ func resolveAgentCommand(agent string, settings agentSettings) (string, error) {
 		args = append(args, `"$(cat `+promptFileMarker+`)" --force`)
 		return strings.Join(args, " "), nil
 	case "codex":
-		args := []string{"codex exec --sandbox workspace-write"}
+		// Codex's workspace-write sandbox protects .agents/ like .git/, which
+		// blocks reviewers from recording findings. Re-add it explicitly.
+		args := []string{`codex exec --sandbox workspace-write -c 'sandbox_workspace_write.writable_roots=[".agents"]'`}
 		codexModel := firstNonEmpty(settings.CodexModel, settings.Model)
 		codexReasoning := firstNonEmpty(settings.CodexReasoning, settings.Reasoning)
 		if strings.TrimSpace(codexModel) != "" {
