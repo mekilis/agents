@@ -1088,8 +1088,8 @@ func newProgressWriter(out io.Writer, label string) *progressWriter {
 func (w *progressWriter) Start() {
 	w.mu.Lock()
 	w.started = true
-	w.mu.Unlock()
 	fmt.Fprintf(w.out, "\r%s |", w.label)
+	w.mu.Unlock()
 	go func() {
 		frames := []rune{'|', '/', '-', '\\'}
 		ticker := time.NewTicker(120 * time.Millisecond)
@@ -1099,10 +1099,14 @@ func (w *progressWriter) Start() {
 		for {
 			select {
 			case <-w.stop:
+				w.mu.Lock()
 				fmt.Fprintf(w.out, "\r\033[2K")
+				w.mu.Unlock()
 				return
 			case <-ticker.C:
+				w.mu.Lock()
 				fmt.Fprintf(w.out, "\r%s %c", w.label, frames[i%len(frames)])
+				w.mu.Unlock()
 				i++
 			}
 		}
@@ -1119,7 +1123,9 @@ func (w *progressWriter) Stop() {
 func (w *progressWriter) Write(p []byte) (int, error) {
 	text := string(p)
 	if strings.HasPrefix(text, "run id:") || strings.HasPrefix(text, "run log:") {
+		w.mu.Lock()
 		_, _ = fmt.Fprint(w.out, text)
+		w.mu.Unlock()
 	}
 	return len(p), nil
 }
