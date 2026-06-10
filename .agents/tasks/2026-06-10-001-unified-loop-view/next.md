@@ -1,3 +1,3 @@
 # Next
 
-Review M0; then M1 (agents go entry point) per qa/unified-loop-view-plan.md
+Review M1; then M2 (unified split view renderer) per qa/unified-loop-view-plan.md

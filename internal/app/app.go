@@ -202,6 +202,8 @@ func runOneShot(args []string, out, errOut io.Writer, e env) int {
 		return runInitCommand(args[1:], out, errOut, e)
 	case "start":
 		return runStartCommand(args[1:], out, errOut, e)
+	case "go":
+		return runGoCommand(args[1:], out, errOut, e)
 	case "task":
 		return runTaskCommand(args[1:], out, errOut, e)
 	case "decision":
@@ -556,6 +558,7 @@ func printHelp(w io.Writer) {
 	fmt.Fprintln(w, "  agents          Open the interactive terminal")
 	fmt.Fprintln(w, "  agents trust [--json]")
 	fmt.Fprintln(w, "  agents init [--share|--local]")
+	fmt.Fprintln(w, "  agents go \"what you want\" [--ref REF] [--max-iterations N]")
 	fmt.Fprintln(w, "  agents start \"title\" [--ref REF] \"what to do\"")
 	fmt.Fprintln(w, "  agents status [--json]")
 	fmt.Fprintln(w, "  agents task open \"title\" [--ref REF]")
@@ -644,6 +647,7 @@ _agents() {
     'help:show help'
     'trust:trust the current workspace'
     'init:initialize Agents state'
+    'go:open a task and run the loop to a stop condition'
     'start:open a task and hand off to implementer'
     'status:show workspace and task status'
     'task:open or switch tasks'
@@ -687,6 +691,9 @@ _agents() {
           ;;
         run)
           _arguments '--json[print JSON]' '--once[run a single role]' '--max-iterations[role run budget]:count:'
+          ;;
+        go)
+          _arguments '--ref[task reference]:ref:' '--max-iterations[role run budget]:count:'
           ;;
         verify)
           _arguments '--cmd[evidence command]:command:' '--by[actor]:actor:'
@@ -2079,6 +2086,103 @@ func parseStartArgs(args []string) (title, ref, text string, err error) {
 	return title, ref, text, nil
 }
 
+// runGoCommand is the one-command entry point: open a task, record scope,
+// hand off to the implementer, and drive the managed loop to a stop
+// condition. `agents go "what you want"` — no role homework.
+func runGoCommand(args []string, out, errOut io.Writer, e env) int {
+	text, ref, maxRuns, err := parseGoArgs(args)
+	if err != nil {
+		fmt.Fprintf(errOut, "agents: go: %v\n", err)
+		return 2
+	}
+	// go executes shell command templates from .agents/config.yml, so refuse
+	// untrusted workspaces before any task state is created.
+	trusted, err := isTrusted(e)
+	if err != nil {
+		fmt.Fprintf(errOut, "agents: go: %v\n", err)
+		return 1
+	}
+	if !trusted {
+		fmt.Fprintf(errOut, "agents: go: %s is not trusted; `agents go` executes commands from .agents/config.yml — review it, then run `agents trust`\n", e.cwd)
+		return 1
+	}
+	title, instruction := splitGoText(text)
+	taskArgs := []string{title}
+	if ref != "" {
+		taskArgs = append(taskArgs, "--ref", ref)
+	}
+	task, err := openTask(e, taskArgs, time.Now().UTC())
+	if err != nil {
+		fmt.Fprintf(errOut, "agents: go: %v\n", err)
+		return 1
+	}
+	if _, err := setTaskChunk(e, "scope", []string{instruction}); err != nil {
+		fmt.Fprintf(errOut, "agents: go: %v\n", err)
+		return 1
+	}
+	if _, err := addHandoff(e, []string{"--to", "implementer", instruction}, time.Now().UTC()); err != nil {
+		fmt.Fprintf(errOut, "agents: go: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(out, "task: %s\n", task.Title)
+	fmt.Fprintf(out, "task path: %s\n", task.Path)
+	fmt.Fprintln(out)
+	return runLoopToStop("go", out, errOut, e, maxRuns, nil)
+}
+
+func parseGoArgs(args []string) (text, ref string, maxRuns int, err error) {
+	maxRuns = defaultMaxLoopRuns
+	for i := 0; i < len(args); i++ {
+		arg := strings.TrimSpace(args[i])
+		switch arg {
+		case "":
+			continue
+		case "--ref":
+			if i+1 >= len(args) || strings.TrimSpace(args[i+1]) == "" {
+				return "", "", 0, fmt.Errorf("--ref requires a value")
+			}
+			ref = strings.TrimSpace(args[i+1])
+			i++
+		case "--max-iterations":
+			if i+1 >= len(args) {
+				return "", "", 0, fmt.Errorf("--max-iterations requires a number")
+			}
+			n, convErr := strconv.Atoi(strings.TrimSpace(args[i+1]))
+			if convErr != nil || n < 1 {
+				return "", "", 0, fmt.Errorf("--max-iterations requires a positive number")
+			}
+			maxRuns = n
+			i++
+		default:
+			if strings.HasPrefix(arg, "--") {
+				return "", "", 0, fmt.Errorf("unknown flag %s", arg)
+			}
+			if text != "" {
+				return "", "", 0, fmt.Errorf("go accepts exactly one instruction")
+			}
+			text = arg
+		}
+	}
+	if text == "" {
+		return "", "", 0, fmt.Errorf("instruction text is required, e.g. agents go \"Add /history command\"")
+	}
+	return text, ref, maxRuns, nil
+}
+
+// splitGoText derives a task title from the instruction. "title: what to do"
+// splits on the first ": " (a bare colon, as in URLs, does not split); plain
+// text is both title and instruction.
+func splitGoText(text string) (title, instruction string) {
+	if idx := strings.Index(text, ": "); idx > 0 {
+		title = strings.TrimSpace(text[:idx])
+		instruction = strings.TrimSpace(text[idx+2:])
+		if title != "" && instruction != "" {
+			return title, instruction
+		}
+	}
+	return text, text
+}
+
 func runTaskCommand(args []string, out, errOut io.Writer, e env) int {
 	if len(args) == 0 {
 		fmt.Fprintln(errOut, "agents: task command requires a subcommand")
@@ -3305,13 +3409,20 @@ func runLoopCommand(args []string, out, errOut io.Writer, e env) int {
 		events = jsonlEventSink(out)
 		loopOut = io.Discard
 	}
-	stop, err := runManagedLoop(e, loopOut, flags.MaxRuns, false, events)
+	return runLoopToStop("run", loopOut, errOut, e, flags.MaxRuns, events)
+}
+
+// runLoopToStop drives the managed loop until a stop condition and translates
+// the stop into plain output and an exit code. Shared by `agents run` and
+// `agents go`; cmd names the invoking command in error output.
+func runLoopToStop(cmd string, loopOut, errOut io.Writer, e env, maxRuns int, events loopEventSink) int {
+	stop, err := runManagedLoop(e, loopOut, maxRuns, false, events)
 	if err != nil {
 		if errors.Is(err, errRunInterrupted) {
 			printInterruptHint(loopOut, e)
 			return 130
 		}
-		fmt.Fprintf(errOut, "agents: run: %v\n", err)
+		fmt.Fprintf(errOut, "agents: %s: %v\n", cmd, err)
 		return 1
 	}
 	switch stop.Reason {

@@ -719,6 +719,205 @@ func TestStartRequiresInstruction(t *testing.T) {
 	}
 }
 
+func TestSplitGoText(t *testing.T) {
+	for _, tc := range []struct {
+		text, title, instruction string
+	}{
+		{"Add /history command", "Add /history command", "Add /history command"},
+		{"History: support /history in the terminal", "History", "support /history in the terminal"},
+		{"Fix http://example.com link", "Fix http://example.com link", "Fix http://example.com link"},
+		{"Trailing colon: ", "Trailing colon: ", "Trailing colon: "},
+	} {
+		title, instruction := splitGoText(tc.text)
+		if title != tc.title || instruction != tc.instruction {
+			t.Fatalf("splitGoText(%q) = (%q, %q), want (%q, %q)", tc.text, title, instruction, tc.title, tc.instruction)
+		}
+	}
+}
+
+func TestGoRequiresTrustBeforeCreatingTask(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		code := Run([]string{"go", "Add /history command"}, bytes.NewBuffer(nil), &out, &errOut)
+		if _, err := os.Stat(filepath.Join(cwd, ".agents", "tasks")); !os.IsNotExist(err) {
+			t.Fatalf("untrusted go must not create task state, stat err=%v", err)
+		}
+		return code
+	})
+	if code != 1 {
+		t.Fatalf("expected untrusted go to exit 1, got %d stderr=%s", code, errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "not trusted") {
+		t.Fatalf("expected trust error, got %q", errOut.String())
+	}
+}
+
+func TestGoRequiresInstruction(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		return Run([]string{"go"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code != 2 {
+		t.Fatalf("expected usage error exit 2, got %d", code)
+	}
+	if !strings.Contains(errOut.String(), "instruction text is required") {
+		t.Fatalf("expected instruction error, got %q", errOut.String())
+	}
+}
+
+func TestGoOpensTaskScopeAndHandoffWithoutConfiguredRoles(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := trustWorkspace(e); err != nil {
+			t.Fatal(err)
+		}
+		code := Run([]string{"go", "History: support /history in the terminal"}, bytes.NewBuffer(nil), &out, &errOut)
+		active := readActiveTask(cwd)
+		if active.Title != "History" {
+			t.Fatalf("expected title from colon split, got %+v", active)
+		}
+		scope, err := os.ReadFile(filepath.Join(cwd, ".agents", active.Path, "scope.md"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(scope), "support /history in the terminal") {
+			t.Fatalf("scope missing instruction:\n%s", scope)
+		}
+		handoffDir := filepath.Join(cwd, ".agents", active.Path, "handoffs")
+		entries, err := os.ReadDir(handoffDir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) != 1 {
+			t.Fatalf("expected one handoff, got %d", len(entries))
+		}
+		data, err := os.ReadFile(filepath.Join(handoffDir, entries[0].Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, want := range []string{"To: implementer", "support /history in the terminal"} {
+			if !strings.Contains(string(data), want) {
+				t.Fatalf("handoff missing %q, got:\n%s", want, data)
+			}
+		}
+		return code
+	})
+	// No roles configured: the loop stops at "unconfigured" with exit 0.
+	if code != 0 {
+		t.Fatalf("expected go to stop cleanly at unconfigured, code=%d stderr=%s", code, errOut.String())
+	}
+	for _, want := range []string{"task: History", "agent: not configured for implementer"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("go output missing %q, got:\n%s", want, out.String())
+		}
+	}
+}
+
+func TestGoReportsLoopErrorsAsGo(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := trustWorkspace(e); err != nil {
+			t.Fatal(err)
+		}
+		implementer := filepath.Join(cwd, "implementer.sh")
+		if err := os.WriteFile(implementer, []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cfg := "roles:\n  implementer: " + implementer + " {prompt_file}\n  reviewer: " + implementer + " {prompt_file}\n  coordinator: codex\n"
+		if err := os.MkdirAll(filepath.Join(cwd, ".agents"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(cwd, ".agents", "config.yml"), []byte(cfg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return Run([]string{"go", "Doomed task"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code != 1 {
+		t.Fatalf("expected failing loop to exit 1, got %d", code)
+	}
+	if !strings.Contains(errOut.String(), "agents: go: implementer command failed") {
+		t.Fatalf("expected error attributed to go, got %q", errOut.String())
+	}
+	if strings.Contains(errOut.String(), "agents: run:") {
+		t.Fatalf("go must not report errors as agents: run:, got %q", errOut.String())
+	}
+}
+
+func TestGoRunsLoopToHumanBoundary(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := trustWorkspace(e); err != nil {
+			t.Fatal(err)
+		}
+		// go opens the task itself, so the stubs locate it by glob. Stub
+		// records use far-future timestamps to sort after go's own handoff.
+		implementer := filepath.Join(cwd, "implementer.sh")
+		implementerBody := strings.Join([]string{
+			"#!/bin/sh",
+			"set -eu",
+			"trap 'exit 0' INT TERM",
+			"task_dir=$(echo .agents/tasks/*)",
+			"mkdir -p \"$task_dir/handoffs\"",
+			"cat > \"$task_dir/handoffs/2099-01-01T000100Z-handoff-to-reviewer.md\" <<'EOF'",
+			"# Handoff: reviewer",
+			"",
+			"To: reviewer",
+			"From: implementer",
+			"",
+			"Ready for review.",
+			"EOF",
+			"",
+		}, "\n")
+		if err := os.WriteFile(implementer, []byte(implementerBody), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		reviewer := filepath.Join(cwd, "reviewer.sh")
+		reviewerBody := strings.Join([]string{
+			"#!/bin/sh",
+			"set -eu",
+			"task_dir=$(echo .agents/tasks/*)",
+			"mkdir -p \"$task_dir/verification\"",
+			"cat > \"$task_dir/verification/2099-01-01T000200Z-checks.md\" <<'EOF'",
+			"# Verification: checks",
+			"",
+			"Result: pass",
+			"By: reviewer",
+			"",
+			"All checks pass.",
+			"EOF",
+			"",
+		}, "\n")
+		if err := os.WriteFile(reviewer, []byte(reviewerBody), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cfg := "roles:\n  implementer: " + implementer + " {prompt_file}\n  reviewer: " + reviewer + " {prompt_file}\n  coordinator: codex\n"
+		if err := os.MkdirAll(filepath.Join(cwd, ".agents"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(cwd, ".agents", "config.yml"), []byte(cfg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return Run([]string{"go", "Add /history command"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code != 0 {
+		t.Fatalf("expected go to reach human boundary, code=%d stderr=%s stdout=%s", code, errOut.String(), out.String())
+	}
+	got := out.String()
+	for _, want := range []string{
+		"task: Add /history command",
+		"running implementer...",
+		"running reviewer...",
+		"human approval required",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("go output missing %q:\n%s", want, got)
+		}
+	}
+}
+
 func TestInteractiveRejectsUntrustedNonTTY(t *testing.T) {
 	var out, errOut bytes.Buffer
 	code := withTempProcessEnv(t, func(home, cwd string) int {

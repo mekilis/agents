@@ -102,7 +102,20 @@ agents status
 agents status --json
 ```
 
-Open or switch tasks:
+One command from intent to a running loop — `agents go` opens a task, records
+the scope, hands off to the implementer, and drives the loop until a stop
+condition. No role configuration questions are asked of the user:
+
+```bash
+agents go "Add /history command"                       # text is title and scope
+agents go "History: support /history in the terminal"  # "title: instruction" splits
+agents go "Fix flaky test" --ref BUG-7 --max-iterations 8
+```
+
+Like `agents run`, `go` executes commands from `.agents/config.yml`, so it
+refuses untrusted workspaces before creating any task state.
+
+Open or switch tasks step by step instead:
 
 ```bash
 agents start "Fix checkout flow" --ref WEB-123 "Implement the checkout fix and add tests"
