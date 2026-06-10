@@ -59,8 +59,9 @@ var interactiveSlashCommands = []slashCommandSpec{
 	{Name: "/decision", Usage: `/decision add "text"`, Description: "record a planning decision"},
 	{Name: "/handoff", Usage: `/handoff --to ROLE "text"`, Description: "route context to another role"},
 	{Name: "/finding", Usage: "/finding add|fix|verify ...", Description: "track review findings"},
+	{Name: "/verify", Usage: `/verify "text" [--cmd 'shell command']`, Description: "record verification evidence"},
 	{Name: "/dispatch", Usage: "/dispatch <role>", Description: "print a role packet"},
-	{Name: "/run", Usage: "/run", Description: "run the next configured role"},
+	{Name: "/run", Usage: "/run", Description: "run queued roles until a stop condition"},
 	{Name: "/archive", Usage: "/archive", Description: "archive the active task"},
 	{Name: "/help", Usage: "/help", Description: "show this command menu"},
 	{Name: "/quit", Usage: "/quit", Description: "exit the interactive terminal"},
@@ -73,11 +74,34 @@ type env struct {
 	isTTY         bool
 	disableBanner bool
 	trustPath     string
+	actor         string
 }
 
 type config struct {
-	Roles    map[string]string
+	Roles    map[string]roleConfig
 	Settings agentSettings
+}
+
+// roleConfig holds who plays a role. Provider is a built-in agent name
+// (cursor, cursor-agent, agent, codex, claude); Cmd is an advanced escape
+// hatch containing {prompt_file}. Model and Reasoning override the global
+// provider settings for this role only.
+type roleConfig struct {
+	Provider  string
+	Model     string
+	Reasoning string
+	Cmd       string
+}
+
+func (rc roleConfig) agentLabel() string {
+	if strings.TrimSpace(rc.Cmd) != "" {
+		return strings.TrimSpace(rc.Cmd)
+	}
+	return strings.TrimSpace(rc.Provider)
+}
+
+func (rc roleConfig) configured() bool {
+	return rc.agentLabel() != ""
 }
 
 type agentSettings struct {
@@ -142,6 +166,8 @@ func runOneShot(args []string, out, errOut io.Writer, e env) int {
 		return runHandoffCommand(args[1:], out, errOut, e)
 	case "finding":
 		return runFindingCommand(args[1:], out, errOut, e)
+	case "verify":
+		return runVerifyCommand(args[1:], out, errOut, e)
 	case "archive":
 		return runArchiveCommand(args[1:], out, errOut, e)
 	case "dispatch":
@@ -212,7 +238,50 @@ func currentEnv(in io.Reader) (env, error) {
 		isTTY:         isTerminalReader(in),
 		disableBanner: bannerDisabledFromEnv(os.Getenv("AGENTS_NO_BANNER")),
 		trustPath:     trustPath,
+		actor:         defaultActor(),
 	}, nil
+}
+
+// defaultActor resolves the actor used for chunk attribution when --by is not
+// given: AGENTS_ACTOR first, then the local OS user.
+func defaultActor() string {
+	if actor := strings.TrimSpace(os.Getenv("AGENTS_ACTOR")); actor != "" {
+		return actor
+	}
+	if user := strings.TrimSpace(os.Getenv("USER")); user != "" {
+		return user
+	}
+	return strings.TrimSpace(os.Getenv("LOGNAME"))
+}
+
+func resolveActor(e env, by string) (string, error) {
+	if actor := strings.TrimSpace(by); actor != "" {
+		return actor, nil
+	}
+	if e.actor != "" {
+		return e.actor, nil
+	}
+	if actor := defaultActor(); actor != "" {
+		return actor, nil
+	}
+	return "", fmt.Errorf("actor is required: set AGENTS_ACTOR or pass --by")
+}
+
+// extractByFlag removes a --by flag from args and returns its value with the
+// remaining arguments.
+func extractByFlag(args []string) (by string, rest []string, err error) {
+	for i := 0; i < len(args); i++ {
+		if strings.TrimSpace(args[i]) != "--by" {
+			rest = append(rest, args[i])
+			continue
+		}
+		if i+1 >= len(args) || strings.TrimSpace(args[i+1]) == "" {
+			return "", nil, fmt.Errorf("--by requires a value")
+		}
+		by = strings.TrimSpace(args[i+1])
+		i++
+	}
+	return by, rest, nil
 }
 
 func bannerDisabledFromEnv(value string) bool {
@@ -234,7 +303,7 @@ func isTerminalReader(r io.Reader) bool {
 }
 
 func readConfig(cwd string) (config, error) {
-	cfg := config{Roles: map[string]string{}}
+	cfg := config{Roles: map[string]roleConfig{}}
 	data, err := os.ReadFile(filepath.Join(cwd, stateDir, "config.yml"))
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -244,6 +313,7 @@ func readConfig(cwd string) (config, error) {
 	}
 	inRoles := false
 	inSettings := false
+	currentRole := ""
 	for _, line := range strings.Split(string(data), "\n") {
 		if strings.TrimSpace(line) == "" || strings.HasPrefix(strings.TrimSpace(line), "#") {
 			continue
@@ -252,16 +322,19 @@ func readConfig(cwd string) (config, error) {
 		if trimmedLine == "roles:" {
 			inRoles = true
 			inSettings = false
+			currentRole = ""
 			continue
 		}
 		if trimmedLine == "settings:" {
 			inRoles = false
 			inSettings = true
+			currentRole = ""
 			continue
 		}
 		if inRoles {
 			if !strings.HasPrefix(line, "  ") {
 				inRoles = false
+				currentRole = ""
 				continue
 			}
 			trimmed := strings.TrimSpace(line)
@@ -269,10 +342,44 @@ func readConfig(cwd string) (config, error) {
 			if len(parts) != 2 {
 				continue
 			}
-			role := strings.TrimSpace(parts[0])
+			key := strings.TrimSpace(parts[0])
 			value := strings.Trim(strings.TrimSpace(parts[1]), `"`)
-			if role == "implementer" || role == "reviewer" || role == "coordinator" {
-				cfg.Roles[role] = value
+			if strings.HasPrefix(line, "    ") {
+				// Nested role field, e.g. "    model: gpt-5.5".
+				if currentRole == "" {
+					continue
+				}
+				rc := cfg.Roles[currentRole]
+				switch key {
+				case "provider":
+					rc.Provider = value
+				case "model":
+					rc.Model = value
+				case "reasoning":
+					rc.Reasoning = value
+				case "cmd":
+					rc.Cmd = value
+				}
+				cfg.Roles[currentRole] = rc
+				continue
+			}
+			if key != "implementer" && key != "reviewer" && key != "coordinator" {
+				currentRole = ""
+				continue
+			}
+			if value == "" {
+				// Map form: fields follow on deeper-indented lines.
+				currentRole = key
+				if _, ok := cfg.Roles[key]; !ok {
+					cfg.Roles[key] = roleConfig{}
+				}
+				continue
+			}
+			currentRole = ""
+			if strings.Contains(value, promptFileMarker) {
+				cfg.Roles[key] = roleConfig{Cmd: value}
+			} else {
+				cfg.Roles[key] = roleConfig{Provider: value}
 			}
 			continue
 		}
@@ -314,7 +421,60 @@ func configuredAgent(cwd, role string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return cfg.Roles[role], nil
+	return cfg.Roles[role].agentLabel(), nil
+}
+
+// roleSettings overlays a role's model/reasoning overrides onto the global
+// provider settings so command construction and run markers see one view.
+func roleSettings(rc roleConfig, settings agentSettings) agentSettings {
+	effective := settings
+	model := strings.TrimSpace(rc.Model)
+	reasoning := strings.TrimSpace(rc.Reasoning)
+	switch strings.ToLower(strings.TrimSpace(rc.Provider)) {
+	case "codex":
+		if model != "" {
+			effective.CodexModel = model
+		}
+		if reasoning != "" {
+			effective.CodexReasoning = reasoning
+		}
+	case "claude":
+		if model != "" {
+			effective.ClaudeModel = model
+		}
+		if reasoning != "" {
+			effective.ClaudeEffort = reasoning
+		}
+	case "cursor", "cursor-agent", "agent":
+		if model != "" {
+			effective.CursorModel = model
+		}
+	default:
+		if model != "" {
+			effective.Model = model
+		}
+		if reasoning != "" {
+			effective.Reasoning = reasoning
+		}
+	}
+	return effective
+}
+
+// resolveRoleCommand resolves the shell command template for a configured
+// role, applying per-role model/reasoning overrides.
+func resolveRoleCommand(rc roleConfig, settings agentSettings) (command, agent string, effective agentSettings, err error) {
+	effective = roleSettings(rc, settings)
+	if cmd := strings.TrimSpace(rc.Cmd); cmd != "" {
+		if !strings.Contains(cmd, promptFileMarker) {
+			return "", "", effective, fmt.Errorf("role cmd must contain %s", promptFileMarker)
+		}
+		return cmd, cmd, effective, nil
+	}
+	command, err = resolveAgentCommand(rc.Provider, effective)
+	if err != nil {
+		return "", "", effective, err
+	}
+	return command, strings.TrimSpace(rc.Provider), effective, nil
 }
 
 func printHelp(w io.Writer) {
@@ -328,17 +488,22 @@ func printHelp(w io.Writer) {
 	fmt.Fprintln(w, "  agents status [--json]")
 	fmt.Fprintln(w, "  agents task open \"title\" [--ref REF]")
 	fmt.Fprintln(w, "  agents task use <task>")
-	fmt.Fprintln(w, "  agents decision add \"text\"")
-	fmt.Fprintln(w, "  agents handoff --to ROLE \"text\"")
-	fmt.Fprintln(w, "  agents finding add \"text\" [--severity low|medium|high]")
-	fmt.Fprintln(w, "  agents finding fix <finding>")
-	fmt.Fprintln(w, "  agents finding verify <finding>")
+	fmt.Fprintln(w, "  agents decision add \"text\" [--by ACTOR]")
+	fmt.Fprintln(w, "  agents handoff --to ROLE \"text\" [--by ACTOR]")
+	fmt.Fprintln(w, "  agents finding add \"text\" [--severity low|medium|high] [--by ACTOR]")
+	fmt.Fprintln(w, "  agents finding fix <finding> [--evidence \"text\"] [--by ACTOR]")
+	fmt.Fprintln(w, "  agents finding verify <finding> [--evidence \"text\"] [--by ACTOR]")
+	fmt.Fprintln(w, "  agents verify \"text\" [--cmd 'shell command'] [--by ACTOR]")
 	fmt.Fprintln(w, "  agents archive")
 	fmt.Fprintln(w, "  agents dispatch <implementer|reviewer|coordinator> [--json]")
-	fmt.Fprintln(w, "  agents run [--json]")
+	fmt.Fprintln(w, "  agents run [--max-iterations N] [--once] [--json]")
 	fmt.Fprintln(w, "  agents completion zsh")
 	fmt.Fprintln(w, "  agents completion install-zsh")
 	fmt.Fprintln(w, "  agents version")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Actor identity:")
+	fmt.Fprintln(w, "  Records are attributed to --by, then AGENTS_ACTOR, then the OS user.")
+	fmt.Fprintln(w, "  A finding cannot be verified by the actor that fixed it.")
 }
 
 func printVersion(w io.Writer) {
@@ -412,9 +577,10 @@ _agents() {
     'decision:record a decision'
     'handoff:record a role handoff'
     'finding:track review findings'
+    'verify:record verification evidence'
     'archive:archive the active task'
     'dispatch:print a role packet'
-    'run:run the next configured role'
+    'run:run queued roles until a stop condition'
     'completion:generate shell completion'
   )
 
@@ -443,8 +609,14 @@ _agents() {
         init)
           _describe 'init option' init_flags
           ;;
-        status|trust|run)
+        status|trust)
           _describe 'option' json_flags
+          ;;
+        run)
+          _arguments '--json[print JSON]' '--once[run a single role]' '--max-iterations[role run budget]:count:'
+          ;;
+        verify)
+          _arguments '--cmd[evidence command]:command:' '--by[actor]:actor:'
           ;;
         dispatch)
           if (( CURRENT == 3 )); then
@@ -977,7 +1149,7 @@ func runCoordinatorChatResponse(e env, out io.Writer) error {
 	reply := cleanInteractiveAgentOutput(result.Agent, result.AgentOutput)
 	directive, directiveOK := parseCoordinatorDirective(reply)
 	if directiveOK {
-		if err := applyCoordinatorDirective(e, directive); err != nil {
+		if err := applyCoordinatorDirective(e, "coordinator", directive); err != nil {
 			return err
 		}
 		reply = removeCoordinatorDirective(reply)
@@ -1056,13 +1228,17 @@ func removeCoordinatorDirective(text string) string {
 	return strings.TrimSpace(text[:start] + text[end:])
 }
 
-func applyCoordinatorDirective(e env, directive coordinatorDirective) error {
+func applyCoordinatorDirective(e env, actor string, directive coordinatorDirective) error {
 	switch directive.Role {
 	case "implementer", "reviewer", "coordinator":
 	default:
 		return fmt.Errorf("coordinator requested unknown handoff role %q", directive.Role)
 	}
-	_, err := addHandoff(e, []string{"--to", directive.Role, directive.Text}, time.Now().UTC())
+	args := []string{"--to", directive.Role, directive.Text}
+	if strings.TrimSpace(actor) != "" {
+		args = append(args, "--by", actor)
+	}
+	_, err := addHandoff(e, args, time.Now().UTC())
 	return err
 }
 
@@ -1138,43 +1314,22 @@ func printInteractiveRoleTransition(out io.Writer, result roleRunResult) {
 }
 
 func runInteractiveQueuedRoles(e env, out io.Writer) error {
-	const maxInteractiveRoleRuns = 6
-	for i := 0; i < maxInteractiveRoleRuns; i++ {
-		state, err := analyzeLoopState(e)
-		if err != nil {
-			return err
-		}
-		switch state.NextRole {
-		case "human":
-			fmt.Fprintln(out)
-			printLoopState(out, state)
-			return nil
-		case "coordinator":
-			return nil
-		case "implementer", "reviewer":
-		default:
-			return fmt.Errorf("cannot run role %q", state.NextRole)
-		}
-		agent, err := configuredAgent(e.cwd, state.NextRole)
-		if err != nil {
-			return err
-		}
-		if strings.TrimSpace(agent) == "" {
-			fmt.Fprintf(out, "\nnext: %s\n", state.NextRole)
-			fmt.Fprintf(out, "agent: not configured for %s\n", state.NextRole)
-			return nil
-		}
-		fmt.Fprintf(out, "\nrunning %s...\n", state.NextRole)
-		result, err := runConfiguredRole(e, state, out)
-		if err != nil {
-			return err
-		}
-		printRoleRunResult(out, result)
-		if result.After.NextRole == "" || result.After.NextRole == state.NextRole {
-			return nil
-		}
+	stop, err := runManagedLoop(e, out, defaultMaxLoopRuns, true)
+	if err != nil {
+		return err
 	}
-	fmt.Fprintf(out, "\nloop paused after %d role runs; use /run to continue\n", maxInteractiveRoleRuns)
+	switch stop.Reason {
+	case "human":
+		fmt.Fprintln(out)
+		printLoopState(out, stop.State)
+	case "unconfigured":
+		fmt.Fprintf(out, "\nnext: %s\n", stop.State.NextRole)
+		fmt.Fprintf(out, "agent: not configured for %s\n", stop.State.NextRole)
+	case "no-progress":
+		fmt.Fprintf(out, "\nstopped: %s run recorded no progress; inspect the run log or route manually\n", stop.State.NextRole)
+	case "max-runs":
+		fmt.Fprintf(out, "\nloop paused after %d role runs; use /run to continue\n", stop.Runs)
+	}
 	return nil
 }
 
@@ -1378,9 +1533,14 @@ type taskStats struct {
 	Handoffs         int
 	LatestHandoffTo  string
 	Verification     int
+	VerificationFail int
 	FindingsOpen     int
 	FindingsFixed    int
 	FindingsVerified int
+	// LatestHandoffName and LatestVerificationName are chunk filenames; their
+	// timestamp prefixes order handoffs against verification evidence.
+	LatestHandoffName      string
+	LatestVerificationName string
 }
 
 func readActiveTask(cwd string) activeTask {
@@ -1584,6 +1744,13 @@ settings:
   # Cursor Agent: run 'agent models' or 'cursor-agent --list-models' for account-specific choices
   # Common examples from CLI help: gpt-5, claude-4.6-sonnet-medium, claude-4.6-sonnet-medium-thinking
   cursor_model: ""
+# Each role is a provider name (cursor, cursor-agent, agent, codex, claude)
+# or a map with provider plus optional model/reasoning overrides:
+#   reviewer:
+#     provider: codex
+#     model: gpt-5.5
+#     reasoning: high
+# Advanced escape hatch: a cmd template containing {prompt_file}.
 roles:
   implementer: agent
   reviewer: codex
@@ -1622,11 +1789,11 @@ func readTaskStats(cwd, activePath string) (taskStats, error) {
 	if err != nil {
 		return taskStats{}, err
 	}
-	latestHandoffTo, err := readLatestHandoffTo(filepath.Join(taskDir, "handoffs"))
+	latestHandoffTo, latestHandoffName, err := readLatestHandoffTo(filepath.Join(taskDir, "handoffs"))
 	if err != nil {
 		return taskStats{}, err
 	}
-	verification, err := countMarkdownFiles(filepath.Join(taskDir, "verification"))
+	verificationPass, verificationFail, latestVerificationName, err := readVerificationStats(filepath.Join(taskDir, "verification"))
 	if err != nil {
 		return taskStats{}, err
 	}
@@ -1639,15 +1806,67 @@ func readTaskStats(cwd, activePath string) (taskStats, error) {
 		return taskStats{}, err
 	}
 	return taskStats{
-		Next:             next,
-		Decisions:        decisions,
-		Handoffs:         handoffs,
-		LatestHandoffTo:  latestHandoffTo,
-		Verification:     verification,
-		FindingsOpen:     openFindings,
-		FindingsFixed:    fixedFindings,
-		FindingsVerified: verifiedFindings,
+		Next:                   next,
+		Decisions:              decisions,
+		Handoffs:               handoffs,
+		LatestHandoffTo:        latestHandoffTo,
+		LatestHandoffName:      latestHandoffName,
+		Verification:           verificationPass,
+		VerificationFail:       verificationFail,
+		LatestVerificationName: latestVerificationName,
+		FindingsOpen:           openFindings,
+		FindingsFixed:          fixedFindings,
+		FindingsVerified:       verifiedFindings,
 	}, nil
+}
+
+// readVerificationStats counts passing and failing verification chunks and
+// returns the newest *independent* passing chunk filename. Chunks without a
+// Result line are manually recorded evidence and count as passing. Evidence
+// recorded by the implementer never satisfies the human approval boundary:
+// implementers do not verify their own work.
+func readVerificationStats(dir string) (pass, fail int, latestPass string, err error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, 0, "", nil
+		}
+		return 0, 0, "", err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".md") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			return 0, 0, "", err
+		}
+		failed := false
+		resultSeen := false
+		by := ""
+		for _, line := range strings.Split(string(data), "\n") {
+			trimmed := strings.ToLower(strings.TrimSpace(line))
+			if !resultSeen && strings.HasPrefix(trimmed, "result:") {
+				failed = strings.TrimSpace(strings.TrimPrefix(trimmed, "result:")) == "fail"
+				resultSeen = true
+			}
+			if by == "" && strings.HasPrefix(trimmed, "by:") {
+				by = strings.TrimSpace(strings.TrimPrefix(trimmed, "by:"))
+			}
+			if resultSeen && by != "" {
+				break
+			}
+		}
+		if failed {
+			fail++
+			continue
+		}
+		pass++
+		if by != "implementer" && entry.Name() > latestPass {
+			latestPass = entry.Name()
+		}
+	}
+	return pass, fail, latestPass, nil
 }
 
 func printTaskStats(w io.Writer, stats taskStats) {
@@ -1655,7 +1874,11 @@ func printTaskStats(w io.Writer, stats taskStats) {
 		fmt.Fprintf(w, "next: %s\n", stats.Next)
 	}
 	fmt.Fprintf(w, "findings: open=%d fixed=%d verified=%d\n", stats.FindingsOpen, stats.FindingsFixed, stats.FindingsVerified)
-	fmt.Fprintf(w, "records: decisions=%d handoffs=%d verification=%d\n", stats.Decisions, stats.Handoffs, stats.Verification)
+	if stats.VerificationFail > 0 {
+		fmt.Fprintf(w, "records: decisions=%d handoffs=%d verification=%d (failed=%d)\n", stats.Decisions, stats.Handoffs, stats.Verification, stats.VerificationFail)
+	} else {
+		fmt.Fprintf(w, "records: decisions=%d handoffs=%d verification=%d\n", stats.Decisions, stats.Handoffs, stats.Verification)
+	}
 }
 
 func readNextLine(path string) (string, error) {
@@ -1676,13 +1899,13 @@ func readNextLine(path string) (string, error) {
 	return "", nil
 }
 
-func readLatestHandoffTo(dir string) (string, error) {
+func readLatestHandoffTo(dir string) (to, name string, err error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return "", nil
+			return "", "", nil
 		}
-		return "", err
+		return "", "", err
 	}
 	latest := ""
 	for _, entry := range entries {
@@ -1694,19 +1917,19 @@ func readLatestHandoffTo(dir string) (string, error) {
 		}
 	}
 	if latest == "" {
-		return "", nil
+		return "", "", nil
 	}
 	data, err := os.ReadFile(filepath.Join(dir, latest))
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	for _, line := range strings.Split(string(data), "\n") {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(strings.ToLower(trimmed), "to:") {
-			return strings.ToLower(strings.TrimSpace(strings.TrimPrefix(trimmed, "To:"))), nil
+			return strings.ToLower(strings.TrimSpace(strings.TrimPrefix(trimmed, "To:"))), latest, nil
 		}
 	}
-	return "", nil
+	return "", latest, nil
 }
 
 func runStartCommand(args []string, out, errOut io.Writer, e env) int {
@@ -2000,10 +2223,19 @@ type chunkRecord struct {
 	Path  string
 	Title string
 	To    string
+	By    string
 }
 
 func addDecision(e env, args []string, now time.Time) (chunkRecord, error) {
-	text, err := parseSingleTextArg(args, "decision text")
+	by, rest, err := extractByFlag(args)
+	if err != nil {
+		return chunkRecord{}, err
+	}
+	actor, err := resolveActor(e, by)
+	if err != nil {
+		return chunkRecord{}, err
+	}
+	text, err := parseSingleTextArg(rest, "decision text")
 	if err != nil {
 		return chunkRecord{}, err
 	}
@@ -2011,7 +2243,7 @@ func addDecision(e env, args []string, now time.Time) (chunkRecord, error) {
 	if len(title) > 80 {
 		title = strings.TrimSpace(title[:80])
 	}
-	body := fmt.Sprintf("# Decision: %s\n\nStatus: proposed\n\n%s\n", title, text)
+	body := fmt.Sprintf("# Decision: %s\n\nStatus: proposed\nBy: %s\n\n%s\n", title, actor, text)
 	record, err := writeActiveTaskChunk(e, "decisions", title, body, now)
 	if err != nil {
 		return chunkRecord{}, err
@@ -2020,12 +2252,20 @@ func addDecision(e env, args []string, now time.Time) (chunkRecord, error) {
 }
 
 func addHandoff(e env, args []string, now time.Time) (chunkRecord, error) {
-	to, text, err := parseHandoffArgs(args)
+	by, rest, err := extractByFlag(args)
+	if err != nil {
+		return chunkRecord{}, err
+	}
+	actor, err := resolveActor(e, by)
+	if err != nil {
+		return chunkRecord{}, err
+	}
+	to, text, err := parseHandoffArgs(rest)
 	if err != nil {
 		return chunkRecord{}, err
 	}
 	title := "Handoff to " + to
-	body := fmt.Sprintf("# Handoff: %s\n\nTo: %s\n\n%s\n", to, to, text)
+	body := fmt.Sprintf("# Handoff: %s\n\nTo: %s\nFrom: %s\n\n%s\n", to, to, actor, text)
 	record, err := writeActiveTaskChunk(e, "handoffs", title, body, now)
 	if err != nil {
 		return chunkRecord{}, err
@@ -2150,6 +2390,7 @@ func runFindingCommand(args []string, out, errOut io.Writer, e env) int {
 			return 1
 		}
 		fmt.Fprintf(out, "verified finding: %s\n", record.Path)
+		fmt.Fprintf(out, "verified by: %s\n", record.By)
 		return 0
 	default:
 		fmt.Fprintf(errOut, "agents: unknown finding command: %s\n", args[0])
@@ -2158,7 +2399,15 @@ func runFindingCommand(args []string, out, errOut io.Writer, e env) int {
 }
 
 func addFinding(e env, args []string, now time.Time) (chunkRecord, error) {
-	text, severity, err := parseFindingAddArgs(args)
+	by, rest, err := extractByFlag(args)
+	if err != nil {
+		return chunkRecord{}, err
+	}
+	actor, err := resolveActor(e, by)
+	if err != nil {
+		return chunkRecord{}, err
+	}
+	text, severity, err := parseFindingAddArgs(rest)
 	if err != nil {
 		return chunkRecord{}, err
 	}
@@ -2166,7 +2415,7 @@ func addFinding(e env, args []string, now time.Time) (chunkRecord, error) {
 	if len(title) > 80 {
 		title = strings.TrimSpace(title[:80])
 	}
-	body := fmt.Sprintf("# Finding: %s\n\nStatus: open\nSeverity: %s\n\n%s\n", title, severity, text)
+	body := fmt.Sprintf("# Finding: %s\n\nStatus: open\nSeverity: %s\nCreated by: %s\n\n%s\n", title, severity, actor, text)
 	return writeActiveTaskChunk(e, "findings", title, body, now)
 }
 
@@ -2203,7 +2452,19 @@ func parseFindingAddArgs(args []string) (text, severity string, err error) {
 }
 
 func updateFindingStatus(e env, args []string, status, section string, now time.Time) (chunkRecord, error) {
-	findingArg, err := parseSingleTextArg(args, "finding path")
+	by, rest, err := extractByFlag(args)
+	if err != nil {
+		return chunkRecord{}, err
+	}
+	evidence, rest, err := extractFlagValue(rest, "--evidence")
+	if err != nil {
+		return chunkRecord{}, err
+	}
+	actor, err := resolveActor(e, by)
+	if err != nil {
+		return chunkRecord{}, err
+	}
+	findingArg, err := parseSingleTextArg(rest, "finding path")
 	if err != nil {
 		return chunkRecord{}, err
 	}
@@ -2219,14 +2480,70 @@ func updateFindingStatus(e env, args []string, status, section string, now time.
 	if err != nil {
 		return chunkRecord{}, err
 	}
-	updated := replaceStatusLine(string(data), status)
+	markdown := string(data)
+	current := findingStatus(markdown)
+	switch status {
+	case "fixed":
+		if current == "verified" {
+			return chunkRecord{}, fmt.Errorf("finding is already verified")
+		}
+	case "verified":
+		if current != "fixed" {
+			return chunkRecord{}, fmt.Errorf("finding must be marked fixed before it can be verified (current status: %s)", current)
+		}
+		fixedBy := findingSectionActor(markdown, "Fixed")
+		if fixedBy != "" && fixedBy == actor {
+			return chunkRecord{}, fmt.Errorf("finding was fixed by %q; verification requires a different actor (set AGENTS_ACTOR or pass --by)", fixedBy)
+		}
+	}
+	updated := replaceStatusLine(markdown, status)
 	var b strings.Builder
 	b.WriteString(strings.TrimRight(updated, "\n"))
-	fmt.Fprintf(&b, "\n\n## %s\n\nRecorded at: %s\n", section, now.Format(time.RFC3339))
+	fmt.Fprintf(&b, "\n\n## %s\n\nBy: %s\nRecorded at: %s\n", section, actor, now.Format(time.RFC3339))
+	if strings.TrimSpace(evidence) != "" {
+		fmt.Fprintf(&b, "Evidence: %s\n", strings.TrimSpace(evidence))
+	}
 	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
 		return chunkRecord{}, err
 	}
-	return chunkRecord{Path: relPath}, nil
+	return chunkRecord{Path: relPath, By: actor}, nil
+}
+
+// extractFlagValue removes a `flag value` pair from args.
+func extractFlagValue(args []string, flag string) (value string, rest []string, err error) {
+	for i := 0; i < len(args); i++ {
+		if strings.TrimSpace(args[i]) != flag {
+			rest = append(rest, args[i])
+			continue
+		}
+		if i+1 >= len(args) || strings.TrimSpace(args[i+1]) == "" {
+			return "", nil, fmt.Errorf("%s requires a value", flag)
+		}
+		value = strings.TrimSpace(args[i+1])
+		i++
+	}
+	return value, rest, nil
+}
+
+// findingSectionActor returns the actor recorded by the most recent
+// "## <section>" block in a finding chunk.
+func findingSectionActor(markdown, section string) string {
+	lines := strings.Split(markdown, "\n")
+	heading := "## " + strings.ToLower(section)
+	actor := ""
+	inSection := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		lower := strings.ToLower(trimmed)
+		if strings.HasPrefix(lower, "## ") {
+			inSection = lower == heading
+			continue
+		}
+		if inSection && strings.HasPrefix(lower, "by:") {
+			actor = strings.TrimSpace(trimmed[len("by:"):])
+		}
+	}
+	return actor
 }
 
 func resolveFindingPath(e env, activePath, findingArg string) (relPath, absPath string, err error) {
@@ -2274,6 +2591,95 @@ func replaceStatusLine(markdown, status string) string {
 		return "Status: " + status + "\n" + markdown
 	}
 	return strings.Join(lines, "\n")
+}
+
+// runVerifyCommand records verification evidence as a chunk under the active
+// task. With --cmd it executes the command and records the exit code and
+// output, so the evidence is reproducible instead of claimed.
+func runVerifyCommand(args []string, out, errOut io.Writer, e env) int {
+	record, passed, err := addVerification(e, args, time.Now().UTC())
+	if err != nil {
+		fmt.Fprintf(errOut, "agents: verify: %v\n", err)
+		return 1
+	}
+	fmt.Fprintf(out, "verification: %s\n", record.Title)
+	fmt.Fprintf(out, "path: %s\n", record.Path)
+	fmt.Fprintf(out, "by: %s\n", record.By)
+	if !passed {
+		fmt.Fprintln(out, "result: fail")
+		return 1
+	}
+	fmt.Fprintln(out, "result: pass")
+	return 0
+}
+
+const verificationOutputLimit = 4000
+
+func addVerification(e env, args []string, now time.Time) (chunkRecord, bool, error) {
+	by, rest, err := extractByFlag(args)
+	if err != nil {
+		return chunkRecord{}, false, err
+	}
+	command, rest, err := extractFlagValue(rest, "--cmd")
+	if err != nil {
+		return chunkRecord{}, false, err
+	}
+	actor, err := resolveActor(e, by)
+	if err != nil {
+		return chunkRecord{}, false, err
+	}
+	text, err := parseSingleTextArg(rest, "verification text")
+	if err != nil {
+		return chunkRecord{}, false, err
+	}
+	title := text
+	if len(title) > 80 {
+		title = strings.TrimSpace(title[:80])
+	}
+	result := "pass"
+	var commandSection string
+	if strings.TrimSpace(command) != "" {
+		output, exitCode, runErr := runVerificationCommand(e.cwd, command)
+		if runErr != nil {
+			return chunkRecord{}, false, runErr
+		}
+		if exitCode != 0 {
+			result = "fail"
+		}
+		var section strings.Builder
+		fmt.Fprintf(&section, "\n## Command\n\n$ %s\nexit: %d\n", command, exitCode)
+		if trimmed := strings.TrimSpace(output); trimmed != "" {
+			if len(trimmed) > verificationOutputLimit {
+				trimmed = "...\n" + trimmed[len(trimmed)-verificationOutputLimit:]
+			}
+			fmt.Fprintf(&section, "\n```\n%s\n```\n", trimmed)
+		}
+		commandSection = section.String()
+	}
+	body := fmt.Sprintf("# Verification: %s\n\nResult: %s\nBy: %s\nRecorded at: %s\n\n%s\n%s",
+		title, result, actor, now.Format(time.RFC3339), text, commandSection)
+	record, err := writeActiveTaskChunk(e, "verification", title, body, now)
+	if err != nil {
+		return chunkRecord{}, false, err
+	}
+	record.By = actor
+	return record, result == "pass", nil
+}
+
+// runVerificationCommand executes an evidence command and returns its
+// combined output and exit code. A non-zero exit is evidence, not an error.
+func runVerificationCommand(cwd, command string) (string, int, error) {
+	cmd := exec.Command("sh", "-c", command)
+	cmd.Dir = cwd
+	output, err := cmd.CombinedOutput()
+	if err == nil {
+		return string(output), 0, nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return string(output), exitErr.ExitCode(), nil
+	}
+	return string(output), -1, err
 }
 
 func runArchiveCommand(args []string, out, errOut io.Writer, e env) int {
@@ -2518,8 +2924,106 @@ func runDispatchCommand(args []string, out, errOut io.Writer, e env) int {
 	return 0
 }
 
+const defaultMaxLoopRuns = 6
+
+type runFlags struct {
+	JSON    bool
+	Once    bool
+	MaxRuns int
+}
+
+func parseRunArgs(args []string) (runFlags, error) {
+	flags := runFlags{MaxRuns: defaultMaxLoopRuns}
+	for i := 0; i < len(args); i++ {
+		arg := strings.TrimSpace(args[i])
+		switch arg {
+		case "":
+			continue
+		case "--json":
+			flags.JSON = true
+		case "--once":
+			flags.Once = true
+		case "--max-iterations":
+			if i+1 >= len(args) {
+				return flags, fmt.Errorf("--max-iterations requires a number")
+			}
+			n, err := strconv.Atoi(strings.TrimSpace(args[i+1]))
+			if err != nil || n < 1 {
+				return flags, fmt.Errorf("--max-iterations requires a positive number")
+			}
+			flags.MaxRuns = n
+			i++
+		default:
+			return flags, fmt.Errorf("unknown flag %s", arg)
+		}
+	}
+	return flags, nil
+}
+
+// loopStop describes why a managed loop stopped.
+type loopStop struct {
+	Reason string // human | coordinator | unconfigured | no-progress | max-runs
+	State  loopState
+	Runs   int
+}
+
+// loopSignature fingerprints coordination state so the loop can detect a role
+// run that recorded no progress and stop instead of churning.
+func loopSignature(state loopState) string {
+	s := state.Stats
+	return fmt.Sprintf("%s|%d|%d|%d|%d|%s|%s",
+		state.NextRole, s.FindingsOpen, s.FindingsFixed, s.FindingsVerified,
+		s.Verification, s.LatestHandoffName, s.LatestVerificationName)
+}
+
+// runManagedLoop drives configured roles until a stop condition: the human
+// approval boundary, an unconfigured role, no recorded progress after a run,
+// or the run budget. With stopAtCoordinator the loop yields to the caller
+// instead of running the coordinator (used by the interactive terminal where
+// coordinator turns belong to chat).
+func runManagedLoop(e env, out io.Writer, maxRuns int, stopAtCoordinator bool) (loopStop, error) {
+	runs := 0
+	for {
+		state, err := analyzeLoopState(e)
+		if err != nil {
+			return loopStop{}, err
+		}
+		switch state.NextRole {
+		case "human":
+			return loopStop{Reason: "human", State: state, Runs: runs}, nil
+		case "coordinator":
+			if stopAtCoordinator {
+				return loopStop{Reason: "coordinator", State: state, Runs: runs}, nil
+			}
+		case "implementer", "reviewer":
+		default:
+			return loopStop{}, fmt.Errorf("cannot run role %q", state.NextRole)
+		}
+		if runs >= maxRuns {
+			return loopStop{Reason: "max-runs", State: state, Runs: runs}, nil
+		}
+		agent, err := configuredAgent(e.cwd, state.NextRole)
+		if err != nil {
+			return loopStop{}, err
+		}
+		if strings.TrimSpace(agent) == "" {
+			return loopStop{Reason: "unconfigured", State: state, Runs: runs}, nil
+		}
+		fmt.Fprintf(out, "\nrunning %s...\n", state.NextRole)
+		result, err := runConfiguredRole(e, state, out)
+		if err != nil {
+			return loopStop{}, err
+		}
+		runs++
+		printRoleRunResult(out, result)
+		if loopSignature(result.After) == loopSignature(state) {
+			return loopStop{Reason: "no-progress", State: result.After, Runs: runs}, nil
+		}
+	}
+}
+
 func runLoopCommand(args []string, out, errOut io.Writer, e env) int {
-	jsonOut, err := parseJSONFlag(args)
+	flags, err := parseRunArgs(args)
 	if err != nil {
 		fmt.Fprintf(errOut, "agents: run: %v\n", err)
 		return 2
@@ -2529,13 +3033,50 @@ func runLoopCommand(args []string, out, errOut io.Writer, e env) int {
 		fmt.Fprintf(errOut, "agents: run: %v\n", err)
 		return 1
 	}
-	if jsonOut {
+	if flags.JSON {
 		if err := writeJSON(out, loopPayload(state)); err != nil {
 			fmt.Fprintf(errOut, "agents: run: %v\n", err)
 			return 1
 		}
 		return 0
 	}
+	if flags.Once {
+		return runLoopOnce(out, errOut, e, state)
+	}
+	stop, err := runManagedLoop(e, out, flags.MaxRuns, false)
+	if err != nil {
+		if errors.Is(err, errRunInterrupted) {
+			printInterruptHint(out, e)
+			return 130
+		}
+		fmt.Fprintf(errOut, "agents: run: %v\n", err)
+		return 1
+	}
+	switch stop.Reason {
+	case "human":
+		fmt.Fprintln(out)
+		printLoopState(out, stop.State)
+		return 0
+	case "unconfigured":
+		printLoopState(out, stop.State)
+		fmt.Fprintf(out, "agent: not configured for %s\n", stop.State.NextRole)
+		return 0
+	case "no-progress":
+		fmt.Fprintf(out, "\nstopped: %s run recorded no progress; inspect the run log and route manually\n", stop.State.NextRole)
+		printLoopState(out, stop.State)
+		return 1
+	case "max-runs":
+		fmt.Fprintf(out, "\nstopped: reached %d role runs with work remaining; rerun `agents run` to continue\n", stop.Runs)
+		printLoopState(out, stop.State)
+		return 1
+	default:
+		return 0
+	}
+}
+
+// runLoopOnce preserves single-step dispatch for scripts that drive the loop
+// themselves.
+func runLoopOnce(out, errOut io.Writer, e env, state loopState) int {
 	if state.NextRole == "human" {
 		printLoopState(out, state)
 		return 0
@@ -2638,7 +3179,7 @@ func dispatchPacket(e env, role string) (dispatchInfo, error) {
 	}
 	info := dispatchInfo{
 		Role:  role,
-		Agent: config.Roles[role],
+		Agent: config.Roles[role].agentLabel(),
 		Task:  state.Task,
 		Stats: state.Stats,
 	}
@@ -2681,6 +3222,10 @@ func analyzeLoopState(e env) (loopState, error) {
 	case stats.FindingsFixed > 0:
 		state.NextRole = "reviewer"
 		state.NextAction = "verify fixed findings independently"
+	case verificationCurrent(stats):
+		state.NextRole = "human"
+		state.NextAction = "approve archive, commit, or next task"
+		state.Boundary = "human approval required"
 	case stats.LatestHandoffTo == "reviewer":
 		state.NextRole = "reviewer"
 		state.NextAction = "review latest handoff"
@@ -2690,15 +3235,25 @@ func analyzeLoopState(e env) (loopState, error) {
 	case stats.LatestHandoffTo == "coordinator":
 		state.NextRole = "coordinator"
 		state.NextAction = "continue intake and planning"
-	case stats.Verification > 0 && stats.FindingsOpen == 0 && stats.FindingsFixed == 0:
-		state.NextRole = "human"
-		state.NextAction = "approve archive, commit, or next task"
-		state.Boundary = "human approval required"
 	default:
 		state.NextRole = "implementer"
 		state.NextAction = "start or continue implementation"
 	}
 	return state, nil
+}
+
+// verificationCurrent reports whether passing verification evidence exists
+// that is at least as new as the latest handoff. Chunk filenames begin with a
+// UTC timestamp, so lexicographic comparison orders them. Stale evidence
+// recorded before the latest handoff does not satisfy the human boundary.
+func verificationCurrent(stats taskStats) bool {
+	if stats.FindingsOpen > 0 || stats.FindingsFixed > 0 {
+		return false
+	}
+	if stats.LatestVerificationName == "" {
+		return false
+	}
+	return stats.LatestVerificationName >= stats.LatestHandoffName
 }
 
 func runConfiguredRole(e env, state loopState, out io.Writer) (roleRunResult, error) {
@@ -2713,11 +3268,11 @@ func runConfiguredRoleWithOptions(e env, state loopState, options roleRunOptions
 	if err != nil {
 		return roleRunResult{}, err
 	}
-	agent := strings.TrimSpace(config.Roles[state.NextRole])
-	if agent == "" {
+	rc := config.Roles[state.NextRole]
+	if !rc.configured() {
 		return roleRunResult{}, fmt.Errorf("no agent configured for %s", state.NextRole)
 	}
-	commandTemplate, err := resolveAgentCommand(agent, config.Settings)
+	commandTemplate, agent, effectiveSettings, err := resolveRoleCommand(rc, config.Settings)
 	if err != nil {
 		return roleRunResult{}, err
 	}
@@ -2741,11 +3296,11 @@ func runConfiguredRoleWithOptions(e env, state loopState, options roleRunOptions
 		fmt.Fprintf(live, "run id: %s\n", artifacts.ID)
 		fmt.Fprintf(live, "run log: %s\n\n", relPathFrom(e.cwd, artifacts.Log))
 	}
-	output, err := runStreamingShellCommand(e.cwd, command, artifacts, state, agent, config.Settings, live)
+	output, err := runStreamingShellCommand(e.cwd, command, artifacts, state, agent, effectiveSettings, live)
 	if err != nil {
 		return roleRunResult{}, fmt.Errorf("%s command failed: %w\n%s", state.NextRole, err, strings.TrimSpace(output))
 	}
-	output, err = applyRoleOutputDirectives(e, output)
+	output, err = applyRoleOutputDirectives(e, state.NextRole, output)
 	if err != nil {
 		return roleRunResult{}, err
 	}
@@ -2876,6 +3431,9 @@ func firstNonEmpty(values ...string) string {
 func runStreamingShellCommand(cwd, command string, artifacts runArtifactPaths, state loopState, agent string, settings agentSettings, live io.Writer) (string, error) {
 	cmd := exec.Command("sh", "-c", command)
 	cmd.Dir = cwd
+	// Attribute any `agents` CLI calls the role makes to the role itself, so
+	// findings, fixes, and verifications carry enforceable actor identity.
+	cmd.Env = append(os.Environ(), "AGENTS_ACTOR="+state.NextRole)
 	configureManagedProcess(cmd)
 	if err := os.MkdirAll(filepath.Dir(artifacts.Log), 0o755); err != nil {
 		return "", err
@@ -3131,9 +3689,10 @@ func buildRolePrompt(e env, state loopState) (string, error) {
 		fmt.Fprintln(&b, "Working agreement:")
 		fmt.Fprintln(&b, "- Edit the working tree to implement the task or fix open findings.")
 		fmt.Fprintln(&b, "- Run relevant checks.")
+		fmt.Fprintln(&b, "- Mark findings you fixed with `agents finding fix <finding> --evidence \"what proves the fix\"`.")
 		fmt.Fprintln(&b, "- Record a handoff when ready for review:")
-		fmt.Fprintln(&b, `  agents handoff --to reviewer "what changed and how it was verified"`)
-		fmt.Fprintln(&b, "- Mark fixed findings with `agents finding fix <finding>`.")
+		fmt.Fprintln(&b, `  agents handoff --to reviewer "what changed and how it was checked"`)
+		fmt.Fprintln(&b, "- You cannot verify your own work: do not run `agents verify` or `agents finding verify`; the reviewer records verification independently.")
 		fmt.Fprintln(&b, "- Do not commit; leave changes for review.")
 	case "reviewer":
 		fmt.Fprintf(&b, "You are the reviewer for this Agents task.\n\n")
@@ -3142,17 +3701,18 @@ func buildRolePrompt(e env, state loopState) (string, error) {
 		appendPromptFile(&b, e.cwd, state.Task.Path, "status.md", "Status")
 		appendPromptDir(&b, e.cwd, state.Task.Path, "handoffs", "Handoffs")
 		appendPromptDir(&b, e.cwd, state.Task.Path, "findings", "Findings")
+		appendPromptDir(&b, e.cwd, state.Task.Path, "verification", "Verification")
 		fmt.Fprintln(&b, "Working agreement:")
-		fmt.Fprintln(&b, "- Review the working tree, tests, and task chunks.")
-		fmt.Fprintln(&b, "- Report real issues first in your response.")
-		fmt.Fprintln(&b, "- Do not run `agents` commands yourself; the parent Agents process records coordination state.")
-		fmt.Fprintln(&b, "- If there are no findings, end your response with exactly one directive block:")
-		fmt.Fprintln(&b, "```agents-handoff")
-		fmt.Fprintln(&b, "role: coordinator")
-		fmt.Fprintln(&b, "text: review approved; include verification performed and residual risk")
-		fmt.Fprintln(&b, "```")
-		fmt.Fprintln(&b, "- If there are findings, include them in the response and end with a coordinator handoff directive summarizing that review found issues.")
-		fmt.Fprintln(&b, "- Do not edit implementation code.")
+		fmt.Fprintln(&b, "- Review the working tree, tests, and task chunks; verify claims against the code, not the handoff text.")
+		fmt.Fprintln(&b, "- Record each real issue as a finding:")
+		fmt.Fprintln(&b, `  agents finding add "summary" --severity low|medium|high`)
+		fmt.Fprintln(&b, "- For findings marked fixed, verify them independently with evidence:")
+		fmt.Fprintln(&b, `  agents finding verify <finding> --evidence "what you checked"`)
+		fmt.Fprintln(&b, "- When the work is clean, record reproducible verification evidence:")
+		fmt.Fprintln(&b, `  agents verify "checks performed" --cmd 'go test ./...'`)
+		fmt.Fprintln(&b, "  Recording passing verification reaches the human approval boundary; nothing ships on your claim alone.")
+		fmt.Fprintln(&b, "- Summarize the review in your response: issues first, then what was verified.")
+		fmt.Fprintln(&b, "- Do not edit implementation code, do not mark findings fixed, and do not commit.")
 	case "coordinator":
 		fmt.Fprintf(&b, "You are the coordinator for this Agents task.\n\n")
 		fmt.Fprintf(&b, "Task: %s\nPath: %s\nNext action: %s\n\n", state.Task.Title, state.Task.Path, state.NextAction)
@@ -3179,14 +3739,14 @@ func buildRolePrompt(e env, state loopState) (string, error) {
 	return b.String(), nil
 }
 
-func applyRoleOutputDirectives(e env, output string) (string, error) {
+func applyRoleOutputDirectives(e env, actor, output string) (string, error) {
 	cleaned := output
 	for {
 		directive, ok := parseCoordinatorDirective(cleaned)
 		if !ok {
 			break
 		}
-		if err := applyCoordinatorDirective(e, directive); err != nil {
+		if err := applyCoordinatorDirective(e, actor, directive); err != nil {
 			return cleaned, err
 		}
 		cleaned = removeCoordinatorDirective(cleaned)

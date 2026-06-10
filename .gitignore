@@ -11,3 +11,4 @@ qa/
 
 # Local/private docs
 docs/
+.idea

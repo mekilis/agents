@@ -341,7 +341,10 @@ func TestStatusShowsActiveTaskRecordSummary(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := updateFindingStatus(e, []string{verifiedFinding.Path}, "verified", "Verification", time.Date(2026, 6, 5, 10, 7, 0, 0, time.UTC)); err != nil {
+		if _, err := updateFindingStatus(e, []string{verifiedFinding.Path, "--by", "implementer"}, "fixed", "Fixed", time.Date(2026, 6, 5, 10, 6, 30, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := updateFindingStatus(e, []string{verifiedFinding.Path, "--by", "reviewer"}, "verified", "Verification", time.Date(2026, 6, 5, 10, 7, 0, 0, time.UTC)); err != nil {
 			t.Fatal(err)
 		}
 		if err := os.MkdirAll(filepath.Join(cwd, ".agents", task.Path, "verification"), 0o755); err != nil {
@@ -1090,7 +1093,7 @@ func TestApplyCoordinatorDirectiveWritesHandoffFromParent(t *testing.T) {
 			t.Fatal(err)
 		}
 		directive := coordinatorDirective{Role: "implementer", Text: "Build the MVP."}
-		if err := applyCoordinatorDirective(e, directive); err != nil {
+		if err := applyCoordinatorDirective(e, "coordinator", directive); err != nil {
 			t.Fatal(err)
 		}
 		entries, err := os.ReadDir(filepath.Join(cwd, ".agents", task.Path, "handoffs"))
@@ -1122,7 +1125,7 @@ func TestApplyRoleOutputDirectivesBrokersReviewerHandoff(t *testing.T) {
 			t.Fatal(err)
 		}
 		raw := "No findings.\n\n```agents-handoff\nrole: coordinator\ntext: Review approved. node --check passed.\n```\n"
-		cleaned, err := applyRoleOutputDirectives(e, raw)
+		cleaned, err := applyRoleOutputDirectives(e, "reviewer", raw)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1670,10 +1673,10 @@ func TestFindingFixAndVerifyUpdateStatus(t *testing.T) {
 			t.Fatal(err)
 		}
 		base := filepath.Base(record.Path)
-		if code := Run([]string{"finding", "fix", base}, bytes.NewBuffer(nil), &out, &errOut); code != 0 {
+		if code := Run([]string{"finding", "fix", base, "--by", "implementer"}, bytes.NewBuffer(nil), &out, &errOut); code != 0 {
 			return code
 		}
-		if code := Run([]string{"finding", "verify", record.Path}, bytes.NewBuffer(nil), &out, &errOut); code != 0 {
+		if code := Run([]string{"finding", "verify", record.Path, "--by", "reviewer", "--evidence", "reran focused tests"}, bytes.NewBuffer(nil), &out, &errOut); code != 0 {
 			return code
 		}
 		data, err := os.ReadFile(filepath.Join(cwd, ".agents", record.Path))
@@ -1684,7 +1687,10 @@ func TestFindingFixAndVerifyUpdateStatus(t *testing.T) {
 		for _, want := range []string{
 			"Status: verified",
 			"## Fixed",
+			"By: implementer",
 			"## Verification",
+			"By: reviewer",
+			"Evidence: reran focused tests",
 		} {
 			if !strings.Contains(got, want) {
 				t.Fatalf("updated finding missing %q, got:\n%s", want, got)
@@ -1776,7 +1782,10 @@ func TestArchiveSummarizesAndPrunesActiveTask(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := updateFindingStatus(e, []string{verifiedFinding.Path}, "verified", "Verification", time.Date(2026, 6, 5, 10, 9, 0, 0, time.UTC)); err != nil {
+		if _, err := updateFindingStatus(e, []string{verifiedFinding.Path, "--by", "implementer"}, "fixed", "Fixed", time.Date(2026, 6, 5, 10, 8, 30, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := updateFindingStatus(e, []string{verifiedFinding.Path, "--by", "reviewer"}, "verified", "Verification", time.Date(2026, 6, 5, 10, 9, 0, 0, time.UTC)); err != nil {
 			t.Fatal(err)
 		}
 
@@ -2055,7 +2064,7 @@ func TestRunExecutesConfiguredImplementer(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(cwd, ".agents", "config.yml"), []byte(cfg), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		code := Run([]string{"run"}, bytes.NewBuffer(nil), &out, &errOut)
+		code := Run([]string{"run", "--once"}, bytes.NewBuffer(nil), &out, &errOut)
 		if data, err := os.ReadFile(filepath.Join(cwd, "prompt-copy.txt")); err == nil {
 			promptCopy = string(data)
 		}
@@ -2148,7 +2157,7 @@ func TestRunStopsImplementerAfterReviewerHandoff(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(cwd, ".agents", "config.yml"), []byte(cfg), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		return Run([]string{"run"}, bytes.NewBuffer(nil), &out, &errOut)
+		return Run([]string{"run", "--once"}, bytes.NewBuffer(nil), &out, &errOut)
 	})
 	if code != 0 {
 		t.Fatalf("Run run code=%d stderr=%s stdout=%s", code, errOut.String(), out.String())
@@ -2203,7 +2212,7 @@ func TestReadConfigParsesModelSettings(t *testing.T) {
 	if cfg.Settings.ClaudeModel != "opus" || cfg.Settings.ClaudeEffort != "high" || cfg.Settings.CursorModel != "claude-4.6-sonnet-medium-thinking" {
 		t.Fatalf("unexpected settings: %+v", cfg.Settings)
 	}
-	if cfg.Roles["coordinator"] != "codex" {
+	if cfg.Roles["coordinator"].Provider != "codex" {
 		t.Fatalf("expected coordinator role to parse, got %+v", cfg.Roles)
 	}
 }
@@ -2417,6 +2426,456 @@ func TestDispatchRejectsUnknownRole(t *testing.T) {
 	}
 	if !strings.Contains(errOut.String(), "unknown role") {
 		t.Fatalf("expected unknown role error, got %q", errOut.String())
+	}
+}
+
+func TestFindingVerifyRejectsSameActorAsFixer(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Independent Verification"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		record, err := addFinding(e, []string{"unchecked error"}, time.Date(2026, 6, 5, 10, 1, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("AGENTS_ACTOR", "implementer")
+		if code := Run([]string{"finding", "fix", record.Path}, bytes.NewBuffer(nil), &out, &errOut); code != 0 {
+			t.Fatalf("finding fix code=%d stderr=%s", code, errOut.String())
+		}
+		// Same actor (via env) cannot verify its own fix.
+		if code := Run([]string{"finding", "verify", record.Path}, bytes.NewBuffer(nil), &out, &errOut); code == 0 {
+			t.Fatalf("expected same-actor verification to fail")
+		}
+		if !strings.Contains(errOut.String(), "requires a different actor") {
+			t.Fatalf("expected independence error, got %q", errOut.String())
+		}
+		errOut.Reset()
+		// A different actor can.
+		if code := Run([]string{"finding", "verify", record.Path, "--by", "reviewer"}, bytes.NewBuffer(nil), &out, &errOut); code != 0 {
+			t.Fatalf("reviewer verification code=%d stderr=%s", code, errOut.String())
+		}
+		data, err := os.ReadFile(filepath.Join(cwd, ".agents", record.Path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(data), "Status: verified") {
+			t.Fatalf("expected verified status:\n%s", string(data))
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
+func TestFindingVerifyRequiresFixedStatus(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Lifecycle"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		record, err := addFinding(e, []string{"open issue"}, time.Date(2026, 6, 5, 10, 1, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return Run([]string{"finding", "verify", record.Path, "--by", "reviewer"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code == 0 {
+		t.Fatalf("expected verify of open finding to fail")
+	}
+	if !strings.Contains(errOut.String(), "must be marked fixed") {
+		t.Fatalf("expected lifecycle error, got %q", errOut.String())
+	}
+}
+
+func TestChunksRecordActorIdentity(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		task, err := openTask(e, []string{"Attribution"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("AGENTS_ACTOR", "codex")
+		if code := Run([]string{"decision", "add", "use actor identity"}, bytes.NewBuffer(nil), &out, &errOut); code != 0 {
+			t.Fatalf("decision add code=%d stderr=%s", code, errOut.String())
+		}
+		if code := Run([]string{"handoff", "--to", "reviewer", "ready"}, bytes.NewBuffer(nil), &out, &errOut); code != 0 {
+			t.Fatalf("handoff code=%d stderr=%s", code, errOut.String())
+		}
+		if code := Run([]string{"finding", "add", "an issue", "--by", "reviewer"}, bytes.NewBuffer(nil), &out, &errOut); code != 0 {
+			t.Fatalf("finding add code=%d stderr=%s", code, errOut.String())
+		}
+		checks := []struct {
+			dir, want string
+		}{
+			{"decisions", "By: codex"},
+			{"handoffs", "From: codex"},
+			{"findings", "Created by: reviewer"},
+		}
+		for _, check := range checks {
+			dir := filepath.Join(cwd, ".agents", task.Path, check.dir)
+			entries, err := os.ReadDir(dir)
+			if err != nil || len(entries) == 0 {
+				t.Fatalf("expected %s chunk, err=%v", check.dir, err)
+			}
+			data, err := os.ReadFile(filepath.Join(dir, entries[0].Name()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(data), check.want) {
+				t.Fatalf("%s chunk missing %q:\n%s", check.dir, check.want, string(data))
+			}
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
+func TestVerifyCommandRecordsEvidence(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		task, err := openTask(e, []string{"Evidence"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if code := Run([]string{"verify", "smoke checks pass", "--cmd", "echo all-good", "--by", "reviewer"}, bytes.NewBuffer(nil), &out, &errOut); code != 0 {
+			t.Fatalf("verify code=%d stderr=%s", code, errOut.String())
+		}
+		dir := filepath.Join(cwd, ".agents", task.Path, "verification")
+		entries, err := os.ReadDir(dir)
+		if err != nil || len(entries) != 1 {
+			t.Fatalf("expected one verification chunk, err=%v", err)
+		}
+		data, err := os.ReadFile(filepath.Join(dir, entries[0].Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := string(data)
+		for _, want := range []string{
+			"# Verification: smoke checks pass",
+			"Result: pass",
+			"By: reviewer",
+			"$ echo all-good",
+			"exit: 0",
+			"all-good",
+		} {
+			if !strings.Contains(got, want) {
+				t.Fatalf("verification chunk missing %q:\n%s", want, got)
+			}
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+	if !strings.Contains(out.String(), "result: pass") {
+		t.Fatalf("unexpected output:\n%s", out.String())
+	}
+}
+
+func TestVerifyCommandRecordsFailureAndExitsNonZero(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		task, err := openTask(e, []string{"Failed Evidence"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		code := Run([]string{"verify", "tests fail", "--cmd", "false", "--by", "reviewer"}, bytes.NewBuffer(nil), &out, &errOut)
+		if code != 1 {
+			t.Fatalf("expected exit 1 for failing evidence, got %d stderr=%s", code, errOut.String())
+		}
+		stats, err := readTaskStats(cwd, task.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stats.Verification != 0 || stats.VerificationFail != 1 {
+			t.Fatalf("expected failed evidence to be excluded from passes, got %+v", stats)
+		}
+		// Failed evidence must not satisfy the human approval boundary.
+		state, err := analyzeLoopState(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state.NextRole == "human" {
+			t.Fatalf("failed verification must not reach human boundary, got %+v", state)
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
+func TestImplementerVerificationDoesNotReachHumanBoundary(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Self Verification"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if code := Run([]string{"verify", "I checked my own work", "--by", "implementer"}, bytes.NewBuffer(nil), &out, &errOut); code != 0 {
+			t.Fatalf("verify code=%d stderr=%s", code, errOut.String())
+		}
+		state, err := analyzeLoopState(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state.NextRole == "human" {
+			t.Fatalf("implementer-recorded evidence must not reach human boundary, got %+v", state)
+		}
+		// Independent evidence does.
+		if code := Run([]string{"verify", "independent check", "--by", "reviewer"}, bytes.NewBuffer(nil), &out, &errOut); code != 0 {
+			t.Fatalf("verify code=%d stderr=%s", code, errOut.String())
+		}
+		state, err = analyzeLoopState(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state.NextRole != "human" {
+			t.Fatalf("expected human boundary after independent verification, got %+v", state)
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
+func TestStaleVerificationDoesNotReachHumanBoundary(t *testing.T) {
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Stale Evidence"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := addVerification(e, []string{"earlier evidence", "--by", "reviewer"}, time.Date(2026, 6, 5, 10, 1, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		// New work hands off after the evidence was recorded.
+		if _, err := addHandoff(e, []string{"--to", "reviewer", "new changes to review", "--by", "implementer"}, time.Date(2026, 6, 5, 10, 2, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		state, err := analyzeLoopState(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state.NextRole != "reviewer" {
+			t.Fatalf("stale evidence must route to reviewer, got %+v", state)
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
+func TestReadConfigParsesPerRoleOverrides(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".agents"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgText := strings.Join([]string{
+		"roles:",
+		"  implementer: agent",
+		"  reviewer:",
+		"    provider: codex",
+		"    model: gpt-5.5",
+		"    reasoning: xhigh",
+		"  coordinator:",
+		"    cmd: my-agent {prompt_file}",
+		"settings:",
+		"  codex_model: gpt-5.4",
+		"",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(dir, ".agents", "config.yml"), []byte(cfgText), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := readConfig(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Roles["implementer"].Provider != "agent" {
+		t.Fatalf("scalar role should parse as provider, got %+v", cfg.Roles["implementer"])
+	}
+	reviewer := cfg.Roles["reviewer"]
+	if reviewer.Provider != "codex" || reviewer.Model != "gpt-5.5" || reviewer.Reasoning != "xhigh" {
+		t.Fatalf("unexpected reviewer config: %+v", reviewer)
+	}
+	if cfg.Roles["coordinator"].Cmd != "my-agent {prompt_file}" {
+		t.Fatalf("unexpected coordinator config: %+v", cfg.Roles["coordinator"])
+	}
+	command, agent, _, err := resolveRoleCommand(reviewer, cfg.Settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if agent != "codex" {
+		t.Fatalf("unexpected agent label %q", agent)
+	}
+	for _, want := range []string{"-m 'gpt-5.5'", `model_reasoning_effort=\"xhigh\"`} {
+		if !strings.Contains(command, strings.ReplaceAll(want, `\"`, `"`)) {
+			t.Fatalf("reviewer command missing %q:\n%s", want, command)
+		}
+	}
+}
+
+func TestRunLoopStopsWhenRoleRecordsNoProgress(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Stalled Loop"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		script := filepath.Join(cwd, "implementer.sh")
+		if err := os.WriteFile(script, []byte("#!/bin/sh\necho did nothing\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cfg := "roles:\n  implementer: " + script + " {prompt_file}\n  reviewer: codex\n  coordinator: codex\n"
+		if err := os.WriteFile(filepath.Join(cwd, ".agents", "config.yml"), []byte(cfg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return Run([]string{"run"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code != 1 {
+		t.Fatalf("expected stalled loop to exit 1, got %d stderr=%s stdout=%s", code, errOut.String(), out.String())
+	}
+	if !strings.Contains(out.String(), "recorded no progress") {
+		t.Fatalf("expected no-progress stop message, got:\n%s", out.String())
+	}
+}
+
+func TestRunLoopChainsRolesToHumanBoundary(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		task, err := openTask(e, []string{"Full Loop"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		handoffPath := filepath.Join(".agents", task.Path, "handoffs", "2026-06-05T100100Z-handoff-to-reviewer.md")
+		implementer := filepath.Join(cwd, "implementer.sh")
+		implementerBody := strings.Join([]string{
+			"#!/bin/sh",
+			"set -eu",
+			"trap 'exit 0' INT TERM",
+			"mkdir -p " + shellQuote(filepath.Dir(handoffPath)),
+			"cat > " + shellQuote(handoffPath) + " <<'EOF'",
+			"# Handoff: reviewer",
+			"",
+			"To: reviewer",
+			"From: implementer",
+			"",
+			"Ready for review.",
+			"EOF",
+			"",
+		}, "\n")
+		if err := os.WriteFile(implementer, []byte(implementerBody), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		verificationPath := filepath.Join(".agents", task.Path, "verification", "2026-06-05T100200Z-checks.md")
+		reviewer := filepath.Join(cwd, "reviewer.sh")
+		reviewerBody := strings.Join([]string{
+			"#!/bin/sh",
+			"set -eu",
+			"mkdir -p " + shellQuote(filepath.Dir(verificationPath)),
+			"cat > " + shellQuote(verificationPath) + " <<'EOF'",
+			"# Verification: checks",
+			"",
+			"Result: pass",
+			"By: reviewer",
+			"",
+			"All checks pass.",
+			"EOF",
+			"",
+		}, "\n")
+		if err := os.WriteFile(reviewer, []byte(reviewerBody), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cfg := "roles:\n  implementer: " + implementer + " {prompt_file}\n  reviewer: " + reviewer + " {prompt_file}\n  coordinator: codex\n"
+		if err := os.WriteFile(filepath.Join(cwd, ".agents", "config.yml"), []byte(cfg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return Run([]string{"run"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code != 0 {
+		t.Fatalf("expected loop to reach human boundary, code=%d stderr=%s stdout=%s", code, errOut.String(), out.String())
+	}
+	got := out.String()
+	for _, want := range []string{
+		"running implementer...",
+		"running reviewer...",
+		"human approval required",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("loop output missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestRunLoopStopsAtMaxIterations(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		task, err := openTask(e, []string{"Churning Loop"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		handoffDir := filepath.Join(".agents", task.Path, "handoffs")
+		script := filepath.Join(cwd, "implementer.sh")
+		// Each run records a new handoff back to the implementer: progress
+		// every time, never converging.
+		body := strings.Join([]string{
+			"#!/bin/sh",
+			"set -eu",
+			"i=$(cat count 2>/dev/null || echo 0)",
+			"i=$((i+1))",
+			"echo $i > count",
+			"mkdir -p " + shellQuote(handoffDir),
+			"cat > " + shellQuote(handoffDir) + "/2026-06-05T10020${i}Z-loop.md <<'EOF'",
+			"# Handoff: implementer",
+			"",
+			"To: implementer",
+			"",
+			"Keep going.",
+			"EOF",
+			"",
+		}, "\n")
+		if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cfg := "roles:\n  implementer: " + script + " {prompt_file}\n  reviewer: codex\n  coordinator: codex\n"
+		if err := os.WriteFile(filepath.Join(cwd, ".agents", "config.yml"), []byte(cfg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return Run([]string{"run", "--max-iterations", "2"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code != 1 {
+		t.Fatalf("expected max-iterations stop to exit 1, got %d stderr=%s stdout=%s", code, errOut.String(), out.String())
+	}
+	if !strings.Contains(out.String(), "reached 2 role runs") {
+		t.Fatalf("expected max-iterations stop message, got:\n%s", out.String())
+	}
+}
+
+func TestParseRunArgs(t *testing.T) {
+	flags, err := parseRunArgs([]string{"--max-iterations", "4", "--once", "--json"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !flags.JSON || !flags.Once || flags.MaxRuns != 4 {
+		t.Fatalf("unexpected flags: %+v", flags)
+	}
+	if _, err := parseRunArgs([]string{"--max-iterations", "zero"}); err == nil {
+		t.Fatal("expected invalid max-iterations to fail")
+	}
+	if _, err := parseRunArgs([]string{"--nope"}); err == nil {
+		t.Fatal("expected unknown flag to fail")
 	}
 }
 

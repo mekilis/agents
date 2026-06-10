@@ -86,8 +86,8 @@ Plain text in the interactive terminal is coordinator chat. Slash commands are
 reserved for controls. When a coordinator role is configured, chat immediately
 runs the coordinator so it can answer, ask for missing details such as a ref,
 or route a clear request to another role. If you already know the task, `/start`
-is still the fast path. Use `/run` for script-style loops or when you want to
-manually run the next queued role.
+is still the fast path. Use `/run` to drive queued roles until a stop condition,
+or `agents run --once` in scripts to step the loop manually.
 
 Hide the startup banner when you want a quieter interactive terminal:
 
@@ -116,18 +116,46 @@ Record coordination state:
 agents decision add "Reviewers record findings and do not edit code"
 agents handoff --to reviewer "Checkout flow is ready for review"
 agents finding add "Missing regression test for expired cards" --severity high
-agents finding fix tasks/.../findings/2026-06-05T120000Z-missing-regression-test.md
-agents finding verify tasks/.../findings/2026-06-05T120000Z-missing-regression-test.md
+agents finding fix tasks/.../findings/2026-06-05T120000Z-missing-regression-test.md --evidence "added regression test"
+agents finding verify tasks/.../findings/2026-06-05T120000Z-missing-regression-test.md --evidence "reran the suite"
+agents verify "go test ./... passes" --cmd 'go test ./...'
 ```
 
-Inspect the loop and route role packets:
+Every record carries an actor identity, resolved from `--by`, then the
+`AGENTS_ACTOR` environment variable, then the OS user. When `agents run`
+launches a role, it sets `AGENTS_ACTOR` to the role name in the agent's
+environment, so records written by agents are attributed automatically.
+
+Independent verification is enforced, not suggested:
+
+- A finding must be marked `fixed` before it can be `verified`.
+- The actor that fixed a finding cannot verify it. `agents finding verify`
+  refuses the same actor and asks for a different `--by`/`AGENTS_ACTOR`.
+- `agents verify` records verification evidence under `verification/`. With
+  `--cmd`, it runs the command and records the exit code and output; a failing
+  command records `Result: fail` and exits non-zero.
+- Evidence recorded by the `implementer` actor never satisfies the human
+  approval boundary: implementers do not verify their own work.
+
+Drive the loop and route role packets:
 
 ```bash
-agents run
-agents run --json
+agents run                      # run queued roles until a stop condition
+agents run --max-iterations 8   # raise the role-run budget (default 6)
+agents run --once               # run exactly one role, then stop
+agents run --json               # inspect loop state without running anything
 agents dispatch implementer
 agents dispatch reviewer --json
 ```
+
+`agents run` manages the implementer/reviewer loop until a stop condition:
+
+- the human approval boundary is reached (open and fixed findings are zero and
+  independent verification evidence is newer than the latest handoff),
+- the next role has no configured agent,
+- a role run records no coordination progress (exit code 1, instead of
+  churning),
+- or the role-run budget is exhausted (exit code 1, rerun to continue).
 
 When the next role has a configured agent, `agents run` writes transient provider
 artifacts under `.agents/runs/`: prompts in `prompts/` and live logs in `logs/`.
@@ -145,7 +173,11 @@ tail -f .agents/runs/logs/2026-06-05T120000Z-implementer.log
 ```yaml
 roles:
   implementer: cursor
-  reviewer: codex
+  # A role can also be a map with per-role model/reasoning overrides:
+  reviewer:
+    provider: codex
+    model: gpt-5.5
+    reasoning: high
   coordinator: codex
 settings:
   # Codex CLI:
@@ -172,8 +204,10 @@ settings:
 
 Provider-specific settings are passed only to that provider's built-in command:
 `codex_*` to `codex`, `claude_*` to `claude`, and `cursor_model` to
-`agent`/`cursor-agent`. Leave a setting empty to use the provider default, or
-put provider flags directly in a custom role command.
+`agent`/`cursor-agent`. Per-role `model`/`reasoning` values override the global
+settings for that role only. Leave a setting empty to use the provider default,
+set `cmd: my-agent {prompt_file}` as an advanced escape hatch, or put provider
+flags directly in a custom role command.
 
 ```bash
 agents archive
@@ -181,12 +215,15 @@ agents archive
 
 ## Current Boundaries
 
-Agents records and routes coordination state today, and `agents run` can launch
-configured local agent commands for the next role. It does not automate commits,
-push branches, or create pull requests. Natural-language top-level commands are
-product direction; use the scriptable commands below in the current build.
-`agents archive` is the local cleanup boundary for completed task state: it
-writes a summary and prunes the active task chunks from `.agents/tasks/`.
+Agents records and routes coordination state, attributes every record to an
+actor, enforces independent verification, and `agents run` manages the
+implementer/reviewer loop across configured local agent commands until a stop
+condition or the human approval boundary. It does not automate commits, push
+branches, or create pull requests — those stay behind human approval.
+Natural-language top-level commands are product direction; use the scriptable
+commands below in the current build. `agents archive` is the local cleanup
+boundary for completed task state: it writes a summary and prunes the active
+task chunks from `.agents/tasks/`.
 
 Interactive input model:
 
@@ -223,6 +260,7 @@ Interactive slash commands available today:
 /decision add "text"
 /handoff --to ROLE "text"
 /finding add|fix|verify ...
+/verify "text" [--cmd 'shell command']
 /dispatch <role>
 /run
 /archive
