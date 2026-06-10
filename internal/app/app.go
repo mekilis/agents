@@ -569,7 +569,7 @@ func printHelp(w io.Writer) {
 	fmt.Fprintln(w, "  agents verify \"text\" [--cmd 'shell command'] [--by ACTOR]")
 	fmt.Fprintln(w, "  agents archive")
 	fmt.Fprintln(w, "  agents dispatch <implementer|reviewer|coordinator> [--json]")
-	fmt.Fprintln(w, "  agents run [--max-iterations N] [--once] [--json]")
+	fmt.Fprintln(w, "  agents run [--max-iterations N] [--once] [--json] [--json-events]")
 	fmt.Fprintln(w, "  agents completion zsh")
 	fmt.Fprintln(w, "  agents completion install-zsh")
 	fmt.Fprintln(w, "  agents version")
@@ -1387,7 +1387,7 @@ func printInteractiveRoleTransition(out io.Writer, result roleRunResult) {
 }
 
 func runInteractiveQueuedRoles(e env, out io.Writer) error {
-	stop, err := runManagedLoop(e, out, defaultMaxLoopRuns, true)
+	stop, err := runManagedLoop(e, out, defaultMaxLoopRuns, true, nil)
 	if err != nil {
 		return err
 	}
@@ -3081,9 +3081,10 @@ func runDispatchCommand(args []string, out, errOut io.Writer, e env) int {
 const defaultMaxLoopRuns = 6
 
 type runFlags struct {
-	JSON    bool
-	Once    bool
-	MaxRuns int
+	JSON       bool
+	JSONEvents bool
+	Once       bool
+	MaxRuns    int
 }
 
 func parseRunArgs(args []string) (runFlags, error) {
@@ -3095,6 +3096,8 @@ func parseRunArgs(args []string) (runFlags, error) {
 			continue
 		case "--json":
 			flags.JSON = true
+		case "--json-events":
+			flags.JSONEvents = true
 		case "--once":
 			flags.Once = true
 		case "--max-iterations":
@@ -3110,6 +3113,9 @@ func parseRunArgs(args []string) (runFlags, error) {
 		default:
 			return flags, fmt.Errorf("unknown flag %s", arg)
 		}
+	}
+	if flags.JSONEvents && (flags.JSON || flags.Once) {
+		return flags, fmt.Errorf("--json-events cannot be combined with --json or --once")
 	}
 	return flags, nil
 }
@@ -3130,48 +3136,130 @@ func loopSignature(state loopState) string {
 		s.Verification, s.LatestHandoffName, s.LatestVerificationName)
 }
 
+// handoffChurn reports a run whose only recorded "progress" is another
+// handoff to the same target as before: findings and verification unchanged,
+// latest handoff target repeated. Without this, a do-nothing role that keeps
+// writing handoffs counts as progress every round until the run budget.
+func handoffChurn(before, after loopState) bool {
+	b, a := before.Stats, after.Stats
+	if b.FindingsOpen != a.FindingsOpen || b.FindingsFixed != a.FindingsFixed ||
+		b.FindingsVerified != a.FindingsVerified || b.Verification != a.Verification {
+		return false
+	}
+	if b.LatestVerificationName != a.LatestVerificationName {
+		return false
+	}
+	return a.LatestHandoffTo != "" && a.LatestHandoffTo == b.LatestHandoffTo
+}
+
+// loopEvent is one lifecycle event from a managed loop, consumable by
+// frontends (JSONL via `agents run --json-events`, future renderers).
+type loopEvent struct {
+	Event  string    `json:"event"` // state_changed | run_started | output | run_finished | stopped
+	Time   string    `json:"time"`
+	RunID  string    `json:"run_id,omitempty"`
+	Role   string    `json:"role,omitempty"`
+	Agent  string    `json:"agent,omitempty"`
+	Chunk  string    `json:"chunk,omitempty"`
+	Reason string    `json:"reason,omitempty"`
+	Runs   *int      `json:"runs,omitempty"`
+	Error  string    `json:"error,omitempty"`
+	State  *loopJSON `json:"state,omitempty"`
+}
+
+// loopEventSink receives loop events as they happen. A nil sink disables
+// event emission.
+type loopEventSink func(loopEvent)
+
+// jsonlEventSink encodes each event as one JSON line. Safe for concurrent
+// emitters (run output streams while the loop owns state events).
+func jsonlEventSink(w io.Writer) loopEventSink {
+	var mu sync.Mutex
+	encoder := json.NewEncoder(w)
+	return func(ev loopEvent) {
+		mu.Lock()
+		defer mu.Unlock()
+		ev.Time = time.Now().UTC().Format(time.RFC3339)
+		_ = encoder.Encode(ev)
+	}
+}
+
+// eventChunkWriter forwards run output to the event sink as output chunks.
+type eventChunkWriter struct {
+	events loopEventSink
+	runID  string
+	role   string
+}
+
+func (w *eventChunkWriter) Write(p []byte) (int, error) {
+	if len(p) > 0 {
+		w.events(loopEvent{Event: "output", RunID: w.runID, Role: w.role, Chunk: string(p)})
+	}
+	return len(p), nil
+}
+
+func statePayload(state loopState) *loopJSON {
+	payload := loopPayload(state)
+	return &payload
+}
+
 // runManagedLoop drives configured roles until a stop condition: the human
 // approval boundary, an unconfigured role, no recorded progress after a run,
 // or the run budget. With stopAtCoordinator the loop yields to the caller
 // instead of running the coordinator (used by the interactive terminal where
 // coordinator turns belong to chat).
-func runManagedLoop(e env, out io.Writer, maxRuns int, stopAtCoordinator bool) (loopStop, error) {
+func runManagedLoop(e env, out io.Writer, maxRuns int, stopAtCoordinator bool, events loopEventSink) (loopStop, error) {
+	emit := func(ev loopEvent) {
+		if events != nil {
+			events(ev)
+		}
+	}
+	stopped := func(stop loopStop) loopStop {
+		runs := stop.Runs
+		emit(loopEvent{Event: "stopped", Reason: stop.Reason, Runs: &runs, State: statePayload(stop.State)})
+		return stop
+	}
 	runs := 0
 	for {
 		state, err := analyzeLoopState(e)
 		if err != nil {
 			return loopStop{}, err
 		}
+		emit(loopEvent{Event: "state_changed", State: statePayload(state)})
 		switch state.NextRole {
 		case "human":
-			return loopStop{Reason: "human", State: state, Runs: runs}, nil
+			return stopped(loopStop{Reason: "human", State: state, Runs: runs}), nil
 		case "coordinator":
 			if stopAtCoordinator {
-				return loopStop{Reason: "coordinator", State: state, Runs: runs}, nil
+				return stopped(loopStop{Reason: "coordinator", State: state, Runs: runs}), nil
 			}
 		case "implementer", "reviewer":
 		default:
 			return loopStop{}, fmt.Errorf("cannot run role %q", state.NextRole)
 		}
 		if runs >= maxRuns {
-			return loopStop{Reason: "max-runs", State: state, Runs: runs}, nil
+			return stopped(loopStop{Reason: "max-runs", State: state, Runs: runs}), nil
 		}
 		agent, err := configuredAgent(e.cwd, state.NextRole)
 		if err != nil {
 			return loopStop{}, err
 		}
 		if strings.TrimSpace(agent) == "" {
-			return loopStop{Reason: "unconfigured", State: state, Runs: runs}, nil
+			return stopped(loopStop{Reason: "unconfigured", State: state, Runs: runs}), nil
 		}
 		fmt.Fprintf(out, "\nrunning %s...\n", state.NextRole)
-		result, err := runConfiguredRole(e, state, out)
+		result, err := runConfiguredRoleWithOptions(e, state, roleRunOptions{
+			ShowRunHeader: events == nil,
+			LiveOutput:    out,
+			Events:        events,
+		})
 		if err != nil {
 			return loopStop{}, err
 		}
 		runs++
 		printRoleRunResult(out, result)
-		if loopSignature(result.After) == loopSignature(state) {
-			return loopStop{Reason: "no-progress", State: result.After, Runs: runs}, nil
+		if loopSignature(result.After) == loopSignature(state) || handoffChurn(state, result.After) {
+			return stopped(loopStop{Reason: "no-progress", State: result.After, Runs: runs}), nil
 		}
 	}
 }
@@ -3209,10 +3297,18 @@ func runLoopCommand(args []string, out, errOut io.Writer, e env) int {
 	if flags.Once {
 		return runLoopOnce(out, errOut, e, state)
 	}
-	stop, err := runManagedLoop(e, out, flags.MaxRuns, false)
+	// With --json-events the JSONL stream owns stdout: plain loop printing is
+	// discarded and every lifecycle change is emitted as an event instead.
+	var events loopEventSink
+	loopOut := out
+	if flags.JSONEvents {
+		events = jsonlEventSink(out)
+		loopOut = io.Discard
+	}
+	stop, err := runManagedLoop(e, loopOut, flags.MaxRuns, false, events)
 	if err != nil {
 		if errors.Is(err, errRunInterrupted) {
-			printInterruptHint(out, e)
+			printInterruptHint(loopOut, e)
 			return 130
 		}
 		fmt.Fprintf(errOut, "agents: run: %v\n", err)
@@ -3220,20 +3316,20 @@ func runLoopCommand(args []string, out, errOut io.Writer, e env) int {
 	}
 	switch stop.Reason {
 	case "human":
-		fmt.Fprintln(out)
-		printLoopState(out, stop.State)
+		fmt.Fprintln(loopOut)
+		printLoopState(loopOut, stop.State)
 		return 0
 	case "unconfigured":
-		printLoopState(out, stop.State)
-		fmt.Fprintf(out, "agent: not configured for %s\n", stop.State.NextRole)
+		printLoopState(loopOut, stop.State)
+		fmt.Fprintf(loopOut, "agent: not configured for %s\n", stop.State.NextRole)
 		return 0
 	case "no-progress":
-		fmt.Fprintf(out, "\nstopped: %s run recorded no progress; inspect the run log and route manually\n", stop.State.NextRole)
-		printLoopState(out, stop.State)
+		fmt.Fprintf(loopOut, "\nstopped: %s run recorded no progress; inspect the run log and route manually\n", stop.State.NextRole)
+		printLoopState(loopOut, stop.State)
 		return 1
 	case "max-runs":
-		fmt.Fprintf(out, "\nstopped: reached %d role runs with work remaining; rerun `agents run` to continue\n", stop.Runs)
-		printLoopState(out, stop.State)
+		fmt.Fprintf(loopOut, "\nstopped: reached %d role runs with work remaining; rerun `agents run` to continue\n", stop.Runs)
+		printLoopState(loopOut, stop.State)
 		return 1
 	default:
 		return 0
@@ -3309,6 +3405,7 @@ type loopState struct {
 }
 
 type roleRunResult struct {
+	RunID        string
 	Role         string
 	Agent        string
 	AgentDesc    string
@@ -3324,6 +3421,7 @@ type roleRunResult struct {
 type roleRunOptions struct {
 	ShowRunHeader bool
 	LiveOutput    io.Writer
+	Events        loopEventSink
 }
 
 type runArtifactPaths struct {
@@ -3472,26 +3570,43 @@ func runConfiguredRoleWithOptions(e env, state loopState, options roleRunOptions
 	if live == nil {
 		live = io.Discard
 	}
+	agentDesc := agentDescriptor(agent, effectiveSettings)
+	if options.Events != nil {
+		live = io.MultiWriter(live, &eventChunkWriter{events: options.Events, runID: artifacts.ID, role: state.NextRole})
+		options.Events(loopEvent{Event: "run_started", RunID: artifacts.ID, Role: state.NextRole, Agent: agentDesc})
+	}
+	// After run_started, every error return must close the run with a
+	// run_finished event so JSONL consumers can pair starts and finishes.
+	failRun := func(err error) (roleRunResult, error) {
+		if options.Events != nil {
+			options.Events(loopEvent{Event: "run_finished", RunID: artifacts.ID, Role: state.NextRole, Agent: agentDesc, Error: err.Error()})
+		}
+		return roleRunResult{}, err
+	}
 	if options.ShowRunHeader {
 		fmt.Fprintf(live, "run id: %s\n", artifacts.ID)
 		fmt.Fprintf(live, "run log: %s\n\n", relPathFrom(e.cwd, artifacts.Log))
 	}
 	output, err := runStreamingShellCommand(e.cwd, command, artifacts, state, agent, effectiveSettings, live)
 	if err != nil {
-		return roleRunResult{}, fmt.Errorf("%s command failed: %w\n%s", state.NextRole, err, strings.TrimSpace(output))
+		return failRun(fmt.Errorf("%s command failed: %w\n%s", state.NextRole, err, strings.TrimSpace(output)))
 	}
 	output, err = applyRoleOutputDirectives(e, state.NextRole, output)
 	if err != nil {
-		return roleRunResult{}, err
+		return failRun(err)
 	}
 	after, err := analyzeLoopState(e)
 	if err != nil {
-		return roleRunResult{}, err
+		return failRun(err)
+	}
+	if options.Events != nil {
+		options.Events(loopEvent{Event: "run_finished", RunID: artifacts.ID, Role: state.NextRole, Agent: agentDesc, State: statePayload(after)})
 	}
 	return roleRunResult{
+		RunID:       artifacts.ID,
 		Role:        state.NextRole,
 		Agent:       agent,
-		AgentDesc:   agentDescriptor(agent, effectiveSettings),
+		AgentDesc:   agentDesc,
 		Command:     command,
 		PromptPath:  artifacts.Prompt,
 		LogPath:     artifacts.Log,

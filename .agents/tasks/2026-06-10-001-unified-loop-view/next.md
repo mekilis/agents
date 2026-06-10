@@ -1,3 +1,3 @@
 # Next
 
-Handover: implementer starts at M0 (loop events) per the plan
+Review M0; then M1 (agents go entry point) per qa/unified-loop-view-plan.md

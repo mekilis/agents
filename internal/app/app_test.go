@@ -3080,6 +3080,215 @@ func TestRunLoopChainsRolesToHumanBoundary(t *testing.T) {
 	}
 }
 
+func TestRunLoopJSONEventsStreamsLifecycle(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := trustWorkspace(e); err != nil {
+			t.Fatal(err)
+		}
+		task, err := openTask(e, []string{"Event Loop"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		handoffPath := filepath.Join(".agents", task.Path, "handoffs", "2026-06-05T100100Z-handoff-to-reviewer.md")
+		implementer := filepath.Join(cwd, "implementer.sh")
+		implementerBody := strings.Join([]string{
+			"#!/bin/sh",
+			"set -eu",
+			"trap 'exit 0' INT TERM",
+			"echo building",
+			"mkdir -p " + shellQuote(filepath.Dir(handoffPath)),
+			"cat > " + shellQuote(handoffPath) + " <<'EOF'",
+			"# Handoff: reviewer",
+			"",
+			"To: reviewer",
+			"From: implementer",
+			"",
+			"Ready for review.",
+			"EOF",
+			"",
+		}, "\n")
+		if err := os.WriteFile(implementer, []byte(implementerBody), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		verificationPath := filepath.Join(".agents", task.Path, "verification", "2026-06-05T100200Z-checks.md")
+		reviewer := filepath.Join(cwd, "reviewer.sh")
+		reviewerBody := strings.Join([]string{
+			"#!/bin/sh",
+			"set -eu",
+			"mkdir -p " + shellQuote(filepath.Dir(verificationPath)),
+			"cat > " + shellQuote(verificationPath) + " <<'EOF'",
+			"# Verification: checks",
+			"",
+			"Result: pass",
+			"By: reviewer",
+			"",
+			"All checks pass.",
+			"EOF",
+			"",
+		}, "\n")
+		if err := os.WriteFile(reviewer, []byte(reviewerBody), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cfg := "roles:\n  implementer: " + implementer + " {prompt_file}\n  reviewer: " + reviewer + " {prompt_file}\n  coordinator: codex\n"
+		if err := os.WriteFile(filepath.Join(cwd, ".agents", "config.yml"), []byte(cfg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return Run([]string{"run", "--json-events"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code != 0 {
+		t.Fatalf("expected event loop to reach human boundary, code=%d stderr=%s stdout=%s", code, errOut.String(), out.String())
+	}
+	var events []loopEvent
+	sawOutputChunk := false
+	for _, line := range strings.Split(strings.TrimSpace(out.String()), "\n") {
+		var ev loopEvent
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatalf("non-JSON line in --json-events output: %q (%v)", line, err)
+		}
+		if ev.Time == "" {
+			t.Fatalf("event missing time: %q", line)
+		}
+		if ev.Event == "output" {
+			if ev.RunID == "" || ev.Role == "" || ev.Chunk == "" {
+				t.Fatalf("output event missing run attribution: %q", line)
+			}
+			sawOutputChunk = sawOutputChunk || strings.Contains(ev.Chunk, "building")
+			continue
+		}
+		events = append(events, ev)
+	}
+	if !sawOutputChunk {
+		t.Fatalf("expected an output event carrying implementer stdout, got:\n%s", out.String())
+	}
+	wantSequence := []string{
+		"state_changed", // implementer next
+		"run_started",   // implementer
+		"run_finished",
+		"state_changed", // reviewer next
+		"run_started",   // reviewer
+		"run_finished",
+		"state_changed", // human boundary
+		"stopped",
+	}
+	if len(events) != len(wantSequence) {
+		t.Fatalf("expected %d lifecycle events, got %d:\n%s", len(wantSequence), len(events), out.String())
+	}
+	for i, want := range wantSequence {
+		if events[i].Event != want {
+			t.Fatalf("event %d = %q, want %q:\n%s", i, events[i].Event, want, out.String())
+		}
+	}
+	if events[1].Role != "implementer" || events[4].Role != "reviewer" {
+		t.Fatalf("unexpected run roles: %q then %q", events[1].Role, events[4].Role)
+	}
+	if events[1].RunID == "" || events[1].RunID != events[2].RunID {
+		t.Fatalf("run_started/run_finished must share a run id: %q vs %q", events[1].RunID, events[2].RunID)
+	}
+	last := events[len(events)-1]
+	if last.Reason != "human" || last.Runs == nil || *last.Runs != 2 {
+		t.Fatalf("expected stopped event with reason human after 2 runs, got %+v", last)
+	}
+	if last.State == nil || last.State.Boundary == "" {
+		t.Fatalf("expected stopped event to carry boundary state, got %+v", last.State)
+	}
+}
+
+func TestRunLoopJSONEventsClosesFailedRun(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := trustWorkspace(e); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := openTask(e, []string{"Failing Run"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		implementer := filepath.Join(cwd, "implementer.sh")
+		implementerBody := strings.Join([]string{
+			"#!/bin/sh",
+			"echo about to fail",
+			"exit 1",
+			"",
+		}, "\n")
+		if err := os.WriteFile(implementer, []byte(implementerBody), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cfg := "roles:\n  implementer: " + implementer + " {prompt_file}\n  reviewer: " + implementer + " {prompt_file}\n  coordinator: codex\n"
+		if err := os.WriteFile(filepath.Join(cwd, ".agents", "config.yml"), []byte(cfg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return Run([]string{"run", "--json-events"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code == 0 {
+		t.Fatalf("expected failing role command to exit non-zero, stdout=%s", out.String())
+	}
+	var started, finished *loopEvent
+	for _, line := range strings.Split(strings.TrimSpace(out.String()), "\n") {
+		var ev loopEvent
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatalf("non-JSON line in --json-events output: %q (%v)", line, err)
+		}
+		switch ev.Event {
+		case "run_started":
+			started = &ev
+		case "run_finished":
+			finished = &ev
+		}
+	}
+	if started == nil || finished == nil {
+		t.Fatalf("expected run_started and run_finished events for a failed run, got:\n%s", out.String())
+	}
+	if finished.RunID == "" || finished.RunID != started.RunID {
+		t.Fatalf("failed run_finished must share the run id: %q vs %q", started.RunID, finished.RunID)
+	}
+	if finished.Error == "" || !strings.Contains(finished.Error, "implementer command failed") {
+		t.Fatalf("expected run_finished to carry the failure error, got %+v", finished)
+	}
+}
+
+func TestRunRejectsJSONEventsCombinations(t *testing.T) {
+	for _, args := range [][]string{
+		{"run", "--json-events", "--json"},
+		{"run", "--json-events", "--once"},
+	} {
+		var out, errOut bytes.Buffer
+		code := withTempProcessEnv(t, func(home, cwd string) int {
+			return Run(args, bytes.NewBuffer(nil), &out, &errOut)
+		})
+		if code != 2 {
+			t.Fatalf("%v: expected usage error exit 2, got %d stderr=%s", args, code, errOut.String())
+		}
+		if !strings.Contains(errOut.String(), "--json-events cannot be combined") {
+			t.Fatalf("%v: expected combination error, got: %s", args, errOut.String())
+		}
+	}
+}
+
+// handoffPingPongScript writes a handoff to the given target with a fresh
+// timestamp on every run: alternating targets look like progress each round,
+// so the loop only stops at its run budget.
+func handoffPingPongScript(handoffDir, target, countFile, stampSuffix string) string {
+	return strings.Join([]string{
+		"#!/bin/sh",
+		"set -eu",
+		"trap 'exit 0' INT TERM",
+		"i=$(cat " + shellQuote(countFile) + " 2>/dev/null || echo 0)",
+		"i=$((i+1))",
+		"echo $i > " + shellQuote(countFile),
+		"mkdir -p " + shellQuote(handoffDir),
+		"cat > " + shellQuote(handoffDir) + "/2026-06-05T1002${i}" + stampSuffix + "Z-loop.md <<'EOF'",
+		"# Handoff: " + target,
+		"",
+		"To: " + target,
+		"",
+		"Keep going.",
+		"EOF",
+		"",
+	}, "\n")
+}
+
 func TestRunLoopStopsAtMaxIterations(t *testing.T) {
 	var out, errOut bytes.Buffer
 	code := withTempProcessEnv(t, func(home, cwd string) int {
@@ -3092,29 +3301,18 @@ func TestRunLoopStopsAtMaxIterations(t *testing.T) {
 			t.Fatal(err)
 		}
 		handoffDir := filepath.Join(".agents", task.Path, "handoffs")
-		script := filepath.Join(cwd, "implementer.sh")
-		// Each run records a new handoff back to the implementer: progress
-		// every time, never converging.
-		body := strings.Join([]string{
-			"#!/bin/sh",
-			"set -eu",
-			"i=$(cat count 2>/dev/null || echo 0)",
-			"i=$((i+1))",
-			"echo $i > count",
-			"mkdir -p " + shellQuote(handoffDir),
-			"cat > " + shellQuote(handoffDir) + "/2026-06-05T10020${i}Z-loop.md <<'EOF'",
-			"# Handoff: implementer",
-			"",
-			"To: implementer",
-			"",
-			"Keep going.",
-			"EOF",
-			"",
-		}, "\n")
-		if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		// Implementer and reviewer keep handing off to each other without
+		// recording findings or verification: never converging, but each
+		// round changes the handoff target, so it is not same-target churn.
+		implementer := filepath.Join(cwd, "implementer.sh")
+		if err := os.WriteFile(implementer, []byte(handoffPingPongScript(handoffDir, "reviewer", "impl-count", "1")), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		cfg := "roles:\n  implementer: " + script + " {prompt_file}\n  reviewer: codex\n  coordinator: codex\n"
+		reviewer := filepath.Join(cwd, "reviewer.sh")
+		if err := os.WriteFile(reviewer, []byte(handoffPingPongScript(handoffDir, "implementer", "rev-count", "2")), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cfg := "roles:\n  implementer: " + implementer + " {prompt_file}\n  reviewer: " + reviewer + " {prompt_file}\n  coordinator: codex\n"
 		if err := os.WriteFile(filepath.Join(cwd, ".agents", "config.yml"), []byte(cfg), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -3125,6 +3323,39 @@ func TestRunLoopStopsAtMaxIterations(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "reached 2 role runs") {
 		t.Fatalf("expected max-iterations stop message, got:\n%s", out.String())
+	}
+}
+
+func TestRunLoopStopsOnRepeatedSameTargetHandoffs(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := trustWorkspace(e); err != nil {
+			t.Fatal(err)
+		}
+		task, err := openTask(e, []string{"Handoff Churn"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		handoffDir := filepath.Join(".agents", task.Path, "handoffs")
+		// A do-nothing implementer that keeps writing handoffs to the same
+		// target: new chunk names every round, but no findings or
+		// verification movement. The loop must treat this as no progress.
+		script := filepath.Join(cwd, "implementer.sh")
+		if err := os.WriteFile(script, []byte(handoffPingPongScript(handoffDir, "implementer", "count", "0")), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cfg := "roles:\n  implementer: " + script + " {prompt_file}\n  reviewer: codex\n  coordinator: codex\n"
+		if err := os.WriteFile(filepath.Join(cwd, ".agents", "config.yml"), []byte(cfg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return Run([]string{"run"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code != 1 {
+		t.Fatalf("expected handoff churn to exit 1, got %d stderr=%s stdout=%s", code, errOut.String(), out.String())
+	}
+	if !strings.Contains(out.String(), "recorded no progress") {
+		t.Fatalf("expected no-progress stop message, got:\n%s", out.String())
 	}
 }
 

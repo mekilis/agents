@@ -159,6 +159,7 @@ agents run                      # run queued roles until a stop condition
 agents run --max-iterations 8   # raise the role-run budget (default 6)
 agents run --once               # run exactly one role, then stop
 agents run --json               # inspect loop state without running anything
+agents run --json-events        # run the loop, streaming lifecycle events as JSONL
 agents dispatch implementer
 agents dispatch reviewer --json
 ```
@@ -169,8 +170,15 @@ agents dispatch reviewer --json
   independent verification evidence is newer than the latest handoff),
 - the next role has no configured agent,
 - a role run records no coordination progress (exit code 1, instead of
-  churning),
+  churning) — including a run whose only "progress" is another handoff to the
+  same target with no findings or verification movement,
 - or the role-run budget is exhausted (exit code 1, rerun to continue).
+
+With `--json-events` the loop runs the same way but stdout becomes a JSONL
+stream of lifecycle events for scripts and frontends: `state_changed` (loop
+state payload), `run_started` / `run_finished` (run id, role, agent), `output`
+(live provider output chunks), and `stopped` (reason, run count, final state).
+Exit codes match the plain loop.
 
 When the next role has a configured agent, `agents run` writes transient provider
 artifacts under `.agents/runs/`: prompts in `prompts/` and live logs in `logs/`.
