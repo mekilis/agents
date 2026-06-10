@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -25,6 +26,7 @@ const (
 )
 
 var errComposerInterrupted = errors.New("composer interrupted")
+var errRunInterrupted = errors.New("run interrupted")
 
 var versionInfo = VersionInfo{
 	Version: "dev",
@@ -666,9 +668,17 @@ func handleInteractiveCommand(rawCommand string, out, errOut io.Writer, e env) (
 		}
 		if e.isTTY {
 			if runErr := runCoordinatorChatResponse(e, out); runErr != nil {
+				if errors.Is(runErr, errRunInterrupted) {
+					printInterruptHint(out, e)
+					return 130, true
+				}
 				fmt.Fprintf(errOut, "agents: coordinator response: %v\n", runErr)
 			}
 			if runErr := runInteractiveQueuedRoles(e, out); runErr != nil {
+				if errors.Is(runErr, errRunInterrupted) {
+					printInterruptHint(out, e)
+					return 130, true
+				}
 				fmt.Fprintf(errOut, "agents: loop: %v\n", runErr)
 			}
 		}
@@ -2536,6 +2546,10 @@ func runLoopCommand(args []string, out, errOut io.Writer, e env) int {
 	}
 	result, err := runConfiguredRole(e, state, out)
 	if err != nil {
+		if errors.Is(err, errRunInterrupted) {
+			printInterruptHint(out, e)
+			return 130
+		}
 		fmt.Fprintf(errOut, "agents: run: %v\n", err)
 		return 1
 	}
@@ -2897,9 +2911,23 @@ func runStreamingShellCommand(cwd, command string, artifacts runArtifactPaths, s
 	go func() {
 		waitErr <- cmd.Wait()
 	}()
+	interrupts := make(chan os.Signal, 1)
+	signal.Notify(interrupts, os.Interrupt)
+	defer signal.Stop(interrupts)
 	var completedBy string
 	select {
 	case err = <-waitErr:
+	case <-interrupts:
+		fmt.Fprintf(logFile, "\n[agents] interrupted at %s\n", time.Now().UTC().Format(time.RFC3339))
+		_ = interruptManagedProcess(cmd)
+		select {
+		case <-waitErr:
+		case <-time.After(5 * time.Second):
+			fmt.Fprintf(logFile, "[agents] process did not exit after interrupt; killing at %s\n", time.Now().UTC().Format(time.RFC3339))
+			_ = killManagedProcess(cmd)
+			<-waitErr
+		}
+		err = errRunInterrupted
 	case completedBy = <-completedByHandoff:
 		fmt.Fprintf(logFile, "\n[agents] detected completion handoff to %s at %s\n", completedBy, time.Now().UTC().Format(time.RFC3339))
 		_ = interruptManagedProcess(cmd)

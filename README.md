@@ -207,8 +207,8 @@ Interactive input model:
 - Press Tab in the interactive composer to complete a unique slash command,
   such as `/qu` to `/quit`.
 - Shell Tab completion is available through `agents completion install-zsh`.
-- Press Ctrl-C to exit the composer with a continuation hint for the active
-  session.
+- Press Ctrl-C in the composer or during a running role to stop with a
+  continuation hint for the active session.
 - Type `?` for shortcuts and the command menu.
 
 Interactive slash commands available today:
