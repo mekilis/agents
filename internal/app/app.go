@@ -1733,7 +1733,7 @@ func ensureAgentsGitignore(statePath string) error {
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	needed := []string{"runs/"}
+	needed := []string{"runs/", "tmp/", "active"}
 	existing := map[string]bool{}
 	for _, line := range strings.Split(string(data), "\n") {
 		existing[strings.TrimSpace(line)] = true
@@ -3813,6 +3813,7 @@ func buildRolePrompt(e env, state loopState) (string, error) {
 		fmt.Fprintln(&b, "- Record a handoff when ready for review:")
 		fmt.Fprintln(&b, `  agents handoff --to reviewer "what changed and how it was checked"`)
 		fmt.Fprintln(&b, "- You cannot verify your own work: do not run `agents verify` or `agents finding verify`; the reviewer records verification independently.")
+		fmt.Fprintln(&b, "- Keep build caches, compiled binaries, and scratch files out of the repository (including .agents/); use the system temp directory instead.")
 		fmt.Fprintln(&b, "- Do not commit; leave changes for review.")
 	case "reviewer":
 		fmt.Fprintf(&b, "You are the reviewer for this Agents task.\n\n")
@@ -3832,6 +3833,7 @@ func buildRolePrompt(e env, state loopState) (string, error) {
 		fmt.Fprintln(&b, `  agents verify "checks performed" --cmd 'go test ./...'`)
 		fmt.Fprintln(&b, "  Recording passing verification reaches the human approval boundary; nothing ships on your claim alone.")
 		fmt.Fprintln(&b, "- Summarize the review in your response: issues first, then what was verified.")
+		fmt.Fprintln(&b, "- Keep build caches, compiled binaries, and scratch files out of the repository (including .agents/); use the system temp directory instead.")
 		fmt.Fprintln(&b, "- Do not edit implementation code, do not mark findings fixed, and do not commit.")
 	case "coordinator":
 		fmt.Fprintf(&b, "You are the coordinator for this Agents task.\n\n")

@@ -502,8 +502,8 @@ func TestInitCreatesShareableWorkspaceState(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if string(agentsIgnore) != "runs/\n" {
-			t.Fatalf("expected .agents/.gitignore to ignore runs only, got:\n%s", agentsIgnore)
+		if string(agentsIgnore) != "runs/\ntmp/\nactive\n" {
+			t.Fatalf("expected .agents/.gitignore to ignore runs, tmp, and active, got:\n%s", agentsIgnore)
 		}
 		return 0
 	})
@@ -529,7 +529,7 @@ func TestInitKeepsExistingAgentsGitignore(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if string(got) != "cache/\nruns/\n" {
+		if string(got) != "cache/\nruns/\ntmp/\nactive\n" {
 			t.Fatalf("unexpected .agents/.gitignore:\n%s", got)
 		}
 		return 0
