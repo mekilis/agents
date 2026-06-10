@@ -110,6 +110,14 @@ agents task open "Fix checkout flow" --ref WEB-123
 agents task use tasks/2026-06-05-001-fix-checkout-flow--web-123
 ```
 
+Maintain the active task's chunks through the CLI instead of hand-editing:
+
+```bash
+agents task scope "Checkout service and its API tests; no schema changes"
+agents task status "Fix implemented; regression test added; awaiting review"
+agents task next "Reviewer verifies the expired-card path"
+```
+
 Record coordination state:
 
 ```bash
@@ -125,6 +133,13 @@ Every record carries an actor identity, resolved from `--by`, then the
 `AGENTS_ACTOR` environment variable, then the OS user. When `agents run`
 launches a role, it sets `AGENTS_ACTOR` to the role name in the agent's
 environment, so records written by agents are attributed automatically.
+
+Actor names alone are not enough: `cursor`, `codex`, and `claude` name tools,
+not models. `agents run` also sets `AGENTS_AGENT` to a qualified descriptor —
+for example `codex (model gpt-5.5, reasoning high)` — and records carry it as
+an `Agent:` line, so it is always inspectable which model produced a decision,
+finding, fix, or verification. Run output and `agents dispatch` show the same
+qualified descriptor.
 
 Independent verification is enforced, not suggested:
 
@@ -257,6 +272,7 @@ Interactive slash commands available today:
 /init [--share|--local]
 /task open "title" [--ref REF]
 /task use <task>
+/task scope|status|next "text"
 /decision add "text"
 /handoff --to ROLE "text"
 /finding add|fix|verify ...

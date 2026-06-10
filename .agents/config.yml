@@ -1,0 +1,38 @@
+version: 1
+storage:
+  commit_chunks: true
+  cleanup_on_archive: true
+  cleanup_mode: summarize_then_prune
+  keep:
+    active_tasks: true
+    archived_summaries: true
+    decisions: promoted_only
+    findings: unresolved_only
+settings:
+  # Codex CLI: model examples: gpt-5.5, gpt-5.4, gpt-5-codex, codex-mini-latest
+  # Codex reasoning examples: minimal, low, medium, high, xhigh
+  codex_model: "gpt-5.5"
+  codex_reasoning: ""
+  # Claude Code: model names and aliases vary by account and CLI version.
+  # Run 'claude --help' or use Claude's in-app model controls for current choices.
+  # Claude effort: low, medium, high, xhigh, max; supported levels depend on the selected model.
+  claude_model: ""
+  claude_effort: ""
+  # Cursor Agent: run 'agent models' or 'cursor-agent --list-models' for account-specific choices
+  # Common examples from CLI help: gpt-5, claude-4.6-sonnet-medium, claude-4.6-sonnet-medium-thinking
+  cursor_model: "gpt-5"
+# Each role is a provider name (cursor, cursor-agent, agent, codex, claude)
+# or a map with provider plus optional model/reasoning overrides:
+#   reviewer:
+#     provider: codex
+#     model: gpt-5.5
+#     reasoning: high
+# Advanced escape hatch: a cmd template containing {prompt_file}.
+roles:
+  implementer: agent
+  reviewer:
+    provider: codex
+    reasoning: high
+  coordinator:
+    provider: codex
+    reasoning: medium

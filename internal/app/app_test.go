@@ -856,7 +856,7 @@ func TestInteractiveHelpAndExit(t *testing.T) {
 		"Slash commands:",
 		`/status`,
 		"show workspace, active task, and record counts",
-		`/task open "title" [--ref REF]`,
+		`/task open|use|scope|status|next ...`,
 		`/decision add "text"`,
 		"/run",
 		"/quit",
@@ -2373,7 +2373,7 @@ func TestDispatchJSONShowsConfiguredAgent(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
 		t.Fatalf("dispatch JSON should decode: %v\n%s", err, out.String())
 	}
-	if got.Role != "implementer" || got.Agent != "claude" || !got.Configured || got.Task == nil {
+	if got.Role != "implementer" || got.Agent != "claude (model provider default)" || !got.Configured || got.Task == nil {
 		t.Fatalf("unexpected dispatch JSON: %+v", got)
 	}
 }
@@ -2860,6 +2860,123 @@ func TestRunLoopStopsAtMaxIterations(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "reached 2 role runs") {
 		t.Fatalf("expected max-iterations stop message, got:\n%s", out.String())
+	}
+}
+
+func TestAgentDescriptorQualifiesModel(t *testing.T) {
+	cases := []struct {
+		agent    string
+		settings agentSettings
+		want     string
+	}{
+		{"codex", agentSettings{CodexModel: "gpt-5.5", CodexReasoning: "high"}, "codex (model gpt-5.5, reasoning high)"},
+		{"claude", agentSettings{ClaudeModel: "opus", ClaudeEffort: "xhigh"}, "claude (model opus, reasoning xhigh)"},
+		{"agent", agentSettings{CursorModel: "gpt-5"}, "agent (model gpt-5)"},
+		{"cursor", agentSettings{}, "cursor (model provider default)"},
+		{"my-agent {prompt_file}", agentSettings{}, "my-agent {prompt_file} (custom command)"},
+		{"", agentSettings{}, ""},
+	}
+	for _, tc := range cases {
+		if got := agentDescriptor(tc.agent, tc.settings); got != tc.want {
+			t.Fatalf("agentDescriptor(%q) = %q, want %q", tc.agent, got, tc.want)
+		}
+	}
+}
+
+func TestChunksRecordAgentDescriptor(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		task, err := openTask(e, []string{"Model Attribution"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("AGENTS_ACTOR", "reviewer")
+		t.Setenv("AGENTS_AGENT", "codex (model gpt-5.5, reasoning high)")
+		if code := Run([]string{"finding", "add", "an issue"}, bytes.NewBuffer(nil), &out, &errOut); code != 0 {
+			t.Fatalf("finding add code=%d stderr=%s", code, errOut.String())
+		}
+		if code := Run([]string{"verify", "checked it"}, bytes.NewBuffer(nil), &out, &errOut); code != 0 {
+			t.Fatalf("verify code=%d stderr=%s", code, errOut.String())
+		}
+		for _, dir := range []string{"findings", "verification"} {
+			entries, err := os.ReadDir(filepath.Join(cwd, ".agents", task.Path, dir))
+			if err != nil || len(entries) == 0 {
+				t.Fatalf("expected %s chunk, err=%v", dir, err)
+			}
+			data, err := os.ReadFile(filepath.Join(cwd, ".agents", task.Path, dir, entries[0].Name()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(data), "Agent: codex (model gpt-5.5, reasoning high)") {
+				t.Fatalf("%s chunk missing qualified agent line:\n%s", dir, string(data))
+			}
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
+func TestTaskChunkSettersUpdateTaskState(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		task, err := openTask(e, []string{"Maintained Task"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, set := range [][]string{
+			{"task", "scope", "CLI surface and loop state only"},
+			{"task", "status", "Setters implemented; tests pending"},
+			{"task", "next", "Run the suite and hand off to reviewer"},
+		} {
+			if code := Run(set, bytes.NewBuffer(nil), &out, &errOut); code != 0 {
+				t.Fatalf("%v code=%d stderr=%s", set, code, errOut.String())
+			}
+		}
+		checks := []struct {
+			file, want string
+		}{
+			{"scope.md", "# Scope\n\nCLI surface and loop state only\n"},
+			{"status.md", "# Status\n\nSetters implemented; tests pending\n"},
+			{"next.md", "# Next\n\nRun the suite and hand off to reviewer\n"},
+		}
+		for _, check := range checks {
+			data, err := os.ReadFile(filepath.Join(cwd, ".agents", task.Path, check.file))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(data) != check.want {
+				t.Fatalf("%s = %q, want %q", check.file, string(data), check.want)
+			}
+		}
+		// The next line should surface in status output.
+		out.Reset()
+		if code := Run([]string{"status"}, bytes.NewBuffer(nil), &out, &errOut); code != 0 {
+			t.Fatalf("status code=%d stderr=%s", code, errOut.String())
+		}
+		if !strings.Contains(out.String(), "next: Run the suite and hand off to reviewer") {
+			t.Fatalf("status missing updated next line:\n%s", out.String())
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
+func TestTaskChunkSetterRequiresActiveTask(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		return Run([]string{"task", "status", "no task yet"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code == 0 {
+		t.Fatalf("expected task status without active task to fail")
+	}
+	if !strings.Contains(errOut.String(), "no active task") {
+		t.Fatalf("expected active task error, got %q", errOut.String())
 	}
 }
 

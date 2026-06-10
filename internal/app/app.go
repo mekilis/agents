@@ -55,7 +55,7 @@ var interactiveSlashCommands = []slashCommandSpec{
 	{Name: "/status", Usage: "/status", Description: "show workspace, active task, and record counts"},
 	{Name: "/trust", Usage: "/trust", Description: "trust this workspace"},
 	{Name: "/init", Usage: "/init [--share|--local]", Description: "initialize Agents task state"},
-	{Name: "/task", Usage: `/task open "title" [--ref REF]`, Description: "open or switch active tasks"},
+	{Name: "/task", Usage: `/task open|use|scope|status|next ...`, Description: "open, switch, or update the active task"},
 	{Name: "/decision", Usage: `/decision add "text"`, Description: "record a planning decision"},
 	{Name: "/handoff", Usage: `/handoff --to ROLE "text"`, Description: "route context to another role"},
 	{Name: "/finding", Usage: "/finding add|fix|verify ...", Description: "track review findings"},
@@ -75,6 +75,11 @@ type env struct {
 	disableBanner bool
 	trustPath     string
 	actor         string
+	// agentDesc qualifies the actor with the concrete agent and model behind
+	// it (from AGENTS_AGENT), e.g. "codex (model gpt-5.5, reasoning high)".
+	// Provider names like cursor or codex are tools, not models; records
+	// should say what actually ran.
+	agentDesc string
 }
 
 type config struct {
@@ -239,7 +244,26 @@ func currentEnv(in io.Reader) (env, error) {
 		disableBanner: bannerDisabledFromEnv(os.Getenv("AGENTS_NO_BANNER")),
 		trustPath:     trustPath,
 		actor:         defaultActor(),
+		agentDesc:     strings.TrimSpace(os.Getenv("AGENTS_AGENT")),
 	}, nil
+}
+
+// agentDescriptor qualifies an agent name with the model and reasoning that
+// will actually run. Built-in names (cursor, codex, claude) identify tools,
+// not models, so durable records and run output should carry both.
+func agentDescriptor(agent string, settings agentSettings) string {
+	label := strings.TrimSpace(agent)
+	if label == "" {
+		return ""
+	}
+	if strings.Contains(label, promptFileMarker) {
+		return label + " (custom command)"
+	}
+	desc := label + " (model " + settingOrDefault(effectiveModelSetting(label, settings))
+	if reasoning := strings.TrimSpace(effectiveReasoningSetting(label, settings)); reasoning != "" {
+		desc += ", reasoning " + reasoning
+	}
+	return desc + ")"
 }
 
 // defaultActor resolves the actor used for chunk attribution when --by is not
@@ -265,6 +289,15 @@ func resolveActor(e env, by string) (string, error) {
 		return actor, nil
 	}
 	return "", fmt.Errorf("actor is required: set AGENTS_ACTOR or pass --by")
+}
+
+// agentLine renders the optional Agent metadata line that qualifies a record
+// with the concrete agent and model behind the actor.
+func agentLine(e env) string {
+	if e.agentDesc == "" {
+		return ""
+	}
+	return "Agent: " + e.agentDesc + "\n"
 }
 
 // extractByFlag removes a --by flag from args and returns its value with the
@@ -488,6 +521,7 @@ func printHelp(w io.Writer) {
 	fmt.Fprintln(w, "  agents status [--json]")
 	fmt.Fprintln(w, "  agents task open \"title\" [--ref REF]")
 	fmt.Fprintln(w, "  agents task use <task>")
+	fmt.Fprintln(w, "  agents task scope|status|next \"text\"")
 	fmt.Fprintln(w, "  agents decision add \"text\" [--by ACTOR]")
 	fmt.Fprintln(w, "  agents handoff --to ROLE \"text\" [--by ACTOR]")
 	fmt.Fprintln(w, "  agents finding add \"text\" [--severity low|medium|high] [--by ACTOR]")
@@ -590,7 +624,7 @@ _agents() {
   completion_cmds=('zsh:print zsh completion' 'install-zsh:install zsh completion locally')
   init_flags=('--share:commit task state' '--local:ignore .agents in this repo')
   json_flags=('--json:print JSON')
-  task_cmds=('open:open a new task' 'use:switch active task')
+  task_cmds=('open:open a new task' 'use:switch active task' 'scope:set task scope' 'status:set task status' 'next:set next step')
   finding_cmds=('add:add a finding' 'fix:mark finding fixed' 'verify:mark finding verified')
 
   _arguments -C \
@@ -2025,10 +2059,54 @@ func runTaskCommand(args []string, out, errOut io.Writer, e env) int {
 		fmt.Fprintf(out, "active task: %s\n", task.Title)
 		fmt.Fprintf(out, "task path: %s\n", task.Path)
 		return 0
+	case "scope", "status", "next":
+		relPath, err := setTaskChunk(e, args[0], args[1:])
+		if err != nil {
+			fmt.Fprintf(errOut, "agents: task %s: %v\n", args[0], err)
+			return 1
+		}
+		fmt.Fprintf(out, "updated: %s\n", relPath)
+		return 0
 	default:
 		fmt.Fprintf(errOut, "agents: unknown task command: %s\n", args[0])
 		return 2
 	}
+}
+
+// setTaskChunk replaces the scope.md, status.md, or next.md chunk of the
+// active task so task state is maintained through the CLI instead of
+// hand-editing.
+func setTaskChunk(e env, kind string, args []string) (string, error) {
+	headings := map[string]string{
+		"scope":  "Scope",
+		"status": "Status",
+		"next":   "Next",
+	}
+	heading, ok := headings[kind]
+	if !ok {
+		return "", fmt.Errorf("unknown task chunk %q", kind)
+	}
+	text, err := parseSingleTextArg(args, kind+" text")
+	if err != nil {
+		return "", err
+	}
+	active := readActiveTask(e.cwd)
+	if active.Path == "" {
+		return "", fmt.Errorf("no active task")
+	}
+	taskDir := filepath.Join(e.cwd, stateDir, active.Path)
+	if _, err := os.Stat(filepath.Join(taskDir, "task.md")); err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("active task not found: %s", active.Path)
+		}
+		return "", err
+	}
+	body := fmt.Sprintf("# %s\n\n%s\n", heading, strings.TrimRight(text, "\n"))
+	relPath := filepath.Join(active.Path, kind+".md")
+	if err := os.WriteFile(filepath.Join(taskDir, kind+".md"), []byte(body), 0o644); err != nil {
+		return "", err
+	}
+	return relPath, nil
 }
 
 func openTask(e env, args []string, now time.Time) (activeTask, error) {
@@ -2243,7 +2321,7 @@ func addDecision(e env, args []string, now time.Time) (chunkRecord, error) {
 	if len(title) > 80 {
 		title = strings.TrimSpace(title[:80])
 	}
-	body := fmt.Sprintf("# Decision: %s\n\nStatus: proposed\nBy: %s\n\n%s\n", title, actor, text)
+	body := fmt.Sprintf("# Decision: %s\n\nStatus: proposed\nBy: %s\n%s\n%s\n", title, actor, agentLine(e), text)
 	record, err := writeActiveTaskChunk(e, "decisions", title, body, now)
 	if err != nil {
 		return chunkRecord{}, err
@@ -2265,7 +2343,7 @@ func addHandoff(e env, args []string, now time.Time) (chunkRecord, error) {
 		return chunkRecord{}, err
 	}
 	title := "Handoff to " + to
-	body := fmt.Sprintf("# Handoff: %s\n\nTo: %s\nFrom: %s\n\n%s\n", to, to, actor, text)
+	body := fmt.Sprintf("# Handoff: %s\n\nTo: %s\nFrom: %s\n%s\n%s\n", to, to, actor, agentLine(e), text)
 	record, err := writeActiveTaskChunk(e, "handoffs", title, body, now)
 	if err != nil {
 		return chunkRecord{}, err
@@ -2415,7 +2493,7 @@ func addFinding(e env, args []string, now time.Time) (chunkRecord, error) {
 	if len(title) > 80 {
 		title = strings.TrimSpace(title[:80])
 	}
-	body := fmt.Sprintf("# Finding: %s\n\nStatus: open\nSeverity: %s\nCreated by: %s\n\n%s\n", title, severity, actor, text)
+	body := fmt.Sprintf("# Finding: %s\n\nStatus: open\nSeverity: %s\nCreated by: %s\n%s\n%s\n", title, severity, actor, agentLine(e), text)
 	return writeActiveTaskChunk(e, "findings", title, body, now)
 }
 
@@ -2499,7 +2577,7 @@ func updateFindingStatus(e env, args []string, status, section string, now time.
 	updated := replaceStatusLine(markdown, status)
 	var b strings.Builder
 	b.WriteString(strings.TrimRight(updated, "\n"))
-	fmt.Fprintf(&b, "\n\n## %s\n\nBy: %s\nRecorded at: %s\n", section, actor, now.Format(time.RFC3339))
+	fmt.Fprintf(&b, "\n\n## %s\n\nBy: %s\n%sRecorded at: %s\n", section, actor, agentLine(e), now.Format(time.RFC3339))
 	if strings.TrimSpace(evidence) != "" {
 		fmt.Fprintf(&b, "Evidence: %s\n", strings.TrimSpace(evidence))
 	}
@@ -2656,8 +2734,8 @@ func addVerification(e env, args []string, now time.Time) (chunkRecord, bool, er
 		}
 		commandSection = section.String()
 	}
-	body := fmt.Sprintf("# Verification: %s\n\nResult: %s\nBy: %s\nRecorded at: %s\n\n%s\n%s",
-		title, result, actor, now.Format(time.RFC3339), text, commandSection)
+	body := fmt.Sprintf("# Verification: %s\n\nResult: %s\nBy: %s\n%sRecorded at: %s\n\n%s\n%s",
+		title, result, actor, agentLine(e), now.Format(time.RFC3339), text, commandSection)
 	record, err := writeActiveTaskChunk(e, "verification", title, body, now)
 	if err != nil {
 		return chunkRecord{}, false, err
@@ -3145,6 +3223,7 @@ type loopState struct {
 type roleRunResult struct {
 	Role         string
 	Agent        string
+	AgentDesc    string
 	Command      string
 	PromptPath   string
 	LogPath      string
@@ -3177,9 +3256,10 @@ func dispatchPacket(e env, role string) (dispatchInfo, error) {
 	if err != nil {
 		return dispatchInfo{}, err
 	}
+	rc := config.Roles[role]
 	info := dispatchInfo{
 		Role:  role,
-		Agent: config.Roles[role].agentLabel(),
+		Agent: agentDescriptor(rc.agentLabel(), roleSettings(rc, config.Settings)),
 		Task:  state.Task,
 		Stats: state.Stats,
 	}
@@ -3311,6 +3391,7 @@ func runConfiguredRoleWithOptions(e env, state loopState, options roleRunOptions
 	return roleRunResult{
 		Role:        state.NextRole,
 		Agent:       agent,
+		AgentDesc:   agentDescriptor(agent, effectiveSettings),
 		Command:     command,
 		PromptPath:  artifacts.Prompt,
 		LogPath:     artifacts.Log,
@@ -3433,7 +3514,11 @@ func runStreamingShellCommand(cwd, command string, artifacts runArtifactPaths, s
 	cmd.Dir = cwd
 	// Attribute any `agents` CLI calls the role makes to the role itself, so
 	// findings, fixes, and verifications carry enforceable actor identity.
-	cmd.Env = append(os.Environ(), "AGENTS_ACTOR="+state.NextRole)
+	// AGENTS_AGENT qualifies records with the concrete provider and model.
+	cmd.Env = append(os.Environ(),
+		"AGENTS_ACTOR="+state.NextRole,
+		"AGENTS_AGENT="+agentDescriptor(agent, settings),
+	)
 	configureManagedProcess(cmd)
 	if err := os.MkdirAll(filepath.Dir(artifacts.Log), 0o755); err != nil {
 		return "", err
@@ -3690,6 +3775,7 @@ func buildRolePrompt(e env, state loopState) (string, error) {
 		fmt.Fprintln(&b, "- Edit the working tree to implement the task or fix open findings.")
 		fmt.Fprintln(&b, "- Run relevant checks.")
 		fmt.Fprintln(&b, "- Mark findings you fixed with `agents finding fix <finding> --evidence \"what proves the fix\"`.")
+		fmt.Fprintln(&b, "- Keep task state current: `agents task status \"where things stand\"` and `agents task next \"what should happen next\"`.")
 		fmt.Fprintln(&b, "- Record a handoff when ready for review:")
 		fmt.Fprintln(&b, `  agents handoff --to reviewer "what changed and how it was checked"`)
 		fmt.Fprintln(&b, "- You cannot verify your own work: do not run `agents verify` or `agents finding verify`; the reviewer records verification independently.")
@@ -3813,7 +3899,11 @@ func printRoleRunResult(w io.Writer, result roleRunResult) {
 
 func printRoleRunSummary(w io.Writer, result roleRunResult, includeOutput bool) {
 	fmt.Fprintf(w, "ran role: %s\n", result.Role)
-	fmt.Fprintf(w, "agent: %s\n", result.Agent)
+	agent := result.AgentDesc
+	if agent == "" {
+		agent = result.Agent
+	}
+	fmt.Fprintf(w, "agent: %s\n", agent)
 	fmt.Fprintf(w, "prompt: %s\n", relPathOrSelf(result.PromptPath, result.Before.Task.Path))
 	fmt.Fprintf(w, "log: %s\n", relPathOrSelf(result.LogPath, result.Before.Task.Path))
 	if includeOutput && strings.TrimSpace(result.AgentOutput) != "" {
