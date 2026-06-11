@@ -2,6 +2,10 @@ version: 2
 
 project_name: agents
 
+before:
+  hooks:
+    - go mod tidy
+
 builds:
   - id: agents
     main: ./cmd/agents
@@ -10,12 +14,12 @@ builds:
       - CGO_ENABLED=0
     flags:
       - -trimpath
+    mod_timestamp: "{{ .CommitTimestamp }}"
     ldflags:
-      - -s
-      - -w
+      - -s -w
       - -X main.version={{ .Version }}
       - -X main.commit={{ .ShortCommit }}
-      - -X main.date={{ .Date }}
+      - -X main.date={{ .CommitDate }}
     goos:
       - linux
       - darwin
@@ -23,31 +27,42 @@ builds:
     goarch:
       - amd64
       - arm64
-    ignore:
-      - goos: windows
-        goarch: arm64
 
 archives:
   - id: default
-    builds: [agents]
-    name_template: '{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}'
-    format: tar.gz
+    ids:
+      - agents
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    formats:
+      - tar.gz
     format_overrides:
       - goos: windows
-        formats: [zip]
+        formats:
+          - zip
     files:
+      - LICENSE
       - README.md
+      - tutorials/*
 
 checksum:
-  name_template: 'checksums.txt'
+  name_template: checksums.txt
 
 changelog:
-  disable: false
   sort: asc
   filters:
     exclude:
-      - '^docs?:'
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
 
 release:
   draft: false
   prerelease: auto
+  header: |
+    Agents {{ .Tag }} coordinates AI coding agents through task state, handoffs,
+    findings, verification, and human approval.
+
+    See `README.md` and `tutorials/tiny-todo-cli.md` in each archive for a
+    quick start.
