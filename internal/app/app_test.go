@@ -1587,6 +1587,79 @@ func TestApplyRoleOutputDirectivesParsesJSONReviewerHandoff(t *testing.T) {
 	}
 }
 
+func TestApplyRoleOutputDirectivesSkipsPlaceholderAndDuplicateVerification(t *testing.T) {
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		task, err := openTask(e, []string{"Review"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw := strings.Join([]string{
+			"Prompt echo:",
+			"```agents-verify",
+			`{"text":"specific checks performed and review result","cmd":"go test ./..."}`,
+			"```",
+			"",
+			"Provider answer:",
+			"```agents-verify",
+			`{"text":"python tests passed","cmd":""}`,
+			"```",
+			"",
+			"Provider answer repeated:",
+			"```agents-verify",
+			`{"text":"python tests passed","cmd":""}`,
+			"```",
+		}, "\n")
+		cleaned, err := applyRoleOutputDirectives(e, "reviewer", raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(cleaned, "agents-verify") {
+			t.Fatalf("expected directives removed, got:\n%s", cleaned)
+		}
+		stats, err := readTaskStats(cwd, task.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stats.Verification != 1 || stats.VerificationFail != 0 {
+			t.Fatalf("verification stats got pass=%d fail=%d", stats.Verification, stats.VerificationFail)
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
+func TestApplyRoleOutputDirectivesSkipsPlaceholderHandoff(t *testing.T) {
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		task, err := openTask(e, []string{"Implement"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw := "Echo.\n\n```agents-handoff\n{\"role\":\"reviewer\",\"text\":\"specific changes made and checks performed\"}\n```\n"
+		cleaned, err := applyRoleOutputDirectives(e, "implementer", raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(cleaned, "agents-handoff") {
+			t.Fatalf("expected directive removed, got:\n%s", cleaned)
+		}
+		stats, err := readTaskStats(cwd, task.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stats.Handoffs != 0 {
+			t.Fatalf("handoff count got %d", stats.Handoffs)
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
 func TestInteractiveRequiresSlashForCommandsAndChatsWithCoordinator(t *testing.T) {
 	var out, errOut bytes.Buffer
 	code := withTempProcessEnv(t, func(home, cwd string) int {

@@ -1433,6 +1433,9 @@ func applyCoordinatorDirective(e env, actor string, directive coordinatorDirecti
 }
 
 func coordinatorDirectiveActionable(actor string, directive coordinatorDirective) bool {
+	if coordinatorDirectivePlaceholder(directive) {
+		return false
+	}
 	if actor != "coordinator" || directive.Role != "implementer" {
 		return true
 	}
@@ -1441,6 +1444,17 @@ func coordinatorDirectiveActionable(actor string, directive coordinatorDirective
 	}
 	text := strings.TrimSpace(strings.ToLower(directive.Text))
 	return text != "" && text != "clear implementation request with context and verification"
+}
+
+func coordinatorDirectivePlaceholder(directive coordinatorDirective) bool {
+	text := strings.TrimSpace(strings.ToLower(directive.Text))
+	switch text {
+	case "specific changes made and checks performed",
+		"clear implementation request with context and verification":
+		return true
+	default:
+		return false
+	}
 }
 
 type progressWriter struct {
@@ -4603,20 +4617,30 @@ func buildRolePrompt(e env, state loopState) (string, error) {
 
 func applyRoleOutputDirectives(e env, actor, output string) (string, error) {
 	cleaned := output
+	seenHandoffs := map[string]bool{}
+	seenVerification := map[string]bool{}
 	for {
 		changed := false
 		directive, ok := parseCoordinatorDirective(cleaned)
 		if ok {
-			if err := applyCoordinatorDirective(e, actor, directive); err != nil {
-				return cleaned, err
+			key := directive.Role + "\x00" + directive.Text
+			if !seenHandoffs[key] {
+				seenHandoffs[key] = true
+				if err := applyCoordinatorDirective(e, actor, directive); err != nil {
+					return cleaned, err
+				}
 			}
 			cleaned = removeCoordinatorDirective(cleaned)
 			changed = true
 		}
 		verification, ok := parseVerificationDirective(cleaned)
 		if ok {
-			if err := applyVerificationDirective(e, actor, verification); err != nil {
-				return cleaned, err
+			key := verification.Text + "\x00" + verification.Cmd
+			if !seenVerification[key] {
+				seenVerification[key] = true
+				if err := applyVerificationDirective(e, actor, verification); err != nil {
+					return cleaned, err
+				}
 			}
 			cleaned = removeVerificationDirective(cleaned)
 			changed = true
@@ -4629,12 +4653,20 @@ func applyRoleOutputDirectives(e env, actor, output string) (string, error) {
 }
 
 func applyVerificationDirective(e env, actor string, directive verificationDirective) error {
+	if verificationDirectivePlaceholder(directive) {
+		return nil
+	}
 	args := []string{directive.Text, "--by", actor}
 	if directive.Cmd != "" {
 		args = append(args, "--cmd", directive.Cmd)
 	}
 	_, _, err := addVerification(e, args, time.Now().UTC())
 	return err
+}
+
+func verificationDirectivePlaceholder(directive verificationDirective) bool {
+	return strings.EqualFold(strings.TrimSpace(directive.Text), "specific checks performed and review result") &&
+		strings.EqualFold(strings.TrimSpace(directive.Cmd), "go test ./...")
 }
 
 func appendPromptFile(b *strings.Builder, cwd, taskPath, name, heading string) {
