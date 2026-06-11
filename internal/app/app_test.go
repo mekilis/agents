@@ -1272,6 +1272,9 @@ func TestInteractiveRunHeaderWriterOnlyShowsRunPointers(t *testing.T) {
 		"Reading additional input from stdin...",
 		"OpenAI Codex v0.137.0",
 		`2026-06-11T12:03:39.367911Z  WARN codex_core_plugins::manifest: ignoring interface.defaultPrompt[0]: prompt must be at most 128 characters`,
+		"```agents-progress",
+		`{"status":"running checks","detail":"verifying tests and task records"}`,
+		"```",
 		"reviewer answer",
 		"",
 	}, "\n")
@@ -1282,6 +1285,7 @@ func TestInteractiveRunHeaderWriterOnlyShowsRunPointers(t *testing.T) {
 	for _, want := range []string{
 		"run: 2026-06-11T120337Z-reviewer",
 		"log: .agents/runs/logs/2026-06-11T120337Z-reviewer.log",
+		"- Running checks: Verifying tests and task records",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("header writer missing %q, got:\n%s", want, got)
@@ -1291,6 +1295,19 @@ func TestInteractiveRunHeaderWriterOnlyShowsRunPointers(t *testing.T) {
 		if strings.Contains(got, unwanted) {
 			t.Fatalf("header writer should hide %q, got:\n%s", unwanted, got)
 		}
+	}
+}
+
+func TestCleanInteractiveAgentOutputRemovesProgressBlocks(t *testing.T) {
+	raw := strings.Join([]string{
+		"```agents-progress",
+		`{"status":"Editing files","detail":"Updating parser"}`,
+		"```",
+		"Implemented todo CLI.",
+	}, "\n")
+	got := cleanInteractiveAgentOutput("agent", raw)
+	if got != "Implemented todo CLI." {
+		t.Fatalf("progress block should be removed from final output, got %q", got)
 	}
 }
 

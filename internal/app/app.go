@@ -1412,20 +1412,94 @@ func printInteractiveRoleTransition(out io.Writer, result roleRunResult) {
 }
 
 type interactiveRunHeaderWriter struct {
-	out io.Writer
+	out       io.Writer
+	pending   string
+	inBlock   bool
+	blockLine []string
 }
 
-func (w interactiveRunHeaderWriter) Write(p []byte) (int, error) {
-	for _, line := range strings.SplitAfter(string(p), "\n") {
-		trimmed := strings.TrimSpace(line)
-		switch {
-		case strings.HasPrefix(trimmed, "run id:"):
-			fmt.Fprintf(w.out, "run: %s\n", strings.TrimSpace(strings.TrimPrefix(trimmed, "run id:")))
-		case strings.HasPrefix(trimmed, "run log:"):
-			fmt.Fprintf(w.out, "log: %s\n", strings.TrimSpace(strings.TrimPrefix(trimmed, "run log:")))
+func (w *interactiveRunHeaderWriter) Write(p []byte) (int, error) {
+	w.pending += string(p)
+	for {
+		line, rest, ok := strings.Cut(w.pending, "\n")
+		if !ok {
+			break
 		}
+		w.pending = rest
+		w.handleLine(line)
 	}
 	return len(p), nil
+}
+
+func (w *interactiveRunHeaderWriter) handleLine(line string) {
+	trimmed := strings.TrimSpace(line)
+	if w.inBlock {
+		if trimmed == "```" {
+			if progress, ok := parseProgressDirectiveLines(w.blockLine); ok {
+				printInteractiveProgress(w.out, progress)
+			}
+			w.inBlock = false
+			w.blockLine = nil
+			return
+		}
+		w.blockLine = append(w.blockLine, line)
+		return
+	}
+	switch {
+	case strings.HasPrefix(trimmed, "run id:"):
+		fmt.Fprintf(w.out, "run: %s\n", strings.TrimSpace(strings.TrimPrefix(trimmed, "run id:")))
+	case strings.HasPrefix(trimmed, "run log:"):
+		fmt.Fprintf(w.out, "log: %s\n", strings.TrimSpace(strings.TrimPrefix(trimmed, "run log:")))
+	case trimmed == "```agents-progress":
+		w.inBlock = true
+		w.blockLine = nil
+	}
+}
+
+type progressDirective struct {
+	Status string
+	Detail string
+}
+
+func parseProgressDirectiveLines(lines []string) (progressDirective, bool) {
+	var p progressDirective
+	data := strings.TrimSpace(strings.Join(lines, "\n"))
+	if data == "" {
+		return progressDirective{}, false
+	}
+	if err := json.Unmarshal([]byte(data), &p); err != nil {
+		return progressDirective{}, false
+	}
+	p.Status = strings.TrimSpace(p.Status)
+	p.Detail = strings.TrimSpace(p.Detail)
+	return p, p.Status != ""
+}
+
+func printInteractiveProgress(w io.Writer, progress progressDirective) {
+	status := strings.TrimSpace(progress.Status)
+	if status == "" {
+		return
+	}
+	detail := strings.TrimSpace(progress.Detail)
+	if detail == "" {
+		fmt.Fprintf(w, "- %s\n", sentenceCase(status))
+		return
+	}
+	fmt.Fprintf(w, "- %s: %s\n", sentenceCase(status), sentenceCase(singleLine(detail)))
+}
+
+func singleLine(text string) string {
+	return strings.Join(strings.Fields(text), " ")
+}
+
+func sentenceCase(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	runes := []rune(text)
+	runes[0] = unicode.ToUpper(runes[0])
+	return string(runes)
 }
 
 func printInteractiveRoleHeader(w io.Writer, role string) {
@@ -3444,7 +3518,7 @@ func runManagedLoop(e env, out io.Writer, maxRuns int, stopAtCoordinator bool, e
 		}
 		liveOut := out
 		if display == loopDisplayInteractive {
-			liveOut = interactiveRunHeaderWriter{out: out}
+			liveOut = &interactiveRunHeaderWriter{out: out}
 		}
 		result, err := runConfiguredRoleWithOptions(e, state, roleRunOptions{
 			ShowRunHeader: events == nil,
@@ -4146,9 +4220,19 @@ func cleanCodexExecOutput(output string) string {
 
 func cleanAgentsCLIRecordOutput(output string) string {
 	var kept []string
+	inProgressBlock := false
 	for _, line := range strings.Split(output, "\n") {
 		trimmed := strings.TrimSpace(line)
+		if inProgressBlock {
+			if trimmed == "```" {
+				inProgressBlock = false
+			}
+			continue
+		}
 		switch {
+		case trimmed == "```agents-progress":
+			inProgressBlock = true
+			continue
 		case trimmed == "Aborting operation...":
 			continue
 		case trimmed == "Reading additional input from stdin...":
@@ -4211,6 +4295,10 @@ func buildRolePrompt(e env, state loopState) (string, error) {
 		appendPromptDir(&b, e.cwd, state.Task.Path, "findings", "Findings")
 		fmt.Fprintln(&b, "Working agreement:")
 		fmt.Fprintln(&b, "- Edit the working tree to implement the task or fix open findings.")
+		fmt.Fprintln(&b, "- Emit brief JSON progress updates for the interactive UI when phases change:")
+		fmt.Fprintln(&b, "  ```agents-progress")
+		fmt.Fprintln(&b, `  {"status":"Editing files","detail":"Updating the CLI parser and focused tests"}`)
+		fmt.Fprintln(&b, "  ```")
 		fmt.Fprintln(&b, "- Run relevant checks.")
 		fmt.Fprintln(&b, "- Mark findings you fixed with `agents finding fix <finding> --evidence \"what proves the fix\"`.")
 		fmt.Fprintln(&b, "- Keep task state current: `agents task status \"where things stand\"` and `agents task next \"what should happen next\"`.")
@@ -4229,6 +4317,10 @@ func buildRolePrompt(e env, state loopState) (string, error) {
 		appendPromptDir(&b, e.cwd, state.Task.Path, "verification", "Verification")
 		fmt.Fprintln(&b, "Working agreement:")
 		fmt.Fprintln(&b, "- Review the working tree, tests, and task chunks; verify claims against the code, not the handoff text.")
+		fmt.Fprintln(&b, "- Emit brief JSON progress updates for the interactive UI when phases change:")
+		fmt.Fprintln(&b, "  ```agents-progress")
+		fmt.Fprintln(&b, `  {"status":"Running checks","detail":"Verifying tests and reviewing the diff"}`)
+		fmt.Fprintln(&b, "  ```")
 		fmt.Fprintln(&b, "- Record each real issue as a finding:")
 		fmt.Fprintln(&b, `  agents finding add "summary" --severity low|medium|high`)
 		fmt.Fprintln(&b, "- For findings marked fixed, verify them independently with evidence:")
@@ -4249,6 +4341,10 @@ func buildRolePrompt(e env, state loopState) (string, error) {
 		appendPromptDir(&b, e.cwd, state.Task.Path, "decisions", "Decisions")
 		fmt.Fprintln(&b, "Working agreement:")
 		fmt.Fprintln(&b, "- Treat user handoffs to coordinator as conversational planning context.")
+		fmt.Fprintln(&b, "- Emit brief JSON progress updates for the interactive UI when phases change:")
+		fmt.Fprintln(&b, "  ```agents-progress")
+		fmt.Fprintln(&b, `  {"status":"Shaping scope","detail":"Checking existing project context and missing constraints"}`)
+		fmt.Fprintln(&b, "  ```")
 		fmt.Fprintln(&b, "- You may inspect the repository in read-only mode to answer planning or project-understanding questions.")
 		fmt.Fprintln(&b, "- Use whatever read-only tools are available; do not block only because a preferred search tool is unavailable.")
 		fmt.Fprintln(&b, "- If evidence is limited, answer with what you can infer and name the missing context briefly.")
