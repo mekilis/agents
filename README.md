@@ -46,6 +46,16 @@ agents version
 The completion script comes from the `agents` binary. If you prefer to install
 it yourself, write `agents completion zsh` to a directory on your zsh `fpath`.
 
+## Tutorial
+
+Start with the short tutorial:
+
+- [Build a tiny todo CLI with Agents](tutorials/tiny-todo-cli.md)
+
+It shows the intended flow in a fresh project: initialize `.agents/`, trust the
+workspace, chat with the coordinator, let implementer and reviewer roles work,
+then accept or iterate at the human boundary.
+
 ## Use
 
 Initialize task state in a project:
@@ -77,9 +87,9 @@ agents
 Build up a feature or bug fix conversationally:
 
 ```text
-› I want to improve bookmark search, but I am not sure about the exact scope yet.
-› It should probably handle uppercase titles and maybe tags too.
-› local-only browser storage is fine for the MVP
+› I want to build a tiny todo CLI, but I am not sure about the exact scope yet.
+› It should probably support add, list, done, and remove.
+› Dependency-free is fine for the first version.
 ```
 
 Plain text in the interactive terminal is coordinator chat. Slash commands are

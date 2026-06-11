@@ -906,6 +906,22 @@ func handleInteractiveCommand(rawCommand string, out, errOut io.Writer, e env) (
 			args, parseErr := parseCommandLine(normalizedCommand)
 			if parseErr != nil {
 				fmt.Fprintf(errOut, "agents: parse command: %v\n", parseErr)
+			} else if len(args) > 0 && args[0] == "run" && e.isTTY {
+				flags, flagErr := parseRunArgs(args[1:])
+				if flagErr != nil {
+					fmt.Fprintf(errOut, "agents: run: %v\n", flagErr)
+				} else if flags.Once || flags.JSON || flags.JSONEvents {
+					code := runOneShot(args, strings.NewReader(""), out, errOut, e)
+					if code != 0 {
+						fmt.Fprintf(out, "command exited: %d\n", code)
+					}
+				} else if runErr := runInteractiveQueuedRoles(e, out, flags.MaxRuns); runErr != nil {
+					if errors.Is(runErr, errRunInterrupted) {
+						printInterruptHint(out, e)
+						return 130, true
+					}
+					fmt.Fprintf(errOut, "agents: loop: %v\n", runErr)
+				}
 			} else if len(args) > 0 {
 				// The composer owns stdin here; a non-file reader makes
 				// TTY-gated commands (go's view) fall back to plain output.
@@ -928,7 +944,7 @@ func handleInteractiveCommand(rawCommand string, out, errOut io.Writer, e env) (
 				}
 				fmt.Fprintf(errOut, "agents: coordinator response: %v\n", runErr)
 			}
-			if runErr := runInteractiveQueuedRoles(e, out); runErr != nil {
+			if runErr := runInteractiveQueuedRoles(e, out, defaultMaxLoopRuns); runErr != nil {
 				if errors.Is(runErr, errRunInterrupted) {
 					printInterruptHint(out, e)
 					return 130, true
@@ -1395,8 +1411,53 @@ func printInteractiveRoleTransition(out io.Writer, result roleRunResult) {
 	fmt.Fprintf(out, "\nnext: %s\n", result.After.NextRole)
 }
 
-func runInteractiveQueuedRoles(e env, out io.Writer) error {
-	stop, err := runManagedLoop(e, out, defaultMaxLoopRuns, true, nil, nil)
+type interactiveRunHeaderWriter struct {
+	out io.Writer
+}
+
+func (w interactiveRunHeaderWriter) Write(p []byte) (int, error) {
+	for _, line := range strings.SplitAfter(string(p), "\n") {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(trimmed, "run id:"):
+			fmt.Fprintf(w.out, "run: %s\n", strings.TrimSpace(strings.TrimPrefix(trimmed, "run id:")))
+		case strings.HasPrefix(trimmed, "run log:"):
+			fmt.Fprintf(w.out, "log: %s\n", strings.TrimSpace(strings.TrimPrefix(trimmed, "run log:")))
+		}
+	}
+	return len(p), nil
+}
+
+func printInteractiveRoleHeader(w io.Writer, role string) {
+	title := titleRole(role)
+	fmt.Fprintf(w, "\n%s\n%s\n", title, strings.Repeat("-", len(title)))
+}
+
+func titleRole(role string) string {
+	if role == "" {
+		return "Role"
+	}
+	return strings.ToUpper(role[:1]) + role[1:]
+}
+
+func printInteractiveRoleRunResult(w io.Writer, result roleRunResult) {
+	reply := cleanInteractiveAgentOutput(result.Agent, result.AgentOutput)
+	if strings.TrimSpace(reply) != "" {
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, strings.TrimRight(reply, "\n"))
+	}
+	if result.After.NextRole != "" && result.After.NextRole != result.Before.NextRole {
+		if result.After.NextRole == "human" {
+			fmt.Fprintln(w)
+			fmt.Fprintln(w, "Ready for you.")
+			return
+		}
+		fmt.Fprintf(w, "\nNext: %s\n", titleRole(result.After.NextRole))
+	}
+}
+
+func runInteractiveQueuedRoles(e env, out io.Writer, maxRuns int) error {
+	stop, err := runManagedLoop(e, out, maxRuns, true, nil, nil, loopDisplayInteractive)
 	if err != nil {
 		return err
 	}
@@ -3325,7 +3386,14 @@ func statePayload(state loopState) *loopJSON {
 // coordinator turns belong to chat). A non-nil control lets the caller stop
 // the loop between role runs (quit/pause from the unified view); the current
 // run always completes so records stay consistent.
-func runManagedLoop(e env, out io.Writer, maxRuns int, stopAtCoordinator bool, events loopEventSink, control *loopControl) (loopStop, error) {
+type loopDisplayMode int
+
+const (
+	loopDisplayPlain loopDisplayMode = iota
+	loopDisplayInteractive
+)
+
+func runManagedLoop(e env, out io.Writer, maxRuns int, stopAtCoordinator bool, events loopEventSink, control *loopControl, display loopDisplayMode) (loopStop, error) {
 	emit := func(ev loopEvent) {
 		if events != nil {
 			events(ev)
@@ -3369,17 +3437,29 @@ func runManagedLoop(e env, out io.Writer, maxRuns int, stopAtCoordinator bool, e
 		if strings.TrimSpace(agent) == "" {
 			return stopped(loopStop{Reason: "unconfigured", State: state, Runs: runs}), nil
 		}
-		fmt.Fprintf(out, "\nrunning %s...\n", state.NextRole)
+		if display == loopDisplayInteractive {
+			printInteractiveRoleHeader(out, state.NextRole)
+		} else {
+			fmt.Fprintf(out, "\nrunning %s...\n", state.NextRole)
+		}
+		liveOut := out
+		if display == loopDisplayInteractive {
+			liveOut = interactiveRunHeaderWriter{out: out}
+		}
 		result, err := runConfiguredRoleWithOptions(e, state, roleRunOptions{
 			ShowRunHeader: events == nil,
-			LiveOutput:    out,
+			LiveOutput:    liveOut,
 			Events:        events,
 		})
 		if err != nil {
 			return loopStop{}, err
 		}
 		runs++
-		printRoleRunResult(out, result)
+		if display == loopDisplayInteractive {
+			printInteractiveRoleRunResult(out, result)
+		} else {
+			printRoleRunResult(out, result)
+		}
 		if loopSignature(result.After) == loopSignature(state) || handoffChurn(state, result.After) {
 			return stopped(loopStop{Reason: "no-progress", State: result.After, Runs: runs}), nil
 		}
@@ -3434,7 +3514,7 @@ func runLoopCommand(args []string, out, errOut io.Writer, e env) int {
 // the stop into plain output and an exit code. Shared by `agents run` and
 // `agents go`; cmd names the invoking command in error output.
 func runLoopToStop(cmd string, loopOut, errOut io.Writer, e env, maxRuns int, events loopEventSink) int {
-	stop, err := runManagedLoop(e, loopOut, maxRuns, false, events, nil)
+	stop, err := runManagedLoop(e, loopOut, maxRuns, false, events, nil, loopDisplayPlain)
 	if err != nil {
 		if errors.Is(err, errRunInterrupted) {
 			printInterruptHint(loopOut, e)
@@ -4069,6 +4149,18 @@ func cleanAgentsCLIRecordOutput(output string) string {
 	for _, line := range strings.Split(output, "\n") {
 		trimmed := strings.TrimSpace(line)
 		switch {
+		case trimmed == "Aborting operation...":
+			continue
+		case trimmed == "Reading additional input from stdin...":
+			continue
+		case strings.Contains(trimmed, " WARN codex_"):
+			continue
+		case strings.Contains(trimmed, "ignoring interface.defaultPrompt[0]"):
+			continue
+		case strings.Contains(trimmed, "ignoring interface.icon_"):
+			continue
+		case strings.Contains(trimmed, "failed to initialize MCP client during shutdown"):
+			continue
 		case strings.HasPrefix(trimmed, "handoff to:"):
 			continue
 		case strings.HasPrefix(trimmed, "path:"):

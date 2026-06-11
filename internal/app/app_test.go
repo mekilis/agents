@@ -668,12 +668,12 @@ func TestCompletionInstallZshWritesCompletionAndZshrc(t *testing.T) {
 func TestStartOpensTaskAndHandoffToImplementer(t *testing.T) {
 	var out, errOut bytes.Buffer
 	code := withTempProcessEnv(t, func(home, cwd string) int {
-		code := Run([]string{"start", "Fix bookmark search", "--ref", "BUG-44", "Fix uppercase title matching and add tests"}, bytes.NewBuffer(nil), &out, &errOut)
+		code := Run([]string{"start", "Fix todo search", "--ref", "BUG-44", "Fix uppercase todo matching and add tests"}, bytes.NewBuffer(nil), &out, &errOut)
 		if code != 0 {
 			return code
 		}
 		active := readActiveTask(cwd)
-		if active.Title != "Fix bookmark search" {
+		if active.Title != "Fix todo search" {
 			t.Fatalf("unexpected active task: %+v", active)
 		}
 		handoffDir := filepath.Join(cwd, ".agents", active.Path, "handoffs")
@@ -689,7 +689,7 @@ func TestStartOpensTaskAndHandoffToImplementer(t *testing.T) {
 			t.Fatal(err)
 		}
 		got := string(data)
-		for _, want := range []string{"To: implementer", "Fix uppercase title matching and add tests"} {
+		for _, want := range []string{"To: implementer", "Fix uppercase todo matching and add tests"} {
 			if !strings.Contains(got, want) {
 				t.Fatalf("handoff missing %q, got:\n%s", want, got)
 			}
@@ -699,7 +699,7 @@ func TestStartOpensTaskAndHandoffToImplementer(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("Run start code=%d stderr=%s", code, errOut.String())
 	}
-	for _, want := range []string{"started task: Fix bookmark search", "handoff to: implementer"} {
+	for _, want := range []string{"started task: Fix todo search", "handoff to: implementer"} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("start output missing %q, got:\n%s", want, out.String())
 		}
@@ -709,7 +709,7 @@ func TestStartOpensTaskAndHandoffToImplementer(t *testing.T) {
 func TestStartRequiresInstruction(t *testing.T) {
 	var out, errOut bytes.Buffer
 	code := withTempProcessEnv(t, func(home, cwd string) int {
-		return Run([]string{"start", "Fix bookmark search"}, bytes.NewBuffer(nil), &out, &errOut)
+		return Run([]string{"start", "Fix todo search"}, bytes.NewBuffer(nil), &out, &errOut)
 	})
 	if code == 0 {
 		t.Fatal("expected start without instruction to fail")
@@ -1248,11 +1248,49 @@ func TestCleanCodexExecOutputReturnsFinalAnswer(t *testing.T) {
 }
 
 func TestCleanInteractiveAgentOutputHidesAgentsRecordOutput(t *testing.T) {
-	raw := "What should this project do?\nhandoff to: implementer\npath: tasks/example/handoffs/file.md\n"
+	raw := strings.Join([]string{
+		"Reading additional input from stdin...",
+		"What should this project do?",
+		"Aborting operation...",
+		`2026-06-11T12:03:39.367911Z  WARN codex_core_plugins::manifest: ignoring interface.defaultPrompt[0]: prompt must be at most 128 characters path=/home/user/.codex/plugin.json`,
+		"handoff to: implementer",
+		"path: tasks/example/handoffs/file.md",
+	}, "\n")
 	got := cleanInteractiveAgentOutput("custom", raw)
 	want := "What should this project do?"
 	if got != want {
 		t.Fatalf("cleanInteractiveAgentOutput got %q want %q", got, want)
+	}
+}
+
+func TestInteractiveRunHeaderWriterOnlyShowsRunPointers(t *testing.T) {
+	var out bytes.Buffer
+	writer := interactiveRunHeaderWriter{out: &out}
+	raw := strings.Join([]string{
+		"run id: 2026-06-11T120337Z-reviewer",
+		"run log: .agents/runs/logs/2026-06-11T120337Z-reviewer.log",
+		"Reading additional input from stdin...",
+		"OpenAI Codex v0.137.0",
+		`2026-06-11T12:03:39.367911Z  WARN codex_core_plugins::manifest: ignoring interface.defaultPrompt[0]: prompt must be at most 128 characters`,
+		"reviewer answer",
+		"",
+	}, "\n")
+	if _, err := writer.Write([]byte(raw)); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	for _, want := range []string{
+		"run: 2026-06-11T120337Z-reviewer",
+		"log: .agents/runs/logs/2026-06-11T120337Z-reviewer.log",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("header writer missing %q, got:\n%s", want, got)
+		}
+	}
+	for _, unwanted := range []string{"OpenAI Codex", "128 characters", "reviewer answer"} {
+		if strings.Contains(got, unwanted) {
+			t.Fatalf("header writer should hide %q, got:\n%s", unwanted, got)
+		}
 	}
 }
 
@@ -1268,7 +1306,7 @@ func TestProgressWriterSuppressesProviderOutput(t *testing.T) {
 }
 
 func TestCoordinatorDirectiveParsesAndRemovesHandoffBlock(t *testing.T) {
-	raw := "Ready to build.\n\n```agents-handoff\nrole: implementer\ntext: Build the bookmark MVP.\nInclude README.\n```\n"
+	raw := "Ready to build.\n\n```agents-handoff\nrole: implementer\ntext: Build the todo CLI.\nInclude README.\n```\n"
 	directive, ok := parseCoordinatorDirective(raw)
 	if !ok {
 		t.Fatal("expected directive to parse")
@@ -1276,7 +1314,7 @@ func TestCoordinatorDirectiveParsesAndRemovesHandoffBlock(t *testing.T) {
 	if directive.Role != "implementer" {
 		t.Fatalf("role got %q", directive.Role)
 	}
-	if directive.Text != "Build the bookmark MVP.\nInclude README." {
+	if directive.Text != "Build the todo CLI.\nInclude README." {
 		t.Fatalf("text got %q", directive.Text)
 	}
 	if got := removeCoordinatorDirective(raw); got != "Ready to build." {
@@ -1366,7 +1404,7 @@ func TestInteractiveRequiresSlashForCommandsAndChatsWithCoordinator(t *testing.T
 		}
 		input := strings.Join([]string{
 			`status`,
-			`I want to add bookmark tags, but I need help shaping the plan.`,
+			`I want to add todo labels, but I need help shaping the plan.`,
 			`/status`,
 			`/quit`,
 			"",
@@ -1474,7 +1512,7 @@ func TestInteractiveTTYChatContinuesIntoImplementerAfterCoordinatorHandoff(t *te
 			"",
 			"```agents-handoff",
 			"role: implementer",
-			"text: Build the bookmark MVP.",
+			"text: Build the todo CLI.",
 			"```",
 			"EOF",
 			"",
@@ -1483,7 +1521,7 @@ func TestInteractiveTTYChatContinuesIntoImplementerAfterCoordinatorHandoff(t *te
 			t.Fatal(err)
 		}
 		implementer := filepath.Join(cwd, "implementer.sh")
-		implementerBody := "#!/bin/sh\nset -eu\nprintf 'implemented bookmark MVP\\n'\n"
+		implementerBody := "#!/bin/sh\nset -eu\nprintf 'implemented todo CLI\\n'\n"
 		if err := os.WriteFile(implementer, []byte(implementerBody), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -1497,7 +1535,7 @@ func TestInteractiveTTYChatContinuesIntoImplementerAfterCoordinatorHandoff(t *te
 		if err := runCoordinatorChatResponse(e, &out); err != nil {
 			t.Fatal(err)
 		}
-		if err := runInteractiveQueuedRoles(e, &out); err != nil {
+		if err := runInteractiveQueuedRoles(e, &out, defaultMaxLoopRuns); err != nil {
 			t.Fatal(err)
 		}
 		return 0
@@ -1509,12 +1547,16 @@ func TestInteractiveTTYChatContinuesIntoImplementerAfterCoordinatorHandoff(t *te
 	for _, want := range []string{
 		"Ready to build.",
 		"next: implementer",
-		"running implementer...",
-		"implemented bookmark MVP",
-		"ran role: implementer",
+		"Implementer",
+		"implemented todo CLI",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("interactive loop output missing %q, got:\n%s", want, got)
+		}
+	}
+	for _, unwanted := range []string{"running implementer...", "ran role: implementer", "agent output:", "prompt:"} {
+		if strings.Contains(got, unwanted) {
+			t.Fatalf("interactive loop output should hide %q, got:\n%s", unwanted, got)
 		}
 	}
 }
@@ -1556,7 +1598,7 @@ func TestInteractiveRunsSlashStartCommand(t *testing.T) {
 			t.Fatal(err)
 		}
 		input := strings.Join([]string{
-			`/start "Fix bookmark search" --ref BUG-44 "Fix uppercase title matching and add tests"`,
+			`/start "Fix todo search" --ref BUG-44 "Fix uppercase todo matching and add tests"`,
 			`/status`,
 			`/quit`,
 			"",
@@ -1568,9 +1610,9 @@ func TestInteractiveRunsSlashStartCommand(t *testing.T) {
 	}
 	got := out.String()
 	for _, want := range []string{
-		"started task: Fix bookmark search",
+		"started task: Fix todo search",
 		"handoff to: implementer",
-		"active task: Fix bookmark search",
+		"active task: Fix todo search",
 		"records: decisions=0 handoffs=1 verification=0",
 		"Goodbye.",
 	} {

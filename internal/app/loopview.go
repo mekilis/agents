@@ -451,7 +451,7 @@ func watchLoopInView(out *os.File, e env, taskTitle string, maxRuns int, keys <-
 	go func() {
 		stop, loopErr := runManagedLoop(e, io.Discard, maxRuns, false, func(ev loopEvent) {
 			events <- ev
-		}, control)
+		}, control, loopDisplayPlain)
 		loopDone <- loopResult{stop: stop, err: loopErr}
 	}()
 
