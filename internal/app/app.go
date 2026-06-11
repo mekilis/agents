@@ -944,13 +944,6 @@ func handleInteractiveCommand(rawCommand string, out, errOut io.Writer, e env) (
 				}
 				fmt.Fprintf(errOut, "agents: coordinator response: %v\n", runErr)
 			}
-			if runErr := runInteractiveQueuedRoles(e, out, defaultMaxLoopRuns); runErr != nil {
-				if errors.Is(runErr, errRunInterrupted) {
-					printInterruptHint(out, e)
-					return 130, true
-				}
-				fmt.Fprintf(errOut, "agents: loop: %v\n", runErr)
-			}
 		}
 	}
 	return 0, false
@@ -1200,8 +1193,8 @@ func recordCoordinatorChat(e env, text string, out io.Writer) error {
 		}
 		task = opened
 		if !e.isTTY {
-			fmt.Fprintf(out, "started coordinator intake: %s\n", task.Title)
-			fmt.Fprintf(out, "task path: %s\n", task.Path)
+			fmt.Fprintf(out, "Started coordinator intake: %s\n", task.Title)
+			fmt.Fprintf(out, "Task path: %s\n", task.Path)
 		}
 	}
 	handoff, err := addHandoff(e, []string{"--to", "coordinator", text}, time.Now().UTC())
@@ -1212,9 +1205,10 @@ func recordCoordinatorChat(e env, text string, out io.Writer) error {
 		// Chat mode should feel conversational; the handoff is durable state,
 		// but not user-facing ceremony.
 	} else {
-		fmt.Fprintf(out, "sent to coordinator\n")
-		fmt.Fprintf(out, "handoff path: %s\n", handoff.Path)
-		fmt.Fprintf(out, "next: /run to ask the coordinator, or keep typing to add context\n")
+		fmt.Fprintln(out, "Sent to coordinator.")
+		fmt.Fprintf(out, "Handoff path: %s\n", handoff.Path)
+		fmt.Fprintln(out)
+		fmt.Fprintf(out, "Next: /run to ask the coordinator, or keep typing to add context\n")
 	}
 	return nil
 }
@@ -1233,11 +1227,11 @@ func runCoordinatorChatResponse(e env, out io.Writer) error {
 		return err
 	}
 	if strings.TrimSpace(agent) == "" {
-		fmt.Fprintln(out, "coordinator: not configured")
-		fmt.Fprintln(out, "next: configure roles.coordinator in .agents/config.yml and try again")
+		fmt.Fprintln(out, "Coordinator is not configured.")
+		fmt.Fprintln(out, "Next: configure roles.coordinator in .agents/config.yml and try again")
 		return nil
 	}
-	progress := newProgressWriter(out, "coordinator is thinking")
+	progress := newProgressWriter(out, "Coordinator is thinking")
 	progress.Start()
 	result, err := runConfiguredRoleWithOptions(e, state, roleRunOptions{ShowRunHeader: true, LiveOutput: progress})
 	progress.Stop()
@@ -1247,27 +1241,33 @@ func runCoordinatorChatResponse(e env, out io.Writer) error {
 	reply := cleanInteractiveAgentOutput(result.Agent, result.AgentOutput)
 	directive, directiveOK := parseCoordinatorDirective(reply)
 	if directiveOK {
-		if err := applyCoordinatorDirective(e, "coordinator", directive); err != nil {
-			return err
+		allowDirective := coordinatorDirectiveActionable("coordinator", directive)
+		if allowDirective {
+			if err := applyCoordinatorDirective(e, "coordinator", directive); err != nil {
+				return err
+			}
 		}
 		reply = removeCoordinatorDirective(reply)
-		after, err := analyzeLoopState(e)
-		if err != nil {
-			return err
+		if allowDirective {
+			after, err := analyzeLoopState(e)
+			if err != nil {
+				return err
+			}
+			result.After = after
 		}
-		result.After = after
 	}
 	if strings.TrimSpace(reply) != "" {
 		fmt.Fprintln(out)
 		fmt.Fprintln(out, strings.TrimRight(reply, "\n"))
 	}
-	printInteractiveRoleTransition(out, result)
+	printInteractiveReadyCue(out, result)
 	return nil
 }
 
 type coordinatorDirective struct {
-	Role string
-	Text string
+	Role  string
+	Text  string
+	Ready bool
 }
 
 func parseCoordinatorDirective(text string) (coordinatorDirective, bool) {
@@ -1293,6 +1293,10 @@ func parseCoordinatorDirective(text string) (coordinatorDirective, bool) {
 		switch {
 		case strings.HasPrefix(trimmed, "role:"):
 			directive.Role = strings.ToLower(strings.TrimSpace(strings.TrimPrefix(trimmed, "role:")))
+			inText = false
+		case strings.HasPrefix(trimmed, "ready:"):
+			value := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(trimmed, "ready:")))
+			directive.Ready = value == "true" || value == "yes"
 			inText = false
 		case strings.HasPrefix(trimmed, "text:"):
 			textLines = append(textLines, strings.TrimSpace(strings.TrimPrefix(trimmed, "text:")))
@@ -1332,6 +1336,9 @@ func applyCoordinatorDirective(e env, actor string, directive coordinatorDirecti
 	default:
 		return fmt.Errorf("coordinator requested unknown handoff role %q", directive.Role)
 	}
+	if !coordinatorDirectiveActionable(actor, directive) {
+		return nil
+	}
 	args := []string{"--to", directive.Role, directive.Text}
 	if strings.TrimSpace(actor) != "" {
 		args = append(args, "--by", actor)
@@ -1340,14 +1347,28 @@ func applyCoordinatorDirective(e env, actor string, directive coordinatorDirecti
 	return err
 }
 
+func coordinatorDirectiveActionable(actor string, directive coordinatorDirective) bool {
+	if actor != "coordinator" || directive.Role != "implementer" {
+		return true
+	}
+	if !directive.Ready {
+		return false
+	}
+	text := strings.TrimSpace(strings.ToLower(directive.Text))
+	return text != "" && text != "clear implementation request with context and verification"
+}
+
 type progressWriter struct {
-	out     io.Writer
-	label   string
-	stop    chan struct{}
-	done    chan struct{}
-	once    sync.Once
-	mu      sync.Mutex
-	started bool
+	out       io.Writer
+	label     string
+	stop      chan struct{}
+	done      chan struct{}
+	once      sync.Once
+	mu        sync.Mutex
+	started   bool
+	pending   string
+	inBlock   bool
+	blockLine []string
 }
 
 func newProgressWriter(out io.Writer, label string) *progressWriter {
@@ -1395,20 +1416,49 @@ func (w *progressWriter) Stop() {
 }
 
 func (w *progressWriter) Write(p []byte) (int, error) {
-	text := string(p)
-	if strings.HasPrefix(text, "run id:") || strings.HasPrefix(text, "run log:") {
-		w.mu.Lock()
-		_, _ = fmt.Fprint(w.out, text)
-		w.mu.Unlock()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.pending += string(p)
+	for {
+		line, rest, ok := strings.Cut(w.pending, "\n")
+		if !ok {
+			break
+		}
+		w.pending = rest
+		w.handleLine(line)
 	}
 	return len(p), nil
 }
 
-func printInteractiveRoleTransition(out io.Writer, result roleRunResult) {
+func (w *progressWriter) handleLine(line string) {
+	trimmed := strings.TrimSpace(line)
+	if w.inBlock {
+		if trimmed == "```" {
+			if progress, ok := parseProgressDirectiveLines(w.blockLine); ok {
+				fmt.Fprint(w.out, "\r\033[2K")
+				printInteractiveProgress(w.out, progress)
+			}
+			w.inBlock = false
+			w.blockLine = nil
+			return
+		}
+		w.blockLine = append(w.blockLine, line)
+		return
+	}
+	switch {
+	case strings.HasPrefix(trimmed, "run id:") || strings.HasPrefix(trimmed, "run log:"):
+		_, _ = fmt.Fprintln(w.out, trimmed)
+	case trimmed == "```agents-progress":
+		w.inBlock = true
+		w.blockLine = nil
+	}
+}
+
+func printInteractiveReadyCue(out io.Writer, result roleRunResult) {
 	if result.After.NextRole == "" || result.After.NextRole == result.Before.NextRole {
 		return
 	}
-	fmt.Fprintf(out, "\nnext: %s\n", result.After.NextRole)
+	fmt.Fprintf(out, "\nReady for %s. Type /run to start.\n", titleRole(result.After.NextRole))
 }
 
 type interactiveRunHeaderWriter struct {
@@ -1540,12 +1590,13 @@ func runInteractiveQueuedRoles(e env, out io.Writer, maxRuns int) error {
 		fmt.Fprintln(out)
 		printLoopState(out, stop.State)
 	case "unconfigured":
-		fmt.Fprintf(out, "\nnext: %s\n", stop.State.NextRole)
-		fmt.Fprintf(out, "agent: not configured for %s\n", stop.State.NextRole)
+		fmt.Fprintf(out, "\nNext: %s\n", titleRole(stop.State.NextRole))
+		fmt.Fprintf(out, "Agent is not configured for %s.\n", stop.State.NextRole)
 	case "no-progress":
-		fmt.Fprintf(out, "\nstopped: %s run recorded no progress; inspect the run log or route manually\n", stop.State.NextRole)
+		fmt.Fprintf(out, "\nPaused: %s did not record new task progress.\n", titleRole(stop.State.NextRole))
+		fmt.Fprintln(out, "Review the run log, keep planning, or use /run again when ready.")
 	case "max-runs":
-		fmt.Fprintf(out, "\nloop paused after %d role runs; use /run to continue\n", stop.Runs)
+		fmt.Fprintf(out, "\nLoop paused after %d role runs; use /run to continue.\n", stop.Runs)
 	}
 	return nil
 }
@@ -4345,17 +4396,17 @@ func buildRolePrompt(e env, state loopState) (string, error) {
 		fmt.Fprintln(&b, "  ```agents-progress")
 		fmt.Fprintln(&b, `  {"status":"Shaping scope","detail":"Checking existing project context and missing constraints"}`)
 		fmt.Fprintln(&b, "  ```")
+		fmt.Fprintln(&b, "- If the user is asking a question, comparing options, or says they are not ready to change code, answer and stop without an `agents-handoff` block.")
+		fmt.Fprintln(&b, "- Emit an `agents-handoff` to implementer only when the user clearly asks to implement, proceed, run, or hand work to an agent.")
+		fmt.Fprintln(&b, "- Handoffs to implementer must include `ready: true`; without it, Agents treats the response as planning-only.")
 		fmt.Fprintln(&b, "- You may inspect the repository in read-only mode to answer planning or project-understanding questions.")
 		fmt.Fprintln(&b, "- Use whatever read-only tools are available; do not block only because a preferred search tool is unavailable.")
 		fmt.Fprintln(&b, "- If evidence is limited, answer with what you can infer and name the missing context briefly.")
 		fmt.Fprintln(&b, "- Ask concise follow-up questions when the task, desired behavior, ref, constraints, or verification are unclear.")
 		fmt.Fprintln(&b, "- Record decisions when the plan becomes concrete.")
 		fmt.Fprintln(&b, "- Do not run `agents` commands yourself; the parent Agents process records coordination state.")
-		fmt.Fprintln(&b, "- When ready for another role, end your response with exactly one directive block:")
-		fmt.Fprintln(&b, "```agents-handoff")
-		fmt.Fprintln(&b, "role: implementer")
-		fmt.Fprintln(&b, "text: clear implementation request with context and verification")
-		fmt.Fprintln(&b, "```")
+		fmt.Fprintln(&b, "- When implementation is explicitly ready, end your response with one `agents-handoff` fenced block containing `role: implementer`, `ready: true`, and a specific `text:` request for the implementer.")
+		fmt.Fprintln(&b, "- Never copy placeholder handoff text; if you are still discussing, do not emit a handoff block.")
 		fmt.Fprintln(&b, "- Do not edit implementation code or coordination files directly.")
 	}
 	return b.String(), nil

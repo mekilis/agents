@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -1323,13 +1324,16 @@ func TestProgressWriterSuppressesProviderOutput(t *testing.T) {
 }
 
 func TestCoordinatorDirectiveParsesAndRemovesHandoffBlock(t *testing.T) {
-	raw := "Ready to build.\n\n```agents-handoff\nrole: implementer\ntext: Build the todo CLI.\nInclude README.\n```\n"
+	raw := "Ready to build.\n\n```agents-handoff\nrole: implementer\nready: true\ntext: Build the todo CLI.\nInclude README.\n```\n"
 	directive, ok := parseCoordinatorDirective(raw)
 	if !ok {
 		t.Fatal("expected directive to parse")
 	}
 	if directive.Role != "implementer" {
 		t.Fatalf("role got %q", directive.Role)
+	}
+	if !directive.Ready {
+		t.Fatal("expected ready directive")
 	}
 	if directive.Text != "Build the todo CLI.\nInclude README." {
 		t.Fatalf("text got %q", directive.Text)
@@ -1346,7 +1350,7 @@ func TestApplyCoordinatorDirectiveWritesHandoffFromParent(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		directive := coordinatorDirective{Role: "implementer", Text: "Build the MVP."}
+		directive := coordinatorDirective{Role: "implementer", Text: "Build the MVP.", Ready: true}
 		if err := applyCoordinatorDirective(e, "coordinator", directive); err != nil {
 			t.Fatal(err)
 		}
@@ -1363,6 +1367,62 @@ func TestApplyCoordinatorDirectiveWritesHandoffFromParent(t *testing.T) {
 		}
 		if got := string(data); !strings.Contains(got, "To: implementer") || !strings.Contains(got, "Build the MVP.") {
 			t.Fatalf("unexpected handoff:\n%s", got)
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
+func TestCoordinatorImplementerHandoffRequiresReady(t *testing.T) {
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		task, err := openTask(e, []string{"Planning Only"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		directive := coordinatorDirective{Role: "implementer", Text: "Maybe implement this later."}
+		if err := applyCoordinatorDirective(e, "coordinator", directive); err != nil {
+			t.Fatal(err)
+		}
+		entries, err := os.ReadDir(filepath.Join(cwd, ".agents", task.Path, "handoffs"))
+		if errors.Is(err, os.ErrNotExist) {
+			return 0
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) != 0 {
+			t.Fatalf("planning-only coordinator handoff should not route to implementer, got %d entries", len(entries))
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
+func TestCoordinatorImplementerHandoffRejectsPlaceholderText(t *testing.T) {
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		task, err := openTask(e, []string{"Planning Only"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		directive := coordinatorDirective{Role: "implementer", Text: "clear implementation request with context and verification", Ready: true}
+		if err := applyCoordinatorDirective(e, "coordinator", directive); err != nil {
+			t.Fatal(err)
+		}
+		entries, err := os.ReadDir(filepath.Join(cwd, ".agents", task.Path, "handoffs"))
+		if errors.Is(err, os.ErrNotExist) {
+			return 0
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) != 0 {
+			t.Fatalf("placeholder coordinator handoff should not route to implementer, got %d entries", len(entries))
 		}
 		return 0
 	})
@@ -1433,8 +1493,8 @@ func TestInteractiveRequiresSlashForCommandsAndChatsWithCoordinator(t *testing.T
 	}
 	got := out.String()
 	for _, want := range []string{
-		"started coordinator intake: status",
-		"sent to coordinator",
+		"Started coordinator intake: status",
+		"Sent to coordinator.",
 		"active task: status",
 		"records: decisions=0 handoffs=2 verification=0",
 		"Goodbye.",
@@ -1484,7 +1544,7 @@ func TestInteractiveTTYChatRunsCoordinatorResponse(t *testing.T) {
 	for _, want := range []string{
 		"run id:",
 		"run log: .agents/runs/logs/",
-		"coordinator is thinking",
+		"Coordinator is thinking",
 		"Hi. What constraints or reference should I use?",
 	} {
 		if !strings.Contains(got, want) {
@@ -1505,9 +1565,11 @@ func TestInteractiveTTYChatRunsCoordinatorResponse(t *testing.T) {
 	}
 }
 
-func TestInteractiveTTYChatContinuesIntoImplementerAfterCoordinatorHandoff(t *testing.T) {
+func TestInteractiveTTYChatRoutesButWaitsForRun(t *testing.T) {
 	var out bytes.Buffer
+	var runCwd string
 	code := withTempProcessEnv(t, func(home, cwd string) int {
+		runCwd = cwd
 		e := env{
 			cwd:       cwd,
 			home:      home,
@@ -1529,6 +1591,7 @@ func TestInteractiveTTYChatContinuesIntoImplementerAfterCoordinatorHandoff(t *te
 			"",
 			"```agents-handoff",
 			"role: implementer",
+			"ready: true",
 			"text: Build the todo CLI.",
 			"```",
 			"EOF",
@@ -1538,7 +1601,7 @@ func TestInteractiveTTYChatContinuesIntoImplementerAfterCoordinatorHandoff(t *te
 			t.Fatal(err)
 		}
 		implementer := filepath.Join(cwd, "implementer.sh")
-		implementerBody := "#!/bin/sh\nset -eu\nprintf 'implemented todo CLI\\n'\n"
+		implementerBody := "#!/bin/sh\nset -eu\ntouch implemented-marker\nprintf 'implemented todo CLI\\n'\n"
 		if err := os.WriteFile(implementer, []byte(implementerBody), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -1552,9 +1615,6 @@ func TestInteractiveTTYChatContinuesIntoImplementerAfterCoordinatorHandoff(t *te
 		if err := runCoordinatorChatResponse(e, &out); err != nil {
 			t.Fatal(err)
 		}
-		if err := runInteractiveQueuedRoles(e, &out, defaultMaxLoopRuns); err != nil {
-			t.Fatal(err)
-		}
 		return 0
 	})
 	if code != 0 {
@@ -1563,18 +1623,19 @@ func TestInteractiveTTYChatContinuesIntoImplementerAfterCoordinatorHandoff(t *te
 	got := out.String()
 	for _, want := range []string{
 		"Ready to build.",
-		"next: implementer",
-		"Implementer",
-		"implemented todo CLI",
+		"Ready for Implementer. Type /run to start.",
 	} {
 		if !strings.Contains(got, want) {
-			t.Fatalf("interactive loop output missing %q, got:\n%s", want, got)
+			t.Fatalf("interactive coordinator output missing %q, got:\n%s", want, got)
 		}
 	}
-	for _, unwanted := range []string{"running implementer...", "ran role: implementer", "agent output:", "prompt:"} {
+	for _, unwanted := range []string{"Implementer\n-----------", "implemented todo CLI", "running implementer...", "ran role: implementer", "agent output:", "prompt:"} {
 		if strings.Contains(got, unwanted) {
-			t.Fatalf("interactive loop output should hide %q, got:\n%s", unwanted, got)
+			t.Fatalf("interactive coordinator output should wait for /run and hide %q, got:\n%s", unwanted, got)
 		}
+	}
+	if _, err := os.Stat(filepath.Join(runCwd, "implemented-marker")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("implementer should not have run during coordinator chat, stat err=%v", err)
 	}
 }
 
