@@ -1,7 +1,6 @@
 # Agent Instructions
 
-This repository is intended to become public. Treat every committed file as
-future public history, even while the remote repository is private.
+Treat every committed file as public history.
 
 ## Product Language
 
