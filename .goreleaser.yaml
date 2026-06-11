@@ -2,16 +2,20 @@ version: 2
 
 project_name: agents
 
-before:
-  hooks:
-    - go mod tidy
-
 builds:
   - id: agents
     main: ./cmd/agents
     binary: agents
     env:
       - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s
+      - -w
+      - -X main.version={{ .Version }}
+      - -X main.commit={{ .ShortCommit }}
+      - -X main.date={{ .Date }}
     goos:
       - linux
       - darwin
@@ -19,35 +23,30 @@ builds:
     goarch:
       - amd64
       - arm64
-    mod_timestamp: "{{ .CommitTimestamp }}"
-    ldflags:
-      - -s -w
-      - -X main.version={{ .Version }}
-      - -X main.commit={{ .ShortCommit }}
-      - -X main.date={{ .CommitDate }}
+    ignore:
+      - goos: windows
+        goarch: arm64
 
 archives:
   - id: default
-    formats:
-      - tar.gz
-    name_template: >-
-      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    builds: [agents]
+    name_template: '{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}'
+    format: tar.gz
     format_overrides:
       - goos: windows
-        formats:
-          - zip
+        formats: [zip]
+    files:
+      - README.md
 
 checksum:
-  name_template: checksums.txt
+  name_template: 'checksums.txt'
 
 changelog:
+  disable: false
   sort: asc
   filters:
     exclude:
-      - "^docs:"
-      - "^test:"
-      - "^chore:"
-      - "^ci:"
+      - '^docs?:'
 
 release:
   draft: false
