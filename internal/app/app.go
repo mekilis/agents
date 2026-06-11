@@ -17,6 +17,7 @@ import (
 	"time"
 	"unicode"
 
+	"charm.land/glamour/v2"
 	"golang.org/x/term"
 )
 
@@ -52,21 +53,21 @@ type slashCommandSpec struct {
 }
 
 var interactiveSlashCommands = []slashCommandSpec{
-	{Name: "/start", Usage: `/start "title" [--ref REF] "what to do"`, Description: "fast path: open a task and hand off to implementer"},
-	{Name: "/status", Usage: "/status", Description: "show workspace, active task, and record counts"},
-	{Name: "/trust", Usage: "/trust", Description: "trust this workspace"},
-	{Name: "/init", Usage: "/init [--share|--local]", Description: "initialize Agents task state"},
-	{Name: "/task", Usage: `/task open|use|scope|status|next ...`, Description: "open, switch, or update the active task"},
-	{Name: "/decision", Usage: `/decision add "text"`, Description: "record a planning decision"},
-	{Name: "/handoff", Usage: `/handoff --to ROLE "text"`, Description: "route context to another role"},
-	{Name: "/finding", Usage: "/finding add|fix|verify ...", Description: "track review findings"},
-	{Name: "/verify", Usage: `/verify "text" [--cmd 'shell command']`, Description: "record verification evidence"},
-	{Name: "/dispatch", Usage: "/dispatch <role>", Description: "print a role packet"},
-	{Name: "/run", Usage: "/run", Description: "run queued roles until a stop condition"},
-	{Name: "/archive", Usage: "/archive", Description: "archive the active task"},
-	{Name: "/help", Usage: "/help", Description: "show this command menu"},
-	{Name: "/quit", Usage: "/quit", Description: "exit the interactive terminal"},
-	{Name: "/exit", Usage: "/exit", Description: "exit the interactive terminal"},
+	{Name: "/start", Usage: `/start "title" [--ref REF] "what to do"`, Description: "Fast path: open a task and hand off to implementer"},
+	{Name: "/status", Usage: "/status", Description: "Show workspace, active task, and record counts"},
+	{Name: "/trust", Usage: "/trust", Description: "Trust this workspace"},
+	{Name: "/init", Usage: "/init [--share|--local]", Description: "Initialize Agents task state"},
+	{Name: "/task", Usage: `/task open|use|scope|status|next ...`, Description: "Open, switch, or update the active task"},
+	{Name: "/decision", Usage: `/decision add "text"`, Description: "Record a planning decision"},
+	{Name: "/handoff", Usage: `/handoff --to ROLE "text"`, Description: "Route context to another role"},
+	{Name: "/finding", Usage: "/finding add|fix|verify ...", Description: "Track review findings"},
+	{Name: "/verify", Usage: `/verify "text" [--cmd 'shell command']`, Description: "Record verification evidence"},
+	{Name: "/dispatch", Usage: "/dispatch <role>", Description: "Print a role packet"},
+	{Name: "/run", Usage: "/run", Description: "Run queued roles until a stop condition"},
+	{Name: "/archive", Usage: "/archive", Description: "Archive the active task"},
+	{Name: "/help", Usage: "/help", Description: "Show this command menu"},
+	{Name: "/quit", Usage: "/quit", Description: "Exit the interactive terminal"},
+	{Name: "/exit", Usage: "/exit", Description: "Exit the interactive terminal"},
 }
 
 type env struct {
@@ -746,11 +747,17 @@ _agents "$@"
 
 func printInteractiveHelp(w io.Writer) {
 	fmt.Fprintln(w, "Shortcuts:")
-	fmt.Fprintln(w, "  plain text  chat with the coordinator")
-	fmt.Fprintln(w, "  /           show slash commands")
-	fmt.Fprintln(w, "  ?           show this help")
+	fmt.Fprintln(w, "  Plain text  Chat with the coordinator")
+	fmt.Fprintln(w, "  /           Show slash commands")
+	fmt.Fprintln(w, "  ?           Show this help")
+	fmt.Fprintln(w, "  Tab         Complete a unique slash command")
 	fmt.Fprintln(w)
 	printSlashCommandSuggestions(w, "", false)
+}
+
+func printInteractiveFooter(w io.Writer) {
+	fmt.Fprintln(w, `Type plain text to chat with the coordinator.`)
+	fmt.Fprintln(w, `Press ? for shortcuts · Type / for commands · Tab completes slash commands`)
 }
 
 func printSlashCommandSuggestions(w io.Writer, prefix string, color bool) {
@@ -845,7 +852,7 @@ func runTerminalLoop(rawIn io.Reader, in *bufio.Reader, out, errOut io.Writer, e
 		return 1
 	}
 	fmt.Fprintln(out)
-	fmt.Fprintln(out, `Type plain text to chat with the coordinator. "/" for commands, "?" for help.`)
+	printInteractiveFooter(out)
 	if e.isTTY {
 		if inFile, ok := rawIn.(*os.File); ok {
 			return runTerminalLoopTTY(inFile, out, errOut, e)
@@ -1238,8 +1245,8 @@ func runCoordinatorChatResponse(e env, out io.Writer) error {
 	if err != nil {
 		return err
 	}
-	reply := cleanInteractiveAgentOutput(result.Agent, result.AgentOutput)
-	directive, directiveOK := parseCoordinatorDirective(reply)
+	reply := cleanInteractiveAgentReply(result.Agent, result.AgentOutput)
+	directive, directiveOK := parseCoordinatorDirective(reply.Text)
 	if directiveOK {
 		allowDirective := coordinatorDirectiveActionable("coordinator", directive)
 		if allowDirective {
@@ -1247,7 +1254,7 @@ func runCoordinatorChatResponse(e env, out io.Writer) error {
 				return err
 			}
 		}
-		reply = removeCoordinatorDirective(reply)
+		reply.Text = removeCoordinatorDirective(reply.Text)
 		if allowDirective {
 			after, err := analyzeLoopState(e)
 			if err != nil {
@@ -1256,9 +1263,12 @@ func runCoordinatorChatResponse(e env, out io.Writer) error {
 			result.After = after
 		}
 	}
-	if strings.TrimSpace(reply) != "" {
+	if strings.TrimSpace(reply.Text) != "" {
 		fmt.Fprintln(out)
-		fmt.Fprintln(out, strings.TrimRight(reply, "\n"))
+		printInteractiveMarkdown(out, reply.Text)
+	}
+	if reply.Usage != "" {
+		fmt.Fprintf(out, "Usage: %s\n", reply.Usage)
 	}
 	printInteractiveReadyCue(out, result)
 	return nil
@@ -1268,6 +1278,11 @@ type coordinatorDirective struct {
 	Role  string
 	Text  string
 	Ready bool
+}
+
+type verificationDirective struct {
+	Text string
+	Cmd  string
 }
 
 func parseCoordinatorDirective(text string) (coordinatorDirective, bool) {
@@ -1285,6 +1300,9 @@ func parseCoordinatorDirective(text string) (coordinatorDirective, bool) {
 		return coordinatorDirective{}, false
 	}
 	content := text[contentStart : contentStart+endRel]
+	if directive, ok := parseCoordinatorDirectiveJSON(content); ok {
+		return directive, true
+	}
 	var directive coordinatorDirective
 	var textLines []string
 	inText := false
@@ -1312,8 +1330,75 @@ func parseCoordinatorDirective(text string) (coordinatorDirective, bool) {
 	return directive, true
 }
 
+func parseCoordinatorDirectiveJSON(content string) (coordinatorDirective, bool) {
+	var raw struct {
+		Role  string `json:"role"`
+		Text  string `json:"text"`
+		Ready bool   `json:"ready"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(content)), &raw); err != nil {
+		return coordinatorDirective{}, false
+	}
+	directive := coordinatorDirective{
+		Role:  strings.ToLower(strings.TrimSpace(raw.Role)),
+		Text:  strings.TrimSpace(raw.Text),
+		Ready: raw.Ready,
+	}
+	if directive.Role == "" || directive.Text == "" {
+		return coordinatorDirective{}, false
+	}
+	return directive, true
+}
+
 func removeCoordinatorDirective(text string) string {
-	start := strings.LastIndex(text, "```agents-handoff")
+	return removeFencedDirective(text, "agents-handoff")
+}
+
+func parseVerificationDirective(text string) (verificationDirective, bool) {
+	content, ok := fencedDirectiveContent(text, "agents-verify")
+	if !ok {
+		return verificationDirective{}, false
+	}
+	var raw struct {
+		Text string `json:"text"`
+		Cmd  string `json:"cmd"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(content)), &raw); err != nil {
+		return verificationDirective{}, false
+	}
+	directive := verificationDirective{
+		Text: strings.TrimSpace(raw.Text),
+		Cmd:  strings.TrimSpace(raw.Cmd),
+	}
+	if directive.Text == "" {
+		return verificationDirective{}, false
+	}
+	return directive, true
+}
+
+func removeVerificationDirective(text string) string {
+	return removeFencedDirective(text, "agents-verify")
+}
+
+func fencedDirectiveContent(text, name string) (string, bool) {
+	start := strings.LastIndex(text, "```"+name)
+	if start < 0 {
+		return "", false
+	}
+	blockStart := strings.Index(text[start:], "\n")
+	if blockStart < 0 {
+		return "", false
+	}
+	contentStart := start + blockStart + 1
+	endRel := strings.Index(text[contentStart:], "```")
+	if endRel < 0 {
+		return "", false
+	}
+	return text[contentStart : contentStart+endRel], true
+}
+
+func removeFencedDirective(text, name string) string {
+	start := strings.LastIndex(text, "```"+name)
 	if start < 0 {
 		return text
 	}
@@ -1538,6 +1623,59 @@ func printInteractiveProgress(w io.Writer, progress progressDirective) {
 	fmt.Fprintf(w, "- %s: %s\n", sentenceCase(status), sentenceCase(singleLine(detail)))
 }
 
+func printInteractiveMarkdown(w io.Writer, markdown string) {
+	text := strings.TrimRight(markdown, "\n")
+	if text == "" {
+		return
+	}
+	if !isTerminalWriter(w) {
+		fmt.Fprintln(w, text)
+		return
+	}
+	width := terminalWriterWidth(w)
+	rendered, err := renderTerminalMarkdown(text, width)
+	if err != nil {
+		fmt.Fprintln(w, text)
+		return
+	}
+	fmt.Fprint(w, strings.TrimRight(rendered, "\n"))
+	fmt.Fprintln(w)
+}
+
+func renderTerminalMarkdown(markdown string, width int) (string, error) {
+	if width <= 0 {
+		width = 100
+	}
+	renderer, err := glamour.NewTermRenderer(
+		glamour.WithEnvironmentConfig(),
+		glamour.WithWordWrap(width),
+	)
+	if err != nil {
+		return "", err
+	}
+	return renderer.Render(markdown)
+}
+
+func isTerminalWriter(w io.Writer) bool {
+	file, ok := w.(*os.File)
+	return ok && term.IsTerminal(int(file.Fd()))
+}
+
+func terminalWriterWidth(w io.Writer) int {
+	file, ok := w.(*os.File)
+	if !ok {
+		return 100
+	}
+	width, _, err := term.GetSize(int(file.Fd()))
+	if err != nil || width <= 0 {
+		return 100
+	}
+	if width > 120 {
+		return 120
+	}
+	return width
+}
+
 func singleLine(text string) string {
 	return strings.Join(strings.Fields(text), " ")
 }
@@ -1565,10 +1703,13 @@ func titleRole(role string) string {
 }
 
 func printInteractiveRoleRunResult(w io.Writer, result roleRunResult) {
-	reply := cleanInteractiveAgentOutput(result.Agent, result.AgentOutput)
-	if strings.TrimSpace(reply) != "" {
+	reply := cleanInteractiveAgentReply(result.Agent, result.AgentOutput)
+	if strings.TrimSpace(reply.Text) != "" {
 		fmt.Fprintln(w)
-		fmt.Fprintln(w, strings.TrimRight(reply, "\n"))
+		printInteractiveMarkdown(w, reply.Text)
+	}
+	if reply.Usage != "" {
+		fmt.Fprintf(w, "Usage: %s\n", reply.Usage)
 	}
 	if result.After.NextRole != "" && result.After.NextRole != result.Before.NextRole {
 		if result.After.NextRole == "human" {
@@ -3658,11 +3799,12 @@ func runLoopToStop(cmd string, loopOut, errOut io.Writer, e env, maxRuns int, ev
 		fmt.Fprintf(loopOut, "agent: not configured for %s\n", stop.State.NextRole)
 		return 0
 	case "no-progress":
-		fmt.Fprintf(loopOut, "\nstopped: %s run recorded no progress; inspect the run log and route manually\n", stop.State.NextRole)
+		fmt.Fprintf(loopOut, "\nPaused: %s did not record new task progress.\n", titleRole(stop.State.NextRole))
+		fmt.Fprintln(loopOut, "Inspect the run log, keep planning, or run again when ready.")
 		printLoopState(loopOut, stop.State)
 		return 1
 	case "max-runs":
-		fmt.Fprintf(loopOut, "\nstopped: reached %d role runs with work remaining; rerun `agents run` to continue\n", stop.Runs)
+		fmt.Fprintf(loopOut, "\nLoop paused after %d role runs with work remaining; rerun `agents run` to continue.\n", stop.Runs)
 		printLoopState(loopOut, stop.State)
 		return 1
 	default:
@@ -3756,6 +3898,11 @@ type roleRunOptions struct {
 	ShowRunHeader bool
 	LiveOutput    io.Writer
 	Events        loopEventSink
+}
+
+type interactiveAgentReply struct {
+	Text  string
+	Usage string
 }
 
 type runArtifactPaths struct {
@@ -3981,7 +4128,7 @@ func resolveAgentCommand(agent string, settings agentSettings) (string, error) {
 		args = append(args, `"$(cat `+promptFileMarker+`)" < /dev/null`)
 		return strings.Join(args, " "), nil
 	case "claude":
-		args := []string{"claude -p"}
+		args := []string{"claude -p --permission-mode acceptEdits"}
 		if strings.TrimSpace(settings.ClaudeModel) != "" {
 			args = append(args, "--model "+shellQuote(strings.TrimSpace(settings.ClaudeModel)))
 		}
@@ -4227,16 +4374,40 @@ func settingOrDefault(value string) string {
 }
 
 func cleanInteractiveAgentOutput(agent, output string) string {
+	return cleanInteractiveAgentReply(agent, output).Text
+}
+
+func cleanInteractiveAgentReply(agent, output string) interactiveAgentReply {
 	text := strings.TrimSpace(output)
 	if text == "" {
-		return ""
+		return interactiveAgentReply{}
 	}
+	reply := interactiveAgentReply{Usage: extractProviderUsage(text)}
 	if strings.EqualFold(strings.TrimSpace(agent), "codex") {
 		if cleaned := cleanCodexExecOutput(text); cleaned != "" {
-			return cleanAgentsCLIRecordOutput(cleaned)
+			reply.Text = cleanAgentsCLIRecordOutput(cleaned)
+			return reply
 		}
 	}
-	return cleanAgentsCLIRecordOutput(text)
+	reply.Text = cleanAgentsCLIRecordOutput(text)
+	return reply
+}
+
+func extractProviderUsage(output string) string {
+	lines := strings.Split(output, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		trimmed := strings.TrimSpace(lines[i])
+		lower := strings.ToLower(trimmed)
+		switch {
+		case strings.HasPrefix(lower, "token usage:"):
+			return strings.TrimSpace(trimmed[len("Token usage:"):])
+		case trimmed == "tok"+"ens used":
+			if i+1 < len(lines) {
+				return strings.TrimSpace(lines[i+1]) + " tokens"
+			}
+		}
+	}
+	return ""
 }
 
 func cleanCodexExecOutput(output string) string {
@@ -4272,8 +4443,14 @@ func cleanCodexExecOutput(output string) string {
 func cleanAgentsCLIRecordOutput(output string) string {
 	var kept []string
 	inProgressBlock := false
+	skipNextUsageLine := false
 	for _, line := range strings.Split(output, "\n") {
 		trimmed := strings.TrimSpace(line)
+		lower := strings.ToLower(trimmed)
+		if skipNextUsageLine {
+			skipNextUsageLine = false
+			continue
+		}
 		if inProgressBlock {
 			if trimmed == "```" {
 				inProgressBlock = false
@@ -4293,6 +4470,11 @@ func cleanAgentsCLIRecordOutput(output string) string {
 		case strings.Contains(trimmed, "ignoring interface.defaultPrompt[0]"):
 			continue
 		case strings.Contains(trimmed, "ignoring interface.icon_"):
+			continue
+		case strings.HasPrefix(lower, "token usage:"):
+			continue
+		case trimmed == "tok"+"ens used":
+			skipNextUsageLine = true
 			continue
 		case strings.Contains(trimmed, "failed to initialize MCP client during shutdown"):
 			continue
@@ -4353,8 +4535,11 @@ func buildRolePrompt(e env, state loopState) (string, error) {
 		fmt.Fprintln(&b, "- Run relevant checks.")
 		fmt.Fprintln(&b, "- Mark findings you fixed with `agents finding fix <finding> --evidence \"what proves the fix\"`.")
 		fmt.Fprintln(&b, "- Keep task state current: `agents task status \"where things stand\"` and `agents task next \"what should happen next\"`.")
-		fmt.Fprintln(&b, "- Record a handoff when ready for review:")
-		fmt.Fprintln(&b, `  agents handoff --to reviewer "what changed and how it was checked"`)
+		fmt.Fprintln(&b, "- When ready for review, end with one `agents-handoff` JSON fenced block so the parent process records the reviewer handoff:")
+		fmt.Fprintln(&b, "```agents-handoff")
+		fmt.Fprintln(&b, `{"role":"reviewer","text":"specific changes made and checks performed"}`)
+		fmt.Fprintln(&b, "```")
+		fmt.Fprintln(&b, "  Replace the text with the actual changes and checks; do not copy placeholder handoff text.")
 		fmt.Fprintln(&b, "- You cannot verify your own work: do not run `agents verify` or `agents finding verify`; the reviewer records verification independently.")
 		fmt.Fprintln(&b, "- Keep build caches, compiled binaries, and scratch files out of the repository (including .agents/); use the system temp directory instead.")
 		fmt.Fprintln(&b, "- Do not commit; leave changes for review.")
@@ -4376,8 +4561,12 @@ func buildRolePrompt(e env, state loopState) (string, error) {
 		fmt.Fprintln(&b, `  agents finding add "summary" --severity low|medium|high`)
 		fmt.Fprintln(&b, "- For findings marked fixed, verify them independently with evidence:")
 		fmt.Fprintln(&b, `  agents finding verify <finding> --evidence "what you checked"`)
-		fmt.Fprintln(&b, "- When the work is clean, record reproducible verification evidence:")
-		fmt.Fprintln(&b, `  agents verify "checks performed" --cmd 'go test ./...'`)
+		fmt.Fprintln(&b, "- When the work is clean, end with one `agents-verify` JSON fenced block so the parent process records reproducible verification evidence:")
+		fmt.Fprintln(&b, "```agents-verify")
+		fmt.Fprintln(&b, `{"text":"specific checks performed and review result","cmd":"go test ./..."}`)
+		fmt.Fprintln(&b, "```")
+		fmt.Fprintln(&b, "  Replace the text and command with the actual verification you performed; do not copy placeholder evidence.")
+		fmt.Fprintln(&b, "  The parent Agents process records this verification; do not run `agents verify` yourself.")
 		fmt.Fprintln(&b, "  Recording passing verification reaches the human approval boundary; nothing ships on your claim alone.")
 		fmt.Fprintln(&b, "- Summarize the review in your response: issues first, then what was verified.")
 		fmt.Fprintln(&b, "- Keep build caches, compiled binaries, and scratch files out of the repository (including .agents/); use the system temp directory instead.")
@@ -4415,16 +4604,37 @@ func buildRolePrompt(e env, state loopState) (string, error) {
 func applyRoleOutputDirectives(e env, actor, output string) (string, error) {
 	cleaned := output
 	for {
+		changed := false
 		directive, ok := parseCoordinatorDirective(cleaned)
-		if !ok {
+		if ok {
+			if err := applyCoordinatorDirective(e, actor, directive); err != nil {
+				return cleaned, err
+			}
+			cleaned = removeCoordinatorDirective(cleaned)
+			changed = true
+		}
+		verification, ok := parseVerificationDirective(cleaned)
+		if ok {
+			if err := applyVerificationDirective(e, actor, verification); err != nil {
+				return cleaned, err
+			}
+			cleaned = removeVerificationDirective(cleaned)
+			changed = true
+		}
+		if !changed {
 			break
 		}
-		if err := applyCoordinatorDirective(e, actor, directive); err != nil {
-			return cleaned, err
-		}
-		cleaned = removeCoordinatorDirective(cleaned)
 	}
 	return cleaned, nil
+}
+
+func applyVerificationDirective(e env, actor string, directive verificationDirective) error {
+	args := []string{directive.Text, "--by", actor}
+	if directive.Cmd != "" {
+		args = append(args, "--cmd", directive.Cmd)
+	}
+	_, _, err := addVerification(e, args, time.Now().UTC())
+	return err
 }
 
 func appendPromptFile(b *strings.Builder, cwd, taskPath, name, heading string) {

@@ -955,7 +955,9 @@ func TestInteractiveTrustThenRunsLoop(t *testing.T) {
 		"AGENTS",
 		"Trusted this folder.",
 		"active task: Demo Task",
-		`Type plain text to chat with the coordinator. "/" for commands, "?" for help.`,
+		"Type plain text to chat with the coordinator.",
+		"Press ? for shortcuts",
+		"Tab completes slash commands",
 		"› ",
 		"Goodbye.",
 	} {
@@ -1052,10 +1054,11 @@ func TestInteractiveHelpAndExit(t *testing.T) {
 	got := out.String()
 	for _, want := range []string{
 		"Shortcuts:",
-		"plain text  chat with the coordinator",
+		"Plain text  Chat with the coordinator",
+		"Tab         Complete a unique slash command",
 		"Slash commands:",
 		`/status`,
-		"show workspace, active task, and record counts",
+		"Show workspace, active task, and record counts",
 		`/task open|use|scope|status|next ...`,
 		`/decision add "text"`,
 		"/run",
@@ -1086,10 +1089,10 @@ func TestInteractiveSlashPrefixShowsMatchingCommands(t *testing.T) {
 		t.Fatalf("runInteractive code=%d stderr=%s", code, errOut.String())
 	}
 	got := out.String()
-	if !strings.Contains(got, "/status") || !strings.Contains(got, "show workspace, active task, and record counts") {
+	if !strings.Contains(got, "/status") || !strings.Contains(got, "Show workspace, active task, and record counts") {
 		t.Fatalf("prefix should suggest /status, got:\n%s", got)
 	}
-	if !strings.Contains(got, "/start") || !strings.Contains(got, "fast path") {
+	if !strings.Contains(got, "/start") || !strings.Contains(got, "Fast path") {
 		t.Fatalf("bare slash should show full command menu, got:\n%s", got)
 	}
 	if strings.Contains(got, "unknown command: /st") {
@@ -1246,6 +1249,10 @@ func TestCleanCodexExecOutputReturnsFinalAnswer(t *testing.T) {
 	if got != want {
 		t.Fatalf("cleanInteractiveAgentOutput got:\n%q\nwant:\n%q", got, want)
 	}
+	reply := cleanInteractiveAgentReply("codex", raw)
+	if reply.Usage != "21,091 tokens" {
+		t.Fatalf("usage got %q", reply.Usage)
+	}
 }
 
 func TestCleanInteractiveAgentOutputHidesAgentsRecordOutput(t *testing.T) {
@@ -1261,6 +1268,34 @@ func TestCleanInteractiveAgentOutputHidesAgentsRecordOutput(t *testing.T) {
 	want := "What should this project do?"
 	if got != want {
 		t.Fatalf("cleanInteractiveAgentOutput got %q want %q", got, want)
+	}
+}
+
+func TestCleanInteractiveAgentReplyExtractsTokenUsage(t *testing.T) {
+	raw := strings.Join([]string{
+		"Here is the answer.",
+		"",
+		"Token usage: total=10,626 input=10,609 output=17",
+	}, "\n")
+	reply := cleanInteractiveAgentReply("claude", raw)
+	if reply.Text != "Here is the answer." {
+		t.Fatalf("reply text got %q", reply.Text)
+	}
+	if reply.Usage != "total=10,626 input=10,609 output=17" {
+		t.Fatalf("usage got %q", reply.Usage)
+	}
+}
+
+func TestRenderTerminalMarkdownFormatsMarkdown(t *testing.T) {
+	rendered, err := renderTerminalMarkdown("## What it does\n\n- **Task** routing\n\n| Concept | What it is |\n| --- | --- |\n| Task | Scoped work |\n", 80)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain := ansiEscapes.ReplaceAllString(rendered, "")
+	for _, want := range []string{"What it does", "Task", "Concept", "Scoped work"} {
+		if !strings.Contains(plain, want) {
+			t.Fatalf("rendered markdown missing %q:\n%s", want, plain)
+		}
 	}
 }
 
@@ -1340,6 +1375,55 @@ func TestCoordinatorDirectiveParsesAndRemovesHandoffBlock(t *testing.T) {
 	}
 	if got := removeCoordinatorDirective(raw); got != "Ready to build." {
 		t.Fatalf("removeCoordinatorDirective got %q", got)
+	}
+}
+
+func TestCoordinatorDirectiveParsesJSONHandoffBlock(t *testing.T) {
+	raw := "Ready.\n\n```agents-handoff\n{\"role\":\"implementer\",\"ready\":true,\"text\":\"Build the count command.\"}\n```\n"
+	directive, ok := parseCoordinatorDirective(raw)
+	if !ok {
+		t.Fatal("expected directive to parse")
+	}
+	if directive.Role != "implementer" || !directive.Ready || directive.Text != "Build the count command." {
+		t.Fatalf("unexpected directive: %+v", directive)
+	}
+	if cleaned := removeCoordinatorDirective(raw); cleaned != "Ready." {
+		t.Fatalf("cleaned got %q", cleaned)
+	}
+}
+
+func TestVerificationDirectiveParsesAndRecords(t *testing.T) {
+	raw := "Looks clean.\n\n```agents-verify\n{\"text\":\"go test ./... passed\",\"cmd\":\"\"}\n```\n"
+	directive, ok := parseVerificationDirective(raw)
+	if !ok {
+		t.Fatal("expected verification directive to parse")
+	}
+	if directive.Text != "go test ./... passed" || directive.Cmd != "" {
+		t.Fatalf("unexpected directive: %+v", directive)
+	}
+	if cleaned := removeVerificationDirective(raw); cleaned != "Looks clean." {
+		t.Fatalf("cleaned got %q", cleaned)
+	}
+
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Review"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if err := applyVerificationDirective(e, "reviewer", directive); err != nil {
+			t.Fatal(err)
+		}
+		stats, err := readTaskStats(cwd, readActiveTask(cwd).Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stats.Verification != 1 {
+			t.Fatalf("verification count got %d", stats.Verification)
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
 	}
 }
 
@@ -1458,6 +1542,42 @@ func TestApplyRoleOutputDirectivesBrokersReviewerHandoff(t *testing.T) {
 			t.Fatal(err)
 		}
 		if got := string(data); !strings.Contains(got, "To: coordinator") || !strings.Contains(got, "Review approved") {
+			t.Fatalf("unexpected handoff:\n%s", got)
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
+func TestApplyRoleOutputDirectivesParsesJSONReviewerHandoff(t *testing.T) {
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		task, err := openTask(e, []string{"Reviewer Handoff"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw := "Implemented.\n\n```agents-handoff\n{\"role\":\"reviewer\",\"text\":\"Added count command and go test ./... passed.\"}\n```\n"
+		cleaned, err := applyRoleOutputDirectives(e, "implementer", raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(cleaned, "agents-handoff") {
+			t.Fatalf("expected directive removed, got:\n%s", cleaned)
+		}
+		entries, err := os.ReadDir(filepath.Join(cwd, ".agents", task.Path, "handoffs"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) != 1 {
+			t.Fatalf("expected one handoff, got %d", len(entries))
+		}
+		data, err := os.ReadFile(filepath.Join(cwd, ".agents", task.Path, "handoffs", entries[0].Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := string(data); !strings.Contains(got, "To: reviewer") || !strings.Contains(got, "Added count command") {
 			t.Fatalf("unexpected handoff:\n%s", got)
 		}
 		return 0
@@ -2582,7 +2702,7 @@ func TestResolveAgentCommandUsesProviderModelSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"claude -p", "--model 'opus'", "--effort 'xhigh'"} {
+	for _, want := range []string{"claude -p", "--permission-mode acceptEdits", "--model 'opus'", "--effort 'xhigh'"} {
 		if !strings.Contains(claudeCommand, want) {
 			t.Fatalf("claude command missing %q:\n%s", want, claudeCommand)
 		}
@@ -3323,7 +3443,7 @@ func TestRunLoopStopsWhenRoleRecordsNoProgress(t *testing.T) {
 	if code != 1 {
 		t.Fatalf("expected stalled loop to exit 1, got %d stderr=%s stdout=%s", code, errOut.String(), out.String())
 	}
-	if !strings.Contains(out.String(), "recorded no progress") {
+	if !strings.Contains(out.String(), "did not record new task progress") {
 		t.Fatalf("expected no-progress stop message, got:\n%s", out.String())
 	}
 }
@@ -3640,7 +3760,7 @@ func TestRunLoopStopsAtMaxIterations(t *testing.T) {
 	if code != 1 {
 		t.Fatalf("expected max-iterations stop to exit 1, got %d stderr=%s stdout=%s", code, errOut.String(), out.String())
 	}
-	if !strings.Contains(out.String(), "reached 2 role runs") {
+	if !strings.Contains(out.String(), "Loop paused after 2 role runs") {
 		t.Fatalf("expected max-iterations stop message, got:\n%s", out.String())
 	}
 }
@@ -3673,7 +3793,7 @@ func TestRunLoopStopsOnRepeatedSameTargetHandoffs(t *testing.T) {
 	if code != 1 {
 		t.Fatalf("expected handoff churn to exit 1, got %d stderr=%s stdout=%s", code, errOut.String(), out.String())
 	}
-	if !strings.Contains(out.String(), "recorded no progress") {
+	if !strings.Contains(out.String(), "did not record new task progress") {
 		t.Fatalf("expected no-progress stop message, got:\n%s", out.String())
 	}
 }

@@ -299,6 +299,10 @@ Interactive input model:
   composer.
 - In an interactive terminal, chat immediately runs the configured coordinator
   so it can ask for constraints, refs, or approval before routing work.
+- Interactive coordinator and role replies render Markdown for headings, lists,
+  code blocks, emphasis, and tables. Scriptable commands keep plain text output.
+- When a provider reports token usage, Agents shows it as a small `Usage:` line
+  after the reply and keeps the raw provider output in the run log.
 - Coordinators do not write `.agents/` state directly; Agents records any
   requested role handoff from the parent process.
 - In scripts or pipes, chat is recorded and `/run` drives the next role.
@@ -308,6 +312,8 @@ Interactive input model:
 - Unique slash prefixes execute, so `/q` and `/qu` resolve to `/quit`.
 - Press Tab in the interactive composer to complete a unique slash command,
   such as `/qu` to `/quit`.
+- The interactive footer shows `Press ? for shortcuts · Type / for commands ·
+  Tab completes slash commands`.
 - Shell Tab completion is available through `agents completion install-zsh`.
 - Press Ctrl-C in the composer or during a running role to stop with a
   continuation hint for the active session.
