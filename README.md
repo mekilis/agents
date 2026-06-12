@@ -205,11 +205,10 @@ and should record findings when the implementation does not match the plan, or
 when the plan is stale, missing, shallow, or incorrect for the work under
 review.
 
-Substantive plans should stay compact: Objective, Evidence, Clarifications,
-Slices, Validation, Risks, and Execution Constraints. Evidence should cite
-brief repo-relative facts, Clarifications should combine assumptions and open
-questions, and Execution Constraints should name requested permissions or
-boundaries without long background notes.
+Substantive plans should stay compact and may use whatever Markdown shape fits
+the work. They should naturally cover the objective, brief repo-relative
+evidence, assumptions or open questions, implementation shape, validation,
+risks, and constraints such as requested permissions or boundaries.
 
 Record coordination state:
 

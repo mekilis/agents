@@ -1771,8 +1771,9 @@ func TestCoordinatorPromptAvoidsCannedProgressAndAllowsReadOnlyRepoInspection(t 
 			"do not inspect the repository, summarize files, recommend code work, or emit progress",
 			"Inspect the repository only when the user explicitly asks",
 			"use read-only commands such as listing files, reading docs, and searching source",
-			"produce or revise the task plan as compact Markdown",
-			"Objective, Evidence, Clarifications, Slices, Validation, Risks, Execution Constraints",
+			"produce or revise the task plan as compact, free-form Markdown",
+			"do not require rigid section headings",
+			"objective, repo-relative evidence, assumptions or open questions, implementation shape, validation, risks, and constraints",
 			"If the plan is not ready for implementation",
 			"repo-relative paths such as `README.md` or `.agents/tasks/...`",
 			"do not print absolute machine-local paths",
@@ -3276,18 +3277,28 @@ func TestPlanDraftWritesCompactSubstantiveScaffold(t *testing.T) {
 			t.Fatalf("expected draft plan, got %+v", plan)
 		}
 		for _, want := range []string{
-			"## Objective",
 			"Make plan mode substantive",
-			"## Evidence",
-			"repo-relative paths",
-			"## Clarifications",
-			"## Slices",
-			"## Validation",
-			"## Risks",
-			"## Execution Constraints",
+			"concise, editable Markdown rather than filling out a form",
+			"repo-relative evidence",
+			"assumptions, open questions, or decisions still needed",
+			"implementation shape",
+			"validation",
+			"risks, trade-offs, and constraints",
 		} {
 			if !strings.Contains(plan.Text, want) {
 				t.Fatalf("draft plan missing %q:\n%s", want, plan.Text)
+			}
+		}
+		for _, unwanted := range []string{
+			"## Objective",
+			"## Evidence",
+			"## Clarifications",
+			"## Slices",
+			"## Execution Constraints",
+			"TODO:",
+		} {
+			if strings.Contains(plan.Text, unwanted) {
+				t.Fatalf("draft plan should feel free-form, found %q:\n%s", unwanted, plan.Text)
 			}
 		}
 		return 0
@@ -3308,16 +3319,12 @@ func TestRolePromptBoundsLongPlanContent(t *testing.T) {
 			t.Fatal(err)
 		}
 		longPlan := strings.Join([]string{
-			"## Objective",
-			"Keep the plan compact.",
+			"Keep the plan compact while allowing free-form narrative.",
 			"",
-			"## Evidence",
 			strings.Repeat("substantive detail\n", 400),
-			"## Risks",
-			"- Risk that must stay visible.",
+			"Risk that must stay visible.",
 			"",
-			"## Execution Constraints",
-			"- Do not hide this required constraint.",
+			"Do not hide this required constraint.",
 		}, "\n")
 		if _, err := writeActiveTaskPlan(e, []string{longPlan}, planStateApproved); err != nil {
 			t.Fatal(err)
@@ -3335,9 +3342,7 @@ func TestRolePromptBoundsLongPlanContent(t *testing.T) {
 				"State: approved",
 				"Plan middle sections compacted for prompt budget",
 				"Plan truncated for prompt budget",
-				"## Risks",
 				"Risk that must stay visible.",
-				"## Execution Constraints",
 				"Do not hide this required constraint.",
 			} {
 				if !strings.Contains(prompt, want) {
@@ -4074,7 +4079,8 @@ func TestReviewerPromptIncludesPlanReviewInstructionsAndOmitsLocalAIReviewNotes(
 			"State: approved",
 			"Approved plan for the reviewer to inspect.",
 			"Review the current task plan in `plan.md` when present.",
-			"evidence, clarifications, slices, validation, risks, and execution constraints",
+			"objective, repo-relative evidence, assumptions or open questions, implementation shape, validation, risks, and constraints",
+			"do not require exact section headings",
 			"implementation and review scope match the approved or draft plan",
 			"stale, missing, shallow, incorrect, or ignored plans",
 			"Working agreement:",

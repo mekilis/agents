@@ -6115,7 +6115,8 @@ func buildRolePrompt(e env, state loopState) (string, error) {
 		appendPromptDir(&b, e.cwd, state.Task.Path, "verification", "Verification")
 		fmt.Fprintln(&b, "Working agreement:")
 		fmt.Fprintln(&b, "- Review the working tree, tests, and task chunks; verify claims against the code, not the handoff text.")
-		fmt.Fprintln(&b, "- Review the current task plan in `plan.md` when present. Check whether it contains compact evidence, clarifications, slices, validation, risks, and execution constraints, then check whether the implementation and review scope match the approved or draft plan.")
+		fmt.Fprintln(&b, "- Review the current task plan in `plan.md` when present. Check for substantive objective, repo-relative evidence, assumptions or open questions, implementation shape, validation, risks, and constraints; do not require exact section headings.")
+		fmt.Fprintln(&b, "- Check whether the implementation and review scope match the approved or draft plan.")
 		fmt.Fprintln(&b, "- Record findings for stale, missing, shallow, incorrect, or ignored plans.")
 		fmt.Fprintln(&b, "- Emit brief JSON progress updates for the interactive UI when phases change:")
 		fmt.Fprintln(&b, "  ```agents-progress")
@@ -6230,6 +6231,9 @@ func boundedPlanText(text string) string {
 	}
 	sections := splitMarkdownSections(trimmed)
 	if len(sections) < 2 {
+		if tail := criticalPlanLines(trimmed); len(tail) > 0 {
+			return boundedPlanWithCriticalTail(trimmed, tail, maxPlanPromptChars)
+		}
 		return truncatePlanHead(trimmed, maxPlanPromptChars)
 	}
 	critical := map[string]bool{
@@ -6245,15 +6249,22 @@ func boundedPlanText(text string) string {
 		tail = append(tail, section)
 	}
 	if len(tail) == 0 {
-		return truncatePlanHead(trimmed, maxPlanPromptChars)
+		tail = criticalPlanLines(trimmed)
+		if len(tail) == 0 {
+			return truncatePlanHead(trimmed, maxPlanPromptChars)
+		}
 	}
+	return boundedPlanWithCriticalTail(strings.TrimSpace(joinPlanSections(head)), tail, maxPlanPromptChars)
+}
+
+func boundedPlanWithCriticalTail(head string, tail []planSection, limit int) string {
 	const marker = "\n\n[Plan middle sections compacted for prompt budget; full canonical plan remains in `.agents` task state.]\n\n"
-	tailText := compactPlanSections(tail, maxPlanPromptChars/2)
-	headBudget := maxPlanPromptChars - len(tailText) - len(marker)
-	if headBudget < maxPlanPromptChars/4 {
-		headBudget = maxPlanPromptChars / 4
+	tailText := compactPlanSections(tail, limit/2)
+	headBudget := limit - len(tailText) - len(marker)
+	if headBudget < limit/4 {
+		headBudget = limit / 4
 	}
-	headText := truncatePlanHead(strings.TrimSpace(joinPlanSections(head)), headBudget)
+	headText := truncatePlanHead(strings.TrimSpace(head), headBudget)
 	return strings.TrimSpace(headText) + marker + tailText
 }
 
@@ -6324,6 +6335,24 @@ func compactPlanSections(sections []planSection, limit int) string {
 
 func normalizePlanHeading(heading string) string {
 	return strings.ToLower(strings.TrimSpace(heading))
+}
+
+func criticalPlanLines(text string) []planSection {
+	var lines []string
+	for _, line := range strings.Split(text, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		lower := strings.ToLower(trimmed)
+		if strings.Contains(lower, "risk") || strings.Contains(lower, "constraint") || strings.Contains(lower, "permission") || strings.Contains(lower, "boundary") || strings.Contains(lower, "avoid") || strings.Contains(lower, "must not") || strings.Contains(lower, "do not") {
+			lines = append(lines, trimmed)
+		}
+	}
+	if len(lines) == 0 {
+		return nil
+	}
+	return []planSection{{Heading: "Critical planning notes", Text: strings.Join(lines, "\n")}}
 }
 
 func truncatePlanHead(text string, limit int) string {

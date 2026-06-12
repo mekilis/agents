@@ -169,26 +169,17 @@ func writeActiveTaskPlanText(e env, text string, state string) (string, error) {
 }
 
 func compactPlanTemplate(objective string) string {
-	return strings.TrimSpace(fmt.Sprintf(`## Objective
-%s
+	return strings.TrimSpace(fmt.Sprintf(`%s
 
-## Evidence
-- TODO: repo/doc/task evidence, with repo-relative paths.
+Write this as concise, editable Markdown rather than filling out a form. Make it specific enough that an implementer and reviewer can act on it without guessing.
 
-## Clarifications
-- TODO: assumptions, open questions, and human decisions needed.
-
-## Slices
-1. TODO: implementation slice with expected files or behavior.
-
-## Validation
-- TODO: focused checks, tests, or manual acceptance criteria.
-
-## Risks
-- TODO: likely regressions, stale context, or trade-offs.
-
-## Execution Constraints
-- TODO: requested permissions, boundaries, and actions Agents must not take.`, strings.TrimSpace(objective)))
+Include the substance naturally:
+- what outcome the user wants and why this plan is in scope
+- repo-relative evidence from docs, code, task state, or prior handoffs
+- assumptions, open questions, or decisions still needed
+- the implementation shape: files, behavior, and action-sized slices
+- validation: focused tests, checks, or acceptance criteria
+- risks, trade-offs, and constraints such as permissions, boundaries, or actions Agents must avoid`, strings.TrimSpace(objective)))
 }
 
 func approveActiveTaskPlan(e env) (string, error) {
