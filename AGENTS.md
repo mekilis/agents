@@ -34,6 +34,16 @@ Treat every committed file as public history.
 
 - Main binary: `cmd/agents/main.go`.
 - App logic: `internal/app/`.
+- Agents should build Agents. For implementation and review work in this repo,
+  prefer opening a task and driving the configured roles with `agents go`,
+  `agents run`, `agents watch`, and the task/finding/verification commands.
+- The IDE or chat agent in use should act as the human supervisor: set scope,
+  inspect status, add decisions, approve boundaries, and commit. It should not
+  silently replace the configured Agents implementer/reviewer loop for normal
+  product work.
+- Direct IDE edits are acceptable for small instruction-only changes, emergency
+  fixes, or when Agents itself is broken. Record the reason in task state when
+  the work is more than trivial.
 - Run tests with an isolated Go build cache when sandboxed:
 
 ```bash
@@ -56,3 +66,6 @@ GOCACHE=<isolated-cache> GOBIN=<user-go-bin> go install ./cmd/agents
   over speculative automation.
 - Record meaningful work in `.agents/` chunks when it helps the next agent or
   human continue.
+- Treat MCP, IDEs, and editor extensions as clients of Agents, not the core
+  implementation surface. The durable source of coordination truth is
+  `.agents/` plus git history.

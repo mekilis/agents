@@ -73,6 +73,13 @@ Agents runs the configured roles from `.agents/config.yml`. Implementer output
 and reviewer output stream in the terminal, while durable task records are
 written under `.agents/`.
 
+From another terminal, you can watch the cleaned task activity without reading
+raw provider logs:
+
+```bash
+agents watch
+```
+
 If you already know the exact task and want to skip the chat step, use `go`:
 
 ```bash

@@ -270,6 +270,8 @@ func runOneShot(args []string, in io.Reader, out, errOut io.Writer, e env) int {
 		return runStartCommand(args[1:], out, errOut, e)
 	case "go":
 		return runGoCommand(args[1:], in, out, errOut, e)
+	case "mcp":
+		return runMCPCommand(args[1:], in, out, errOut, e)
 	case "task":
 		return runTaskCommand(args[1:], out, errOut, e)
 	case "decision":
@@ -907,6 +909,7 @@ func printHelp(w io.Writer) {
 	fmt.Fprintln(w, "  agents run [--max-iterations N] [--once] [--json] [--json-events]")
 	fmt.Fprintln(w, "  agents watch")
 	fmt.Fprintln(w, "  agents runs [--follow]")
+	fmt.Fprintln(w, "  agents mcp")
 	fmt.Fprintln(w, "  agents completion zsh")
 	fmt.Fprintln(w, "  agents completion install-zsh")
 	fmt.Fprintln(w, "  agents version")
@@ -2362,31 +2365,20 @@ func coordinatorChatTitle(text string) string {
 }
 
 func printStatus(w io.Writer, e env, jsonOut bool) error {
-	trusted, err := isTrusted(e)
+	payload, err := statusPayload(e)
 	if err != nil {
 		return err
 	}
-	active := readActiveTask(e.cwd)
 	if jsonOut {
-		payload := statusJSON{
-			Workspace: e.cwd,
-			Trust:     trustStatus(trusted),
-		}
-		if active.Path != "" {
-			stats, err := readTaskStats(e.cwd, active.Path)
-			if err != nil {
-				return err
-			}
-			payload.ActiveTask = taskPayload(active, stats)
-		}
 		return writeJSON(w, payload)
 	}
 
-	fmt.Fprintf(w, "workspace: %s\n", e.cwd)
-	fmt.Fprintf(w, "trust: %s\n", trustStatus(trusted))
-	if active.Path == "" {
+	fmt.Fprintf(w, "workspace: %s\n", payload.Workspace)
+	fmt.Fprintf(w, "trust: %s\n", payload.Trust)
+	if payload.ActiveTask == nil {
 		fmt.Fprintln(w, "active task: none")
 	} else {
+		active := payload.ActiveTask
 		fmt.Fprintf(w, "active task: %s\n", active.Title)
 		if active.Missing {
 			fmt.Fprintln(w, "warning: active task directory is missing; run `agents task use <task>` or `agents task open`")
@@ -2395,13 +2387,38 @@ func printStatus(w io.Writer, e env, jsonOut bool) error {
 			fmt.Fprintf(w, "task status: %s\n", active.Status)
 		}
 		fmt.Fprintf(w, "task path: %s\n", active.Path)
-		stats, err := readTaskStats(e.cwd, active.Path)
-		if err != nil {
-			return err
-		}
-		printTaskStats(w, stats)
+		printTaskStats(w, taskStats{
+			Next:             active.Next,
+			FindingsOpen:     active.Findings.Open,
+			FindingsFixed:    active.Findings.Fixed,
+			FindingsVerified: active.Findings.Verified,
+			Decisions:        active.Records.Decisions,
+			Handoffs:         active.Records.Handoffs,
+			Verification:     active.Records.Verification,
+			VerificationFail: active.Records.VerificationFailed,
+		})
 	}
 	return nil
+}
+
+func statusPayload(e env) (statusJSON, error) {
+	trusted, err := isTrusted(e)
+	if err != nil {
+		return statusJSON{}, err
+	}
+	active := readActiveTask(e.cwd)
+	payload := statusJSON{
+		Workspace: e.cwd,
+		Trust:     trustStatus(trusted),
+	}
+	if active.Path != "" {
+		stats, err := readTaskStats(e.cwd, active.Path)
+		if err != nil {
+			return statusJSON{}, err
+		}
+		payload.ActiveTask = taskPayload(active, stats)
+	}
+	return payload, nil
 }
 
 type statusJSON struct {

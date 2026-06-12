@@ -7,6 +7,12 @@ The current build is intentionally local-first: a small CLI, workspace trust,
 scriptable task state, and an interactive terminal that routes the same
 primitives you can call from scripts.
 
+Agents is meant to be the coordination surface even when you launch it from an
+IDE, another coding assistant, or a future MCP client. Those clients should set
+scope, inspect state, and approve boundaries; the configured Agents roles
+should do the implementation and independent review whenever the loop is
+available.
+
 ## Install
 
 From this repository:
@@ -209,6 +215,7 @@ agents runs                     # show recent cleaned run history
 agents runs --follow            # same cleaned activity view as watch
 agents dispatch implementer
 agents dispatch reviewer --json
+agents mcp                      # serve local Agents tools over MCP stdio
 ```
 
 `agents run` manages the implementer/reviewer loop until a stop condition:
@@ -227,6 +234,25 @@ cleaned agent messages, failures, and finish times without duplicating
 findings, verification, decisions, status, or noisy heartbeat output. Use
 `agents watch` while work is active, or `agents runs` to review recent cleaned
 history.
+
+`agents mcp` starts a local stdio MCP server for clients that want to inspect
+and update the same task state without bespoke shell parsing. It exposes tools
+for status, one loop step, recent run activity, handoffs, findings, decisions,
+and archive; it does not add IDE orchestration or bypass existing Agents
+boundaries.
+
+For Agents development itself, prefer letting Agents drive the work:
+
+```bash
+agents go "Update run activity docs"
+agents watch
+agents status
+```
+
+The IDE or assistant you are using can still supervise: clarify scope, add
+decisions or findings, inspect diffs, and approve commits. The normal
+implementation/review path should stay inside the Agents loop so the repo keeps
+durable task history and independent verification.
 
 With `--json-events` the loop runs the same way but stdout becomes a JSONL
 stream of lifecycle events for scripts and frontends: `state_changed` (loop

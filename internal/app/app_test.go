@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"errors"
@@ -6299,6 +6300,213 @@ func TestParseRunArgs(t *testing.T) {
 	if _, err := parseRunArgs([]string{"--nope"}); err == nil {
 		t.Fatal("expected unknown flag to fail")
 	}
+}
+
+func TestMCPInitializeListsRequestedTools(t *testing.T) {
+	var out, errOut bytes.Buffer
+	input := mcpTestFrames(
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`,
+	)
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		return Run([]string{"mcp"}, strings.NewReader(input), &out, &errOut)
+	})
+	if code != 0 {
+		t.Fatalf("Run mcp code=%d stderr=%s", code, errOut.String())
+	}
+	responses := decodeMCPTestResponses(t, out.String())
+	if len(responses) != 2 {
+		t.Fatalf("expected two responses, got %d: %s", len(responses), out.String())
+	}
+	if got := responses[0]["result"].(map[string]any)["serverInfo"].(map[string]any)["name"]; got != "agents" {
+		t.Fatalf("unexpected server name: %v", got)
+	}
+	tools := responses[1]["result"].(map[string]any)["tools"].([]any)
+	names := map[string]bool{}
+	for _, tool := range tools {
+		names[tool.(map[string]any)["name"].(string)] = true
+	}
+	for _, want := range []string{"status", "run_once", "recent_runs", "watch_activity", "add_handoff", "add_finding", "fix_finding", "verify_finding", "add_decision", "archive"} {
+		if !names[want] {
+			t.Fatalf("tools/list missing %s: %+v", want, names)
+		}
+	}
+}
+
+func TestMCPRejectsBareJSONInput(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		return Run([]string{"mcp"}, strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`), &out, &errOut)
+	})
+	if code != 1 {
+		t.Fatalf("expected bare JSON input to fail, code=%d stdout=%s stderr=%s", code, out.String(), errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "missing Content-Length header") {
+		t.Fatalf("expected missing Content-Length error, got %s", errOut.String())
+	}
+}
+
+func TestMCPToolsWrapTaskStateCommands(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"MCP State"}, time.Date(2026, 6, 12, 16, 30, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		input := mcpTestFrames(
+			mcpToolCallLine(1, "add_decision", map[string]any{"text": "MCP wraps CLI state"}),
+			mcpToolCallLine(2, "add_handoff", map[string]any{"to": "reviewer", "text": "Review MCP surface"}),
+			mcpToolCallLine(3, "add_finding", map[string]any{"text": "missing tool test", "severity": "high", "by": "reviewer"}),
+			mcpToolCallLine(4, "status", map[string]any{}),
+			mcpToolCallLine(5, "archive", map[string]any{}),
+		)
+		return Run([]string{"mcp"}, strings.NewReader(input), &out, &errOut)
+	})
+	if code != 0 {
+		t.Fatalf("Run mcp code=%d stderr=%s", code, errOut.String())
+	}
+	responses := decodeMCPTestResponses(t, out.String())
+	statusPayload := decodeMCPToolText(t, responses[3])
+	task := statusPayload["active_task"].(map[string]any)
+	if got := task["records"].(map[string]any)["decisions"]; got != float64(1) {
+		t.Fatalf("expected one decision, got %+v", statusPayload)
+	}
+	if got := task["records"].(map[string]any)["handoffs"]; got != float64(1) {
+		t.Fatalf("expected one handoff, got %+v", statusPayload)
+	}
+	if got := task["findings"].(map[string]any)["open"]; got != float64(1) {
+		t.Fatalf("expected one open finding, got %+v", statusPayload)
+	}
+	archived := decodeMCPToolText(t, responses[4])
+	if got := archived["title"]; got != "MCP State" {
+		t.Fatalf("expected archive tool to archive active task, got %+v", archived)
+	}
+}
+
+func TestMCPFixAndVerifyFinding(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"MCP Findings"}, time.Date(2026, 6, 12, 16, 35, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		finding, err := addFinding(e, []string{"needs fix", "--by", "reviewer"}, time.Date(2026, 6, 12, 16, 36, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		input := mcpTestFrames(
+			mcpToolCallLine(1, "fix_finding", map[string]any{"finding": finding.Path, "evidence": "patched", "by": "implementer"}),
+			mcpToolCallLine(2, "verify_finding", map[string]any{"finding": finding.Path, "evidence": "checked", "by": "reviewer"}),
+		)
+		return Run([]string{"mcp"}, strings.NewReader(input), &out, &errOut)
+	})
+	if code != 0 {
+		t.Fatalf("Run mcp code=%d stderr=%s", code, errOut.String())
+	}
+	responses := decodeMCPTestResponses(t, out.String())
+	verified := decodeMCPToolText(t, responses[1])
+	if got := verified["by"]; got != "reviewer" {
+		t.Fatalf("expected reviewer verification, got %+v", verified)
+	}
+}
+
+func TestMCPRunActivityAndRunOnce(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := trustWorkspace(e); err != nil {
+			t.Fatal(err)
+		}
+		task, err := openTask(e, []string{"MCP Runs"}, time.Date(2026, 6, 12, 16, 40, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		runDir := filepath.Join(cwd, ".agents", task.Path, "runs")
+		if err := os.MkdirAll(runDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := appendRunActivityRecord(filepath.Join(runDir, "run-1.jsonl"), runActivityRecord{Event: "message", Time: "2026-06-12T16:41:00Z", RunID: "run-1", Text: "hello from run"}); err != nil {
+			t.Fatal(err)
+		}
+		input := mcpTestFrames(
+			mcpToolCallLine(1, "recent_runs", map[string]any{}),
+			mcpToolCallLine(2, "watch_activity", map[string]any{}),
+			mcpToolCallLine(3, "run_once", map[string]any{}),
+		)
+		return Run([]string{"mcp"}, strings.NewReader(input), &out, &errOut)
+	})
+	if code != 0 {
+		t.Fatalf("Run mcp code=%d stderr=%s", code, errOut.String())
+	}
+	responses := decodeMCPTestResponses(t, out.String())
+	recent := decodeMCPToolText(t, responses[0])
+	if records := recent["records"].([]any); len(records) != 1 || records[0].(map[string]any)["text"] != "hello from run" {
+		t.Fatalf("unexpected run activity: %+v", recent)
+	}
+	runOnce := decodeMCPToolText(t, responses[2])
+	if got := runOnce["exit_code"]; got != float64(0) {
+		t.Fatalf("expected run_once wrapper to return exit code 0, got %+v", runOnce)
+	}
+	if !strings.Contains(runOnce["stdout"].(string), "agent: not configured for implementer") {
+		t.Fatalf("run_once should wrap existing run output, got %+v", runOnce)
+	}
+}
+
+func mcpToolCallLine(id int, name string, arguments map[string]any) string {
+	data, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      id,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name":      name,
+			"arguments": arguments,
+		},
+	})
+	if err != nil {
+		panic(err)
+	}
+	return string(data)
+}
+
+func mcpTestFrames(messages ...string) string {
+	var b strings.Builder
+	for _, message := range messages {
+		fmt.Fprintf(&b, "Content-Length: %d\r\n\r\n%s", len([]byte(message)), message)
+	}
+	return b.String()
+}
+
+func decodeMCPTestResponses(t *testing.T, output string) []map[string]any {
+	t.Helper()
+	var responses []map[string]any
+	reader := bufio.NewReader(strings.NewReader(output))
+	for {
+		message, err := readMCPMessage(reader)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("MCP response frame should decode: %v\n%s", err, output)
+		}
+		var response map[string]any
+		if err := json.Unmarshal(message, &response); err != nil {
+			t.Fatalf("MCP response should decode: %v\n%s", err, string(message))
+		}
+		responses = append(responses, response)
+	}
+	return responses
+}
+
+func decodeMCPToolText(t *testing.T, response map[string]any) map[string]any {
+	t.Helper()
+	result := response["result"].(map[string]any)
+	content := result["content"].([]any)
+	text := content[0].(map[string]any)["text"].(string)
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(text), &payload); err != nil {
+		t.Fatalf("MCP tool text should decode: %v\n%s", err, text)
+	}
+	return payload
 }
 
 func withTempProcessEnv(t *testing.T, fn func(home, cwd string) int) int {
