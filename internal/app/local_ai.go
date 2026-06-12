@@ -528,9 +528,6 @@ func (r localAIReviewResult) valid() bool {
 		return false
 	}
 	for _, finding := range r.Findings {
-		if strings.TrimSpace(finding.Text) == "" {
-			return false
-		}
 		switch strings.ToLower(strings.TrimSpace(finding.Severity)) {
 		case "", "low", "medium", "high":
 		default:
@@ -567,11 +564,18 @@ func (r localAIReviewResult) normalizedFindings() []localAIReviewFinding {
 func localAIReviewFindingIsClean(finding localAIReviewFinding) bool {
 	text := strings.ToLower(strings.TrimSpace(finding.Text))
 	if text == "" {
-		return false
+		return true
+	}
+	text = strings.Trim(text, ".! \t\r\n")
+	if text == "none" || text == "n/a" {
+		return true
 	}
 	cleanMarkers := []string{
 		"no problems found",
 		"no issues found",
+		"no issues remain",
+		"no issues remained",
+		"no concrete issues",
 		"no findings",
 		"no blocking findings",
 		"no blocking issues",

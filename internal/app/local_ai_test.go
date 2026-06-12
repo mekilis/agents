@@ -38,6 +38,44 @@ func TestParseLocalAIReviewResultExtractsJSON(t *testing.T) {
 	}
 }
 
+func TestLocalAIReviewResultIgnoresNoOpFindings(t *testing.T) {
+	result := localAIReviewResult{
+		Result: "fail",
+		Findings: []localAIReviewFinding{
+			{Text: ""},
+			{Text: "None"},
+			{Text: "No concrete issues remain."},
+			{Text: "No issues remained after the latest changes.", Evidence: "Tests passed."},
+		},
+	}
+	if !result.valid() {
+		t.Fatalf("no-op findings should still be a valid local review result: %+v", result)
+	}
+	if result.blocksReviewer() {
+		t.Fatalf("no-op findings should not block reviewer: %+v", result.normalizedFindings())
+	}
+	if findings := result.normalizedFindings(); len(findings) != 0 {
+		t.Fatalf("expected no normalized findings, got %+v", findings)
+	}
+}
+
+func TestLocalAIReviewResultPreservesRealFindings(t *testing.T) {
+	result := localAIReviewResult{
+		Result: "fail",
+		Findings: []localAIReviewFinding{
+			{Text: "None"},
+			{Text: "unchecked error still returns nil", Evidence: "internal/app/app.go:42"},
+		},
+	}
+	if !result.valid() || !result.blocksReviewer() {
+		t.Fatalf("real finding should remain blocking: %+v", result)
+	}
+	findings := result.normalizedFindings()
+	if len(findings) != 1 || findings[0].Severity != "medium" || findings[0].Text != "unchecked error still returns nil" {
+		t.Fatalf("unexpected normalized findings: %+v", findings)
+	}
+}
+
 func TestParseLocalAICoordinatorAdvisoryExtractsJSON(t *testing.T) {
 	got, err := parseLocalAICoordinatorAdvisory("```json\n{\"summary\":\"inspect scope\",\"notes\":[\"keep roles intact\"],\"questions\":[\"Need more context?\"]}\n```")
 	if err != nil {
