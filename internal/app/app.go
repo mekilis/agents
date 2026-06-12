@@ -89,14 +89,35 @@ type env struct {
 }
 
 type config struct {
-	Roles    map[string]roleConfig
-	Settings agentSettings
+	Roles     map[string]roleConfig
+	Providers map[string]providerConfig
+	Review    reviewConfig
+	Settings  agentSettings
 }
 
-// roleConfig holds who plays a role. Provider is a built-in agent name
-// (cursor, cursor-agent, agent, codex, claude); Cmd is an advanced escape
-// hatch containing {prompt_file}. Model and Reasoning override the global
-// provider settings for this role only.
+// providerConfig holds reusable provider settings. Name is the map key.
+// Provider selects a built-in agent driver when it differs from the key; Cmd is
+// an advanced escape hatch containing {prompt_file}.
+type providerConfig struct {
+	Name      string
+	Type      string
+	Provider  string
+	Model     string
+	Reasoning string
+	Effort    string
+	Cmd       string
+	BaseURL   string
+	Timeout   int
+}
+
+type reviewConfig struct {
+	FirstPass string
+}
+
+// roleConfig holds who plays a role. Provider is a provider-map key or built-in
+// agent name (cursor, cursor-agent, agent, codex, claude); Cmd is an advanced
+// escape hatch containing {prompt_file}. Model and Reasoning override provider
+// settings for this role only.
 type roleConfig struct {
 	Provider  string
 	Model     string
@@ -126,6 +147,7 @@ type agentSettings struct {
 	LocalAIEnabled         bool
 	LocalAIReviewFirstPass bool
 	LocalAIProvider        string
+	LocalAIActor           string
 	LocalAIBaseURL         string
 	LocalAIModel           string
 	LocalAITimeout         int
@@ -388,7 +410,7 @@ func isTerminalReader(r io.Reader) bool {
 }
 
 func readConfig(cwd string) (config, error) {
-	cfg := config{Roles: map[string]roleConfig{}}
+	cfg := config{Roles: map[string]roleConfig{}, Providers: map[string]providerConfig{}}
 	data, err := os.ReadFile(filepath.Join(cwd, stateDir, "config.yml"))
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -397,8 +419,11 @@ func readConfig(cwd string) (config, error) {
 		return cfg, err
 	}
 	inRoles := false
+	inProviders := false
+	inReview := false
 	inSettings := false
 	currentRole := ""
+	currentProvider := ""
 	for _, line := range strings.Split(string(data), "\n") {
 		if strings.TrimSpace(line) == "" || strings.HasPrefix(strings.TrimSpace(line), "#") {
 			continue
@@ -406,14 +431,38 @@ func readConfig(cwd string) (config, error) {
 		trimmedLine := strings.TrimSpace(line)
 		if trimmedLine == "roles:" {
 			inRoles = true
+			inProviders = false
+			inReview = false
 			inSettings = false
 			currentRole = ""
+			currentProvider = ""
+			continue
+		}
+		if trimmedLine == "providers:" {
+			inRoles = false
+			inProviders = true
+			inReview = false
+			inSettings = false
+			currentRole = ""
+			currentProvider = ""
+			continue
+		}
+		if trimmedLine == "review:" {
+			inRoles = false
+			inProviders = false
+			inReview = true
+			inSettings = false
+			currentRole = ""
+			currentProvider = ""
 			continue
 		}
 		if trimmedLine == "settings:" {
 			inRoles = false
+			inProviders = false
+			inReview = false
 			inSettings = true
 			currentRole = ""
+			currentProvider = ""
 			continue
 		}
 		if inRoles {
@@ -465,6 +514,73 @@ func readConfig(cwd string) (config, error) {
 				cfg.Roles[key] = roleConfig{Cmd: value}
 			} else {
 				cfg.Roles[key] = roleConfig{Provider: value}
+			}
+			continue
+		}
+		if inProviders {
+			if !strings.HasPrefix(line, "  ") {
+				inProviders = false
+				currentProvider = ""
+				continue
+			}
+			trimmed := strings.TrimSpace(line)
+			parts := strings.SplitN(trimmed, ":", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			key := strings.TrimSpace(parts[0])
+			value := strings.Trim(strings.TrimSpace(parts[1]), `"`)
+			if strings.HasPrefix(line, "    ") {
+				if currentProvider == "" {
+					continue
+				}
+				pc := cfg.Providers[currentProvider]
+				switch key {
+				case "type":
+					pc.Type = value
+				case "provider":
+					pc.Provider = value
+				case "model":
+					pc.Model = value
+				case "reasoning":
+					pc.Reasoning = value
+				case "effort":
+					pc.Effort = value
+				case "cmd":
+					pc.Cmd = value
+				case "base_url":
+					pc.BaseURL = value
+				case "timeout_ms":
+					n, err := strconv.Atoi(value)
+					if err == nil {
+						pc.Timeout = n
+					}
+				}
+				cfg.Providers[currentProvider] = pc
+				continue
+			}
+			if value == "" {
+				currentProvider = key
+				if _, ok := cfg.Providers[key]; !ok {
+					cfg.Providers[key] = providerConfig{Name: key}
+				}
+			}
+			continue
+		}
+		if inReview {
+			if !strings.HasPrefix(line, "  ") {
+				inReview = false
+				continue
+			}
+			trimmed := strings.TrimSpace(line)
+			parts := strings.SplitN(trimmed, ":", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			key := strings.TrimSpace(parts[0])
+			value := strings.Trim(strings.TrimSpace(parts[1]), `"`)
+			if key == "first_pass" {
+				cfg.Review.FirstPass = value
 			}
 			continue
 		}
@@ -524,6 +640,78 @@ func configuredAgent(cwd, role string) (string, error) {
 	return cfg.Roles[role].agentLabel(), nil
 }
 
+func providerName(pc providerConfig) string {
+	return strings.TrimSpace(pc.Name)
+}
+
+func providerDriver(pc providerConfig) string {
+	if driver := strings.TrimSpace(pc.Provider); driver != "" {
+		return driver
+	}
+	return providerName(pc)
+}
+
+func providerForRole(cfg config, rc roleConfig) (providerConfig, bool) {
+	name := strings.TrimSpace(rc.Provider)
+	if name == "" {
+		return providerConfig{}, false
+	}
+	pc, ok := cfg.Providers[name]
+	if !ok {
+		return providerConfig{Name: name}, false
+	}
+	if strings.TrimSpace(pc.Name) == "" {
+		pc.Name = name
+	}
+	return pc, true
+}
+
+func providerSettings(pc providerConfig, settings agentSettings) agentSettings {
+	effective := settings
+	model := strings.TrimSpace(pc.Model)
+	reasoning := firstNonEmpty(pc.Reasoning, pc.Effort)
+	switch strings.ToLower(providerDriver(pc)) {
+	case "codex":
+		if model != "" {
+			effective.CodexModel = model
+		}
+		if reasoning != "" {
+			effective.CodexReasoning = reasoning
+		}
+	case "claude":
+		if model != "" {
+			effective.ClaudeModel = model
+		}
+		if reasoning != "" {
+			effective.ClaudeEffort = reasoning
+		}
+	case "cursor", "cursor-agent", "agent":
+		if model != "" {
+			effective.CursorModel = model
+		}
+	default:
+		if model != "" {
+			effective.Model = model
+		}
+		if reasoning != "" {
+			effective.Reasoning = reasoning
+		}
+	}
+	if strings.TrimSpace(pc.BaseURL) != "" {
+		effective.LocalAIBaseURL = strings.TrimSpace(pc.BaseURL)
+	}
+	if model != "" {
+		effective.LocalAIModel = model
+	}
+	if pc.Timeout > 0 {
+		effective.LocalAITimeout = pc.Timeout
+	}
+	if providerName(pc) != "" {
+		effective.LocalAIProvider = providerName(pc)
+	}
+	return effective
+}
+
 // roleSettings overlays a role's model/reasoning overrides onto the global
 // provider settings so command construction and run markers see one view.
 func roleSettings(rc roleConfig, settings agentSettings) agentSettings {
@@ -558,6 +746,22 @@ func roleSettings(rc roleConfig, settings agentSettings) agentSettings {
 		}
 	}
 	return effective
+}
+
+func resolvedRole(cfg config, rc roleConfig) (roleConfig, agentSettings) {
+	resolved := rc
+	effective := cfg.Settings
+	if pc, ok := providerForRole(cfg, rc); ok {
+		effective = providerSettings(pc, effective)
+		if strings.TrimSpace(resolved.Cmd) == "" {
+			resolved.Cmd = pc.Cmd
+		}
+		if strings.TrimSpace(resolved.Provider) != "" {
+			resolved.Provider = providerDriver(pc)
+		}
+	}
+	effective = roleSettings(resolved, effective)
+	return resolved, effective
 }
 
 // resolveRoleCommand resolves the shell command template for a configured
@@ -2448,18 +2652,18 @@ settings:
   # Cursor Agent: run 'agent models' or 'cursor-agent --list-models' for account-specific choices
   # Common examples from CLI help: gpt-5, claude-4.6-sonnet-medium, claude-4.6-sonnet-medium-thinking
   cursor_model: ""
-  # Optional local AI for ambiguous coordinator chat routing and reviewer preflight.
-  # LM Studio: base URL http://127.0.0.1:1234/v1, provider lmstudio.
-  # Ollama: base URL http://127.0.0.1:11434/v1, provider ollama.
-  local_ai_enabled: false
-  # When true, local AI reviews before the configured reviewer. Findings skip
-  # the remote reviewer and route back to implementer; clean local review still
-  # continues to the configured reviewer as the final gate.
-  local_ai_review_first_pass: false
-  local_ai_provider: lmstudio
-  local_ai_base_url: http://127.0.0.1:1234/v1
-  local_ai_model: google/gemma-3-4b
-  local_ai_timeout_ms: 800
+providers:
+  # Local OpenAI-compatible providers can coordinate or run first-pass review.
+  # LM Studio: base URL http://127.0.0.1:1234/v1.
+  # Ollama: base URL http://127.0.0.1:11434/v1.
+  lmstudio:
+    type: openai_compatible
+    base_url: http://127.0.0.1:1234/v1
+    model: google/gemma-3-4b
+    timeout_ms: 800
+review:
+  # Optional first-pass reviewer. Example: lmstudio.
+  first_pass: ""
 # Each role is a provider name (cursor, cursor-agent, agent, codex, claude)
 # or a map with provider plus optional model/reasoning overrides:
 #   reviewer:
@@ -4279,9 +4483,10 @@ func dispatchPacket(e env, role string) (dispatchInfo, error) {
 		return dispatchInfo{}, err
 	}
 	rc := config.Roles[role]
+	resolved, effective := resolvedRole(config, rc)
 	info := dispatchInfo{
 		Role:  role,
-		Agent: agentDescriptor(rc.agentLabel(), roleSettings(rc, config.Settings)),
+		Agent: agentDescriptor(resolved.agentLabel(), effective),
 		Task:  state.Task,
 		Stats: state.Stats,
 	}
@@ -4386,10 +4591,14 @@ func runConfiguredRoleWithOptions(e env, state loopState, options roleRunOptions
 	if !rc.configured() {
 		return roleRunResult{}, fmt.Errorf("no agent configured for %s", state.NextRole)
 	}
-	if handled, result, err := runLocalAIFirstPassReview(e, state, config.Settings, options); handled || err != nil {
+	if handled, result, err := runLocalAIFirstPassReview(e, state, config, options); handled || err != nil {
 		return result, err
 	}
-	commandTemplate, agent, effectiveSettings, err := resolveRoleCommand(rc, config.Settings)
+	resolved, settings := resolvedRole(config, rc)
+	if localAIProviderRole(resolved, settings) {
+		return runLocalAIConfiguredRole(e, state, resolved, settings, options)
+	}
+	commandTemplate, agent, effectiveSettings, err := resolveRoleCommand(resolved, settings)
 	if err != nil {
 		return roleRunResult{}, err
 	}

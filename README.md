@@ -238,43 +238,42 @@ tail -f .agents/runs/logs/2026-06-05T120000Z-implementer.log
 ```
 
 ```yaml
+providers:
+  lmstudio:
+    type: openai_compatible
+    base_url: http://127.0.0.1:1234/v1
+    model: google/gemma-3-4b
+    timeout_ms: 800
+  codex:
+    model: gpt-5.5
+    reasoning: low
+  claude:
+    model: ""
+    effort: high
+  cursor:
+    model: gpt-5
 roles:
   implementer: cursor
-  # A role can also be a map with per-role model/reasoning overrides:
+  coordinator: lmstudio
+  # A role can also be a map with per-role overrides:
   reviewer:
     provider: codex
-    model: gpt-5.5
     reasoning: high
-  coordinator: codex
-settings:
-  # Codex CLI:
-  #   models: use `codex -m <model>` / `/model`; examples: gpt-5.5, gpt-5.4,
-  #           gpt-5-codex, codex-mini-latest
-  #   reasoning: minimal, low, medium, high, xhigh
-  codex_model: gpt-5.5
-  codex_reasoning: low
-
-  # Claude Code:
-  #   model names and aliases change by account and CLI version.
-  #   Run `claude --help` or use Claude's in-app model controls for current choices.
-  #   effort examples: low, medium, high, xhigh, max
-  #   note: supported effort levels depend on the selected Claude model.
-  claude_model: ""
-  claude_effort: high
-
-  # Cursor Agent:
-  #   run `agent models` or `cursor-agent --list-models` for account-specific
-  #   choices; current examples from CLI help include gpt-5,
-  #   claude-4.6-sonnet-medium, claude-4.6-sonnet-medium-thinking.
-  cursor_model: gpt-5
+review:
+  first_pass: lmstudio
 ```
 
-Provider-specific settings are passed only to that provider's built-in command:
-`codex_*` to `codex`, `claude_*` to `claude`, and `cursor_model` to
-`agent`/`cursor-agent`. Per-role `model`/`reasoning` values override the global
-settings for that role only. Leave a setting empty to use the provider default,
-set `cmd: my-agent {prompt_file}` as an advanced escape hatch, or put provider
-flags directly in a custom role command.
+Providers are named by who runs them or how Agents reaches them. Built-in
+provider names are `cursor`, `cursor-agent`, `agent`, `codex`, and `claude`;
+local OpenAI-compatible providers such as `lmstudio` and `ollama` can be used
+for coordinator preflight and `review.first_pass`. Models and provider-specific
+settings live under `providers`; use `type: openai_compatible` for local chat
+completion servers. Per-role `model`/`reasoning` values override the named
+provider for that role only. Set `cmd: my-agent {prompt_file}` as an advanced
+escape hatch, or put provider flags directly in a custom role command.
+Legacy `settings.local_ai_*`, `settings.codex_*`, `settings.claude_*`, and
+`settings.cursor_model` keys still work, but new config should prefer
+`providers` and explicit `review.first_pass`.
 
 ```bash
 agents archive

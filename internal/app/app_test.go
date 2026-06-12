@@ -3526,6 +3526,56 @@ func TestLocalAISettingsDoNotReplaceCoordinatorRole(t *testing.T) {
 	}
 }
 
+func TestReadConfigParsesProviderMapAndReviewFirstPass(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".agents"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgText := strings.Join([]string{
+		"providers:",
+		"  lmstudio:",
+		"    type: openai_compatible",
+		"    base_url: http://127.0.0.1:1234/v1",
+		"    model: google/gemma-3-4b",
+		"    timeout_ms: 900",
+		"  reviewer-codex:",
+		"    provider: codex",
+		"    model: gpt-5.5",
+		"    reasoning: high",
+		"roles:",
+		"  coordinator: lmstudio",
+		"  reviewer: reviewer-codex",
+		"review:",
+		"  first_pass: lmstudio",
+		"",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(dir, ".agents", "config.yml"), []byte(cfgText), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := readConfig(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Review.FirstPass != "lmstudio" {
+		t.Fatalf("unexpected review config: %+v", cfg.Review)
+	}
+	if got := cfg.Providers["lmstudio"]; got.Type != "openai_compatible" || got.BaseURL != "http://127.0.0.1:1234/v1" || got.Model != "google/gemma-3-4b" || got.Timeout != 900 {
+		t.Fatalf("unexpected lmstudio provider: %+v", got)
+	}
+	reviewer, settings := resolvedRole(cfg, cfg.Roles["reviewer"])
+	if reviewer.Provider != "codex" {
+		t.Fatalf("reviewer provider did not resolve through provider map: %+v", reviewer)
+	}
+	if settings.CodexModel != "gpt-5.5" || settings.CodexReasoning != "high" {
+		t.Fatalf("unexpected resolved reviewer settings: %+v", settings)
+	}
+	firstPass, ok := firstPassReviewSettings(cfg)
+	if !ok || firstPass.LocalAIProvider != "lmstudio" || firstPass.LocalAIActor != "lmstudio" ||
+		firstPass.LocalAIBaseURL != "http://127.0.0.1:1234/v1" || firstPass.LocalAIModel != "google/gemma-3-4b" {
+		t.Fatalf("unexpected first-pass settings ok=%v settings=%+v", ok, firstPass)
+	}
+}
+
 func TestReviewerPromptDoesNotIncludeLocalAIReviewNotes(t *testing.T) {
 	code := withTempProcessEnv(t, func(home, cwd string) int {
 		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
@@ -3607,6 +3657,92 @@ func TestLocalAIFirstPassFindingsSkipConfiguredReviewer(t *testing.T) {
 			t.Fatal(err)
 		}
 		cfg := strings.Join([]string{
+			"providers:",
+			"  lmstudio:",
+			"    base_url: http://127.0.0.1:1234/v1",
+			"    model: google/gemma-3-4b",
+			"    timeout_ms: 700",
+			"review:",
+			"  first_pass: lmstudio",
+			"settings:",
+			"  local_ai_enabled: true",
+			"  local_ai_review_first_pass: true",
+			"  local_ai_provider: legacy",
+			"  local_ai_base_url: http://127.0.0.1:9999/v1",
+			"  local_ai_model: legacy-model",
+			"roles:",
+			"  reviewer: " + reviewer + " {prompt_file}",
+			"",
+		}, "\n")
+		if err := os.WriteFile(filepath.Join(cwd, ".agents", "config.yml"), []byte(cfg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		state, err := analyzeLoopState(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var live bytes.Buffer
+		result, err := runConfiguredRole(e, state, &live)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !result.AgentSkipped || result.Agent != "lmstudio" || result.After.NextRole != "implementer" || result.After.Stats.FindingsOpen != 1 {
+			t.Fatalf("unexpected local first-pass result: %+v", result)
+		}
+		if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("configured reviewer should not run, stat err=%v", err)
+		}
+		if !strings.Contains(live.String(), "Local AI first-pass found 1 finding") {
+			t.Fatalf("missing local first-pass output:\n%s", live.String())
+		}
+		findings, err := filepath.Glob(filepath.Join(cwd, ".agents", "tasks", "*", "findings", "*.md"))
+		if err != nil || len(findings) != 1 {
+			t.Fatalf("expected one finding, got %v err=%v", findings, err)
+		}
+		data, err := os.ReadFile(findings[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, want := range []string{"Created by: lmstudio", "Agent: lmstudio (model google/gemma-3-4b)", "Severity: high", "Evidence:"} {
+			if !strings.Contains(string(data), want) {
+				t.Fatalf("finding missing %q:\n%s", want, string(data))
+			}
+		}
+		if strings.Contains(string(data), "legacy-model") {
+			t.Fatalf("new review.first_pass provider should override legacy settings:\n%s", string(data))
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
+func TestLegacyLocalAIFirstPassFindingsSkipConfiguredReviewer(t *testing.T) {
+	old := runFirstPassReviewWithLocalAI
+	defer func() { runFirstPassReviewWithLocalAI = old }()
+	runFirstPassReviewWithLocalAI = func(settings agentSettings, input string) (localAIReviewResult, error) {
+		return localAIReviewResult{
+			Result: "fail",
+			Findings: []localAIReviewFinding{{
+				Text: "legacy local first-pass issue",
+			}},
+		}, nil
+	}
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Legacy Local Review"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addHandoff(e, []string{"--to", "reviewer", "Ready for review."}, time.Date(2026, 6, 5, 10, 1, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		marker := filepath.Join(cwd, "remote-reviewer-ran")
+		reviewer := filepath.Join(cwd, "reviewer.sh")
+		if err := os.WriteFile(reviewer, []byte("#!/bin/sh\ntouch "+shellQuote(marker)+"\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cfg := strings.Join([]string{
 			"settings:",
 			"  local_ai_enabled: true",
 			"  local_ai_review_first_pass: true",
@@ -3646,7 +3782,7 @@ func TestLocalAIFirstPassFindingsSkipConfiguredReviewer(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, want := range []string{"Created by: local-ai", "Agent: lmstudio (model google/gemma-3-4b)", "Severity: high", "Evidence:"} {
+		for _, want := range []string{"Created by: local-ai", "Agent: lmstudio (model google/gemma-3-4b)", "Severity: medium"} {
 			if !strings.Contains(string(data), want) {
 				t.Fatalf("finding missing %q:\n%s", want, string(data))
 			}

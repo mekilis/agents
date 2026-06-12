@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -115,8 +117,106 @@ func localAIFirstPassReviewEnabled(settings agentSettings) bool {
 	return localAIConfigured(settings) && settings.LocalAIReviewFirstPass
 }
 
-func runLocalAIFirstPassReview(e env, state loopState, settings agentSettings, options roleRunOptions) (bool, roleRunResult, error) {
-	if state.NextRole != "reviewer" || !localAIFirstPassReviewEnabled(settings) {
+func localAIProviderRole(rc roleConfig, settings agentSettings) bool {
+	if strings.TrimSpace(rc.Cmd) != "" || !localAIConfigured(settings) {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(rc.Provider)) {
+	case "cursor", "cursor-agent", "agent", "codex", "claude":
+		return false
+	}
+	return strings.TrimSpace(rc.Provider) != ""
+}
+
+func runLocalAIConfiguredRole(e env, state loopState, rc roleConfig, settings agentSettings, options roleRunOptions) (roleRunResult, error) {
+	prompt, err := buildRolePrompt(e, state)
+	if err != nil {
+		return roleRunResult{}, err
+	}
+	artifacts, err := writePromptFile(e.cwd, state.NextRole, prompt)
+	if err != nil {
+		return roleRunResult{}, err
+	}
+	live := options.LiveOutput
+	if live == nil {
+		live = io.Discard
+	}
+	agent := strings.TrimSpace(rc.Provider)
+	agentDesc := agentDescriptor(agent, settings)
+	if options.Events != nil {
+		options.Events(loopEvent{Event: "run_started", RunID: artifacts.ID, Role: state.NextRole, Agent: agentDesc})
+	}
+	failRun := func(err error) (roleRunResult, error) {
+		if options.Events != nil {
+			options.Events(loopEvent{Event: "run_finished", RunID: artifacts.ID, Role: state.NextRole, Agent: agentDesc, Error: err.Error()})
+		}
+		return roleRunResult{}, err
+	}
+	if options.ShowRunHeader {
+		fmt.Fprintf(live, "run id: %s\n", artifacts.ID)
+		fmt.Fprintf(live, "run log: %s\n\n", relPathFrom(e.cwd, artifacts.Log))
+	}
+	output, err := localAIChat(settings, "You are the configured Agents "+state.NextRole+". Follow the user prompt exactly and return the role response.", prompt)
+	if err != nil {
+		return failRun(fmt.Errorf("%s provider %q failed: %w", state.NextRole, agent, err))
+	}
+	if err := os.MkdirAll(filepath.Dir(artifacts.Log), 0o755); err != nil {
+		return failRun(err)
+	}
+	if err := os.WriteFile(artifacts.Log, []byte(output), 0o644); err != nil {
+		return failRun(err)
+	}
+	fmt.Fprint(live, output)
+	if !strings.HasSuffix(output, "\n") {
+		fmt.Fprintln(live)
+	}
+	directiveEnv := e
+	directiveEnv.actor = state.NextRole
+	directiveEnv.agentDesc = agentDesc
+	output, err = applyRoleOutputDirectives(directiveEnv, state.NextRole, output)
+	if err != nil {
+		return failRun(err)
+	}
+	after, err := analyzeLoopState(e)
+	if err != nil {
+		return failRun(err)
+	}
+	if options.Events != nil {
+		options.Events(loopEvent{Event: "run_finished", RunID: artifacts.ID, Role: state.NextRole, Agent: agentDesc, State: statePayload(after)})
+	}
+	return roleRunResult{
+		RunID:       artifacts.ID,
+		Role:        state.NextRole,
+		Agent:       agent,
+		AgentDesc:   agentDesc,
+		PromptPath:  artifacts.Prompt,
+		LogPath:     artifacts.Log,
+		Before:      state,
+		After:       after,
+		AgentOutput: output,
+	}, nil
+}
+
+func firstPassReviewSettings(cfg config) (agentSettings, bool) {
+	if name := strings.TrimSpace(cfg.Review.FirstPass); name != "" {
+		pc, ok := cfg.Providers[name]
+		if !ok {
+			return agentSettings{}, false
+		}
+		if strings.TrimSpace(pc.Name) == "" {
+			pc.Name = name
+		}
+		settings := providerSettings(pc, cfg.Settings)
+		settings.LocalAIEnabled = true
+		settings.LocalAIActor = name
+		return settings, localAIConfigured(settings)
+	}
+	return cfg.Settings, localAIFirstPassReviewEnabled(cfg.Settings)
+}
+
+func runLocalAIFirstPassReview(e env, state loopState, cfg config, options roleRunOptions) (bool, roleRunResult, error) {
+	settings, enabled := firstPassReviewSettings(cfg)
+	if state.NextRole != "reviewer" || !enabled {
 		return false, roleRunResult{}, nil
 	}
 	live := options.LiveOutput
@@ -136,7 +236,7 @@ func runLocalAIFirstPassReview(e env, state loopState, settings agentSettings, o
 	if review.blocksReviewer() {
 		result := roleRunResult{
 			Role:         state.NextRole,
-			Agent:        "local-ai",
+			Agent:        localAIAgentName(settings),
 			AgentDesc:    agentDesc,
 			Before:       state,
 			AgentSkipped: true,
@@ -147,14 +247,14 @@ func runLocalAIFirstPassReview(e env, state loopState, settings agentSettings, o
 			fmt.Fprintf(&output, "%s\n", summary)
 		}
 		localEnv := e
-		localEnv.actor = "local-ai"
+		localEnv.actor = localAIAgentName(settings)
 		localEnv.agentDesc = agentDesc
 		for _, finding := range review.normalizedFindings() {
 			text := "Local AI first-pass: " + finding.Text
 			if evidence := strings.TrimSpace(finding.Evidence); evidence != "" {
 				text += "\nEvidence: " + evidence
 			}
-			if _, err := addFinding(localEnv, []string{text, "--severity", finding.Severity, "--by", "local-ai"}, time.Now().UTC()); err != nil {
+			if _, err := addFinding(localEnv, []string{text, "--severity", finding.Severity, "--by", localAIAgentName(settings)}, time.Now().UTC()); err != nil {
 				return true, result, err
 			}
 		}
@@ -400,4 +500,11 @@ func localAIAgentDescriptor(settings agentSettings) string {
 		provider = "local-ai"
 	}
 	return fmt.Sprintf("%s (model %s)", provider, settingOrDefault(settings.LocalAIModel))
+}
+
+func localAIAgentName(settings agentSettings) string {
+	if actor := strings.TrimSpace(settings.LocalAIActor); actor != "" {
+		return actor
+	}
+	return "local-ai"
 }

@@ -8,27 +8,19 @@ storage:
     archived_summaries: true
     decisions: promoted_only
     findings: unresolved_only
-settings:
-  # Codex CLI: model examples: gpt-5.5, gpt-5.4, gpt-5-codex, codex-mini-latest
-  # Codex reasoning examples: minimal, low, medium, high, xhigh
-  codex_model: "gpt-5.5"
-  codex_reasoning: ""
-  # Claude Code: model names and aliases vary by account and CLI version.
-  # Run 'claude --help' or use Claude's in-app model controls for current choices.
-  # Claude effort: low, medium, high, xhigh, max; supported levels depend on the selected model.
-  claude_model: ""
-  claude_effort: ""
-  # Cursor Agent: run 'agent models' or 'cursor-agent --list-models' for account-specific choices
-  # Common examples from CLI help: gpt-5, claude-4.6-sonnet-medium, claude-4.6-sonnet-medium-thinking
-  cursor_model: "gpt-5.5-low"
-  # Local AI currently powers lightweight coordinator routing and reviewer preflight.
-  # LM Studio serves OpenAI-compatible chat completions at http://127.0.0.1:1234/v1.
-  local_ai_enabled: true
-  local_ai_review_first_pass: true
-  local_ai_provider: lmstudio
-  local_ai_base_url: http://127.0.0.1:1234/v1
-  local_ai_model: openai/gpt-oss-20b
-  local_ai_timeout_ms: 30000
+providers:
+  lmstudio:
+    type: openai_compatible
+    base_url: http://127.0.0.1:1234/v1
+    model: openai/gpt-oss-20b
+    timeout_ms: 30000
+  codex:
+    model: gpt-5.5
+    reasoning: low
+  agent:
+    model: gpt-5.5-low
+review:
+  first_pass: lmstudio
 # Each role is a provider name (cursor, cursor-agent, agent, codex, claude)
 # or a map with provider plus optional model/reasoning overrides:
 #   reviewer:
@@ -38,9 +30,5 @@ settings:
 # Advanced escape hatch: a cmd template containing {prompt_file}.
 roles:
   implementer: agent
-  reviewer:
-    provider: codex
-    reasoning: low
-  coordinator:
-    provider: codex
-    reasoning: low
+  reviewer: codex
+  coordinator: codex
