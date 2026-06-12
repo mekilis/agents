@@ -186,6 +186,23 @@ agents task status "Fix implemented; regression test added; awaiting review"
 agents task next "Reviewer verifies the expired-card path"
 ```
 
+Keep an approved implementation plan with the task when the work needs a
+planning boundary:
+
+```bash
+agents plan revise "1. Add the CLI flag\n2. Update tests\n3. Refresh docs"
+agents plan show
+agents plan approve
+agents plan clear
+```
+
+The canonical plan lives at `.agents/tasks/<task>/plan.md`. Runs may mention
+plan updates, but durable plan content belongs to the task. A draft or stale
+plan routes the loop to the coordinator for approval or revision before Agents
+runs the implementer. Reviewers inspect the current task plan as part of review
+and should record findings when the implementation does not match the plan, or
+when the plan is stale, missing, or incorrect for the work under review.
+
 Record coordination state:
 
 ```bash
@@ -384,6 +401,7 @@ Interactive slash commands available today:
 /task open "title" [--ref REF]
 /task use <task>
 /task scope|status|next "text"
+/plan show|revise|approve|clear ...
 /decision add "text"
 /handoff --to ROLE "text"
 /finding add|fix|verify ...

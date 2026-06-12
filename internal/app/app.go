@@ -60,6 +60,7 @@ var interactiveSlashCommands = []slashCommandSpec{
 	{Name: "/trust", Usage: "/trust", Description: "Trust this workspace"},
 	{Name: "/init", Usage: "/init [--share|--local]", Description: "Initialize Agents task state"},
 	{Name: "/task", Usage: `/task open|use|scope|status|next ...`, Description: "Open, switch, or update the active task"},
+	{Name: "/plan", Usage: `/plan show|revise|approve|clear ...`, Description: "Manage the active task plan"},
 	{Name: "/decision", Usage: `/decision add "text"`, Description: "Record a planning decision"},
 	{Name: "/handoff", Usage: `/handoff --to ROLE "text"`, Description: "Route context to another role"},
 	{Name: "/finding", Usage: "/finding add|fix|verify ...", Description: "Track review findings"},
@@ -274,6 +275,8 @@ func runOneShot(args []string, in io.Reader, out, errOut io.Writer, e env) int {
 		return runMCPCommand(args[1:], in, out, errOut, e)
 	case "task":
 		return runTaskCommand(args[1:], out, errOut, e)
+	case "plan":
+		return runPlanCommand(args[1:], out, errOut, e)
 	case "decision":
 		return runDecisionCommand(args[1:], out, errOut, e)
 	case "handoff":
@@ -898,6 +901,7 @@ func printHelp(w io.Writer) {
 	fmt.Fprintln(w, "  agents task open \"title\" [--ref REF]")
 	fmt.Fprintln(w, "  agents task use <task>")
 	fmt.Fprintln(w, "  agents task scope|status|next \"text\"")
+	fmt.Fprintln(w, "  agents plan show|revise|approve|clear ...")
 	fmt.Fprintln(w, "  agents decision add \"text\" [--by ACTOR]")
 	fmt.Fprintln(w, "  agents handoff --to ROLE \"text\" [--by ACTOR]")
 	fmt.Fprintln(w, "  agents finding add \"text\" [--severity low|medium|high] [--by ACTOR]")
@@ -2443,6 +2447,7 @@ type taskJSON struct {
 	Path     string       `json:"path"`
 	Missing  bool         `json:"missing,omitempty"`
 	Next     string       `json:"next,omitempty"`
+	Plan     string       `json:"plan,omitempty"`
 	Findings findingsJSON `json:"findings"`
 	Records  recordsJSON  `json:"records"`
 }
@@ -2498,6 +2503,7 @@ func taskPayload(task activeTask, stats taskStats) *taskJSON {
 		Path:    task.Path,
 		Missing: task.Missing,
 		Next:    stats.Next,
+		Plan:    stats.PlanState,
 		Findings: findingsJSON{
 			Open:     stats.FindingsOpen,
 			Fixed:    stats.FindingsFixed,
@@ -2579,6 +2585,7 @@ type activeTask struct {
 
 type taskStats struct {
 	Next             string
+	PlanState        string
 	Decisions        int
 	Handoffs         int
 	LatestHandoffTo  string
@@ -2853,6 +2860,10 @@ func readTaskStats(cwd, activePath string) (taskStats, error) {
 	if err != nil {
 		return taskStats{}, err
 	}
+	planState, err := planStateForStats(cwd, activePath, latestHandoffName)
+	if err != nil {
+		return taskStats{}, err
+	}
 	verificationPass, verificationFail, latestVerificationName, err := readVerificationStats(filepath.Join(taskDir, "verification"))
 	if err != nil {
 		return taskStats{}, err
@@ -2867,6 +2878,7 @@ func readTaskStats(cwd, activePath string) (taskStats, error) {
 	}
 	return taskStats{
 		Next:                   next,
+		PlanState:              planState,
 		Decisions:              decisions,
 		Handoffs:               handoffs,
 		LatestHandoffTo:        latestHandoffTo,
@@ -2936,6 +2948,9 @@ func printTaskStats(w io.Writer, stats taskStats) {
 func printTaskStatsWithOptions(w io.Writer, stats taskStats, includeNext bool) {
 	if includeNext && stats.Next != "" {
 		fmt.Fprintf(w, "next: %s\n", stats.Next)
+	}
+	if stats.PlanState != "" {
+		fmt.Fprintf(w, "plan: %s\n", stats.PlanState)
 	}
 	fmt.Fprintf(w, "findings: open=%d fixed=%d verified=%d\n", stats.FindingsOpen, stats.FindingsFixed, stats.FindingsVerified)
 	if stats.VerificationFail > 0 {
@@ -4755,7 +4770,21 @@ func analyzeLoopState(e env) (loopState, error) {
 		state.NextRole = "implementer"
 		state.NextAction = "start or continue implementation"
 	}
+	if state.NextRole == "implementer" && planRequiresApproval(stats.PlanState) {
+		state.NextRole = "coordinator"
+		state.NextAction = "approve or revise plan before implementation"
+		state.Boundary = "plan approval required"
+	}
 	return state, nil
+}
+
+func planRequiresApproval(state string) bool {
+	switch state {
+	case planStateDraft, planStateStale:
+		return true
+	default:
+		return false
+	}
 }
 
 // verificationCurrent reports whether passing verification evidence exists
@@ -5827,6 +5856,7 @@ func buildRolePrompt(e env, state loopState) (string, error) {
 		appendPromptFile(&b, e.cwd, state.Task.Path, "scope.md", "Scope")
 		appendPromptFile(&b, e.cwd, state.Task.Path, "status.md", "Status")
 		appendPromptFile(&b, e.cwd, state.Task.Path, "next.md", "Next")
+		appendPromptFile(&b, e.cwd, state.Task.Path, "plan.md", "Plan")
 		appendPromptDir(&b, e.cwd, state.Task.Path, "handoffs", "Handoffs")
 		appendPromptDir(&b, e.cwd, state.Task.Path, "decisions", "Decisions")
 		appendPromptDir(&b, e.cwd, state.Task.Path, "findings", "Findings")
@@ -5852,11 +5882,13 @@ func buildRolePrompt(e env, state loopState) (string, error) {
 		fmt.Fprintf(&b, "Task: %s\nPath: %s\nNext action: %s\n\n", state.Task.Title, state.Task.Path, state.NextAction)
 		appendPromptFile(&b, e.cwd, state.Task.Path, "scope.md", "Scope")
 		appendPromptFile(&b, e.cwd, state.Task.Path, "status.md", "Status")
+		appendPromptFile(&b, e.cwd, state.Task.Path, "plan.md", "Plan")
 		appendPromptDir(&b, e.cwd, state.Task.Path, "handoffs", "Handoffs")
 		appendPromptDir(&b, e.cwd, state.Task.Path, "findings", "Findings")
 		appendPromptDir(&b, e.cwd, state.Task.Path, "verification", "Verification")
 		fmt.Fprintln(&b, "Working agreement:")
 		fmt.Fprintln(&b, "- Review the working tree, tests, and task chunks; verify claims against the code, not the handoff text.")
+		fmt.Fprintln(&b, "- Review the current task plan in `plan.md` when present. Check whether the implementation and review scope match the approved or draft plan, and record findings for stale, missing, or incorrect plans.")
 		fmt.Fprintln(&b, "- Emit brief JSON progress updates for the interactive UI when phases change:")
 		fmt.Fprintln(&b, "  ```agents-progress")
 		fmt.Fprintln(&b, `  {"status":"Running checks","detail":"Verifying tests and reviewing the diff"}`)

@@ -3083,6 +3083,85 @@ func TestRunRoutesHandoffToImplementerToImplementer(t *testing.T) {
 	}
 }
 
+func TestPlanReviseShowApproveAndClear(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Plan Task"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if code := Run([]string{"plan", "revise", "1. Update CLI\n2. Add tests"}, bytes.NewBuffer(nil), &out, &errOut); code != 0 {
+			t.Fatalf("plan revise code=%d stderr=%s", code, errOut.String())
+		}
+		if code := Run([]string{"plan", "show"}, bytes.NewBuffer(nil), &out, &errOut); code != 0 {
+			t.Fatalf("plan show code=%d stderr=%s", code, errOut.String())
+		}
+		if code := Run([]string{"plan", "approve"}, bytes.NewBuffer(nil), &out, &errOut); code != 0 {
+			t.Fatalf("plan approve code=%d stderr=%s", code, errOut.String())
+		}
+		status, err := statusPayload(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status.ActiveTask == nil || status.ActiveTask.Plan != "approved" {
+			t.Fatalf("expected approved plan in status JSON, got %+v", status.ActiveTask)
+		}
+		if code := Run([]string{"plan", "clear"}, bytes.NewBuffer(nil), &out, &errOut); code != 0 {
+			t.Fatalf("plan clear code=%d stderr=%s", code, errOut.String())
+		}
+		plan, err := readActiveTaskPlan(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if plan.State != planStateMissing {
+			t.Fatalf("expected missing plan after clear, got %+v", plan)
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+	got := out.String()
+	for _, want := range []string{"plan: draft", "plan: approved", "cleared: tasks/"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("plan output missing %q, got:\n%s", want, got)
+		}
+	}
+}
+
+func TestDraftPlanRoutesImplementerHandoffToCoordinator(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := trustWorkspace(e); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := openTask(e, []string{"Plan Boundary"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addHandoff(e, []string{"--to", "implementer", "Build it."}, time.Date(2026, 6, 5, 10, 1, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writeActiveTaskPlan(e, []string{"Draft plan that needs approval."}, planStateDraft); err != nil {
+			t.Fatal(err)
+		}
+		return Run([]string{"run", "--json"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code != 0 {
+		t.Fatalf("Run run --json code=%d stderr=%s", code, errOut.String())
+	}
+	var got loopJSON
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatalf("run JSON should decode: %v\n%s", err, out.String())
+	}
+	if got.NextRole != "coordinator" || got.NextAction != "approve or revise plan before implementation" || got.Boundary != "plan approval required" {
+		t.Fatalf("unexpected loop state: %+v", got)
+	}
+	if got.Task == nil || got.Task.Plan != "draft" {
+		t.Fatalf("expected draft plan in loop JSON, got %+v", got.Task)
+	}
+}
+
 func TestRunRoutesHandoffToCoordinatorToCoordinator(t *testing.T) {
 	var out, errOut bytes.Buffer
 	code := withTempProcessEnv(t, func(home, cwd string) int {
@@ -3730,7 +3809,7 @@ func TestReadConfigParsesReviewerBlockListForConfiguredAgent(t *testing.T) {
 	}
 }
 
-func TestReviewerPromptDoesNotIncludeLocalAIReviewNotes(t *testing.T) {
+func TestReviewerPromptIncludesPlanReviewInstructionsAndOmitsLocalAIReviewNotes(t *testing.T) {
 	code := withTempProcessEnv(t, func(home, cwd string) int {
 		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
 		task, err := openTask(e, []string{"Review Notes"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
@@ -3738,6 +3817,9 @@ func TestReviewerPromptDoesNotIncludeLocalAIReviewNotes(t *testing.T) {
 			t.Fatal(err)
 		}
 		if _, err := addHandoff(e, []string{"--to", "reviewer", "Review the changed CLI behavior."}, time.Date(2026, 6, 5, 10, 1, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writeActiveTaskPlan(e, []string{"Approved plan for the reviewer to inspect."}, planStateApproved); err != nil {
 			t.Fatal(err)
 		}
 		cfgText := strings.Join([]string{
@@ -3760,7 +3842,16 @@ func TestReviewerPromptDoesNotIncludeLocalAIReviewNotes(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, want := range []string{"Review the changed CLI behavior.", "Working agreement:"} {
+		for _, want := range []string{
+			"Review the changed CLI behavior.",
+			"## Plan",
+			"State: approved",
+			"Approved plan for the reviewer to inspect.",
+			"Review the current task plan in `plan.md` when present.",
+			"implementation and review scope match the approved or draft plan",
+			"record findings for stale, missing, or incorrect plans",
+			"Working agreement:",
+		} {
 			if !strings.Contains(prompt, want) {
 				t.Fatalf("reviewer prompt missing %q:\n%s", want, prompt)
 			}

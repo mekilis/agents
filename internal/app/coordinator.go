@@ -21,6 +21,7 @@ func buildCoordinatorPrompt(e env, state loopState) (string, error) {
 	appendPromptFile(&b, e.cwd, state.Task.Path, "scope.md", "Scope")
 	appendPromptFile(&b, e.cwd, state.Task.Path, "status.md", "Status")
 	appendPromptFile(&b, e.cwd, state.Task.Path, "next.md", "Next")
+	appendPromptFile(&b, e.cwd, state.Task.Path, "plan.md", "Plan")
 	if compact {
 		if strings.TrimSpace(latestText) != "" {
 			fmt.Fprintf(&b, "## Latest user message\n\n%s\n\n", strings.TrimSpace(latestText))
@@ -76,6 +77,7 @@ func localAICoordinatorInput(e env, state loopState, latestText string) string {
 		{name: "scope.md", title: "Scope"},
 		{name: "status.md", title: "Status"},
 		{name: "next.md", title: "Next"},
+		{name: "plan.md", title: "Plan"},
 	} {
 		data, err := os.ReadFile(filepath.Join(e.cwd, stateDir, state.Task.Path, file.name))
 		if err != nil || strings.TrimSpace(string(data)) == "" {
