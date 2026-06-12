@@ -4121,7 +4121,7 @@ func resolveAgentCommand(agent string, settings agentSettings) (string, error) {
 	}
 	switch strings.ToLower(agent) {
 	case "cursor", "cursor-agent", "agent":
-		args := []string{"agent -p"}
+		args := []string{"agent -p --output-format stream-json --stream-partial-output"}
 		if strings.TrimSpace(settings.CursorModel) != "" {
 			args = append(args, "--model "+shellQuote(strings.TrimSpace(settings.CursorModel)))
 		}
@@ -4245,7 +4245,14 @@ func runStreamingShellCommand(cwd, command string, artifacts runArtifactPaths, s
 	if _, err := logFile.WriteString(marker); err != nil {
 		return "", err
 	}
-	writer := io.MultiWriter(&output, logFile, live)
+	var cursorWriter *cursorStreamWriter
+	var writer io.Writer
+	if isCursorAgent(agent) {
+		cursorWriter = &cursorStreamWriter{output: &output, log: logFile, live: live}
+		writer = cursorWriter
+	} else {
+		writer = io.MultiWriter(&output, logFile, live)
+	}
 	cmd.Stdout = writer
 	cmd.Stderr = writer
 	if err := cmd.Start(); err != nil {
@@ -4322,7 +4329,168 @@ func runStreamingShellCommand(cwd, command string, artifacts runArtifactPaths, s
 	} else {
 		fmt.Fprintf(logFile, "\n[agents] completed at %s\n", time.Now().UTC().Format(time.RFC3339))
 	}
+	if cursorWriter != nil {
+		return cursorWriter.FinalOutput(), err
+	}
 	return output.String(), err
+}
+
+func isCursorAgent(agent string) bool {
+	switch strings.ToLower(strings.TrimSpace(agent)) {
+	case "cursor", "cursor-agent", "agent":
+		return true
+	default:
+		return false
+	}
+}
+
+type cursorStreamWriter struct {
+	mu             sync.Mutex
+	output         *strings.Builder
+	log            io.Writer
+	live           io.Writer
+	pending        string
+	deltas         strings.Builder
+	finalAssistant string
+	result         string
+	usage          string
+}
+
+func (w *cursorStreamWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.pending += string(p)
+	for {
+		line, rest, ok := strings.Cut(w.pending, "\n")
+		if !ok {
+			break
+		}
+		w.pending = rest
+		w.handleLine(line)
+	}
+	return len(p), nil
+}
+
+func (w *cursorStreamWriter) FinalOutput() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if strings.TrimSpace(w.pending) != "" {
+		w.handleLine(w.pending)
+		w.pending = ""
+	}
+	text := firstNonEmpty(w.result, w.finalAssistant, w.deltas.String(), w.output.String())
+	if w.usage != "" {
+		text = strings.TrimSpace(text) + "\nToken usage: " + w.usage
+	}
+	return strings.TrimSpace(text)
+}
+
+func (w *cursorStreamWriter) handleLine(line string) {
+	if w.log != nil {
+		fmt.Fprintln(w.log, line)
+	}
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return
+	}
+	var ev cursorStreamEvent
+	if err := json.Unmarshal([]byte(trimmed), &ev); err != nil {
+		fmt.Fprintln(w.output, line)
+		if w.live != nil {
+			fmt.Fprintln(w.live, line)
+		}
+		return
+	}
+	switch ev.Type {
+	case "assistant":
+		text := ev.messageText()
+		if text == "" {
+			return
+		}
+		if ev.TimestampMS != nil {
+			w.deltas.WriteString(text)
+			if w.live != nil {
+				fmt.Fprint(w.live, text)
+			}
+			return
+		}
+		w.finalAssistant = text
+	case "result":
+		w.result = strings.TrimSpace(ev.Result)
+		w.usage = ev.usageString()
+	case "system", "user":
+		return
+	default:
+		summary := ev.summary()
+		if summary == "" {
+			return
+		}
+		fmt.Fprintln(w.output, summary)
+		if w.live != nil {
+			fmt.Fprintln(w.live, summary)
+		}
+	}
+}
+
+type cursorStreamEvent struct {
+	Type        string              `json:"type"`
+	Subtype     string              `json:"subtype"`
+	Message     cursorStreamMessage `json:"message"`
+	Result      string              `json:"result"`
+	TimestampMS *int64              `json:"timestamp_ms"`
+	Usage       struct {
+		InputTokens      int `json:"inputTokens"`
+		OutputTokens     int `json:"outputTokens"`
+		CacheReadTokens  int `json:"cacheReadTokens"`
+		CacheWriteTokens int `json:"cacheWriteTokens"`
+	} `json:"usage"`
+}
+
+type cursorStreamMessage struct {
+	Content []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+		Name string `json:"name"`
+	} `json:"content"`
+}
+
+func (e cursorStreamEvent) messageText() string {
+	var b strings.Builder
+	for _, part := range e.Message.Content {
+		if part.Type == "text" && part.Text != "" {
+			b.WriteString(part.Text)
+		}
+	}
+	return b.String()
+}
+
+func (e cursorStreamEvent) usageString() string {
+	if e.Usage.InputTokens == 0 && e.Usage.OutputTokens == 0 &&
+		e.Usage.CacheReadTokens == 0 && e.Usage.CacheWriteTokens == 0 {
+		return ""
+	}
+	parts := []string{
+		fmt.Sprintf("input=%d", e.Usage.InputTokens),
+		fmt.Sprintf("output=%d", e.Usage.OutputTokens),
+	}
+	if e.Usage.CacheReadTokens > 0 {
+		parts = append(parts, fmt.Sprintf("cache_read=%d", e.Usage.CacheReadTokens))
+	}
+	if e.Usage.CacheWriteTokens > 0 {
+		parts = append(parts, fmt.Sprintf("cache_write=%d", e.Usage.CacheWriteTokens))
+	}
+	return strings.Join(parts, " ")
+}
+
+func (e cursorStreamEvent) summary() string {
+	name := strings.TrimSpace(e.Subtype)
+	if name == "" {
+		name = strings.TrimSpace(e.Type)
+	}
+	if name == "" {
+		return ""
+	}
+	return "Cursor: " + name
 }
 
 func shortDuration(d time.Duration) string {

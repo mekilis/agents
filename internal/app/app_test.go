@@ -2817,10 +2817,36 @@ func TestResolveAgentCommandUsesProviderModelSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"agent -p", "--model 'claude-4.6-sonnet-medium-thinking'", "--force"} {
+	for _, want := range []string{"agent -p", "--output-format stream-json", "--stream-partial-output", "--model 'claude-4.6-sonnet-medium-thinking'", "--force"} {
 		if !strings.Contains(cursorCommand, want) {
 			t.Fatalf("cursor command missing %q:\n%s", want, cursorCommand)
 		}
+	}
+}
+
+func TestCursorStreamWriterDecodesDeltasResultAndUsage(t *testing.T) {
+	var out, log, live strings.Builder
+	writer := &cursorStreamWriter{output: &out, log: &log, live: &live}
+	chunks := []string{
+		`{"type":"system","subtype":"init"}` + "\n",
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"Hel"}]},"timestamp_ms":1}` + "\n",
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"lo"}]},"timestamp_ms":2}` + "\n",
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"Hello"}]}}` + "\n",
+		`{"type":"result","subtype":"success","result":"Hello","usage":{"inputTokens":12,"outputTokens":3,"cacheReadTokens":4}}` + "\n",
+	}
+	for _, chunk := range chunks {
+		if _, err := writer.Write([]byte(chunk)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := writer.FinalOutput(); got != "Hello\nToken usage: input=12 output=3 cache_read=4" {
+		t.Fatalf("FinalOutput got %q", got)
+	}
+	if got := live.String(); got != "Hello" {
+		t.Fatalf("live stream got %q", got)
+	}
+	if !strings.Contains(log.String(), `"type":"system"`) || !strings.Contains(log.String(), `"type":"result"`) {
+		t.Fatalf("raw JSON should be preserved in log, got:\n%s", log.String())
 	}
 }
 
