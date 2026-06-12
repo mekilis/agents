@@ -38,24 +38,40 @@ func TestParseLocalAIReviewResultExtractsJSON(t *testing.T) {
 	}
 }
 
-func TestLocalAIReviewResultIgnoresNoOpFindings(t *testing.T) {
+func TestLocalAIReviewResultPassDoesNotBlockWithFindings(t *testing.T) {
+	result := localAIReviewResult{
+		Result: "pass",
+		Findings: []localAIReviewFinding{
+			{Severity: "low", Text: "review note that should not block"},
+		},
+	}
+	if !result.valid() {
+		t.Fatalf("pass with findings should still be a valid local review result: %+v", result)
+	}
+	if result.blocksReviewer() {
+		t.Fatalf("pass result should not block reviewer: %+v", result.normalizedFindings())
+	}
+	if findings := result.normalizedFindings(); len(findings) != 1 || findings[0].Text != "review note that should not block" {
+		t.Fatalf("expected normalized finding to be preserved for diagnostics, got %+v", findings)
+	}
+}
+
+func TestLocalAIReviewResultFailRequiresNonEmptyFindingText(t *testing.T) {
 	result := localAIReviewResult{
 		Result: "fail",
 		Findings: []localAIReviewFinding{
 			{Text: ""},
-			{Text: "None"},
-			{Text: "No concrete issues remain."},
-			{Text: "No issues remained after the latest changes.", Evidence: "Tests passed."},
+			{Text: " \t\n ", Evidence: "empty text should not create a finding"},
 		},
 	}
-	if !result.valid() {
-		t.Fatalf("no-op findings should still be a valid local review result: %+v", result)
+	if result.valid() {
+		t.Fatalf("fail without actionable finding text should be invalid: %+v", result)
 	}
 	if result.blocksReviewer() {
-		t.Fatalf("no-op findings should not block reviewer: %+v", result.normalizedFindings())
+		t.Fatalf("empty fail findings should not block reviewer: %+v", result.normalizedFindings())
 	}
 	if findings := result.normalizedFindings(); len(findings) != 0 {
-		t.Fatalf("expected no normalized findings, got %+v", findings)
+		t.Fatalf("expected empty finding text to be dropped, got %+v", findings)
 	}
 }
 
@@ -63,7 +79,7 @@ func TestLocalAIReviewResultPreservesRealFindings(t *testing.T) {
 	result := localAIReviewResult{
 		Result: "fail",
 		Findings: []localAIReviewFinding{
-			{Text: "None"},
+			{Text: ""},
 			{Text: "unchecked error still returns nil", Evidence: "internal/app/app.go:42"},
 		},
 	}

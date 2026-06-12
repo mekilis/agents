@@ -4115,23 +4115,23 @@ func TestReviewerPipelineLocalFindingStopsNextReviewer(t *testing.T) {
 	}
 }
 
-func TestReviewerPipelineLocalCleanFindingContinuesToNextReviewer(t *testing.T) {
+func TestReviewerPipelineLocalPassWithFindingsContinuesToNextReviewer(t *testing.T) {
 	old := runFirstPassReviewWithLocalAI
 	defer func() { runFirstPassReviewWithLocalAI = old }()
 	runFirstPassReviewWithLocalAI = func(settings agentSettings, input string) (localAIReviewResult, error) {
 		return localAIReviewResult{
-			Result:  "fail",
-			Summary: "clean local review",
+			Result:  "pass",
+			Summary: "local review passed",
 			Findings: []localAIReviewFinding{{
 				Severity: "low",
-				Text:     "No problems found in the diff or test results.",
-				Evidence: "All tests passed and code changes are consistent with task description.",
+				Text:     "advisory note that should not block because the result is pass",
+				Evidence: "result field controls blocking behavior",
 			}},
 		}, nil
 	}
 	code := withTempProcessEnv(t, func(home, cwd string) int {
 		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
-		if _, err := openTask(e, []string{"Reviewer Pipeline Clean Local Finding"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+		if _, err := openTask(e, []string{"Reviewer Pipeline Local Pass With Findings"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := addHandoff(e, []string{"--to", "reviewer", "Ready for review."}, time.Date(2026, 6, 5, 10, 1, 0, 0, time.UTC)); err != nil {
@@ -4168,7 +4168,7 @@ func TestReviewerPipelineLocalCleanFindingContinuesToNextReviewer(t *testing.T) 
 			t.Fatal(err)
 		}
 		if _, err := os.Stat(marker); err != nil {
-			t.Fatalf("next reviewer did not run after clean local finding: %v", err)
+			t.Fatalf("next reviewer did not run after local pass with findings: %v", err)
 		}
 		if result.After.NextRole != "human" || result.After.Stats.FindingsOpen != 0 || result.After.Stats.Verification != 1 {
 			t.Fatalf("expected clean local finding to reach human boundary: %+v", result.After)

@@ -522,8 +522,13 @@ func localAIAdvisoryContainsRouting(text string) bool {
 }
 
 func (r localAIReviewResult) valid() bool {
-	switch strings.ToLower(strings.TrimSpace(r.Result)) {
-	case "pass", "fail", "escalate":
+	result := strings.ToLower(strings.TrimSpace(r.Result))
+	switch result {
+	case "pass", "escalate":
+	case "fail":
+		if len(r.normalizedFindings()) == 0 {
+			return false
+		}
 	default:
 		return false
 	}
@@ -538,6 +543,9 @@ func (r localAIReviewResult) valid() bool {
 }
 
 func (r localAIReviewResult) blocksReviewer() bool {
+	if !strings.EqualFold(strings.TrimSpace(r.Result), "fail") {
+		return false
+	}
 	return len(r.normalizedFindings()) > 0
 }
 
@@ -553,41 +561,12 @@ func (r localAIReviewResult) normalizedFindings() []localAIReviewFinding {
 			Text:     strings.TrimSpace(finding.Text),
 			Evidence: strings.TrimSpace(finding.Evidence),
 		}
-		if localAIReviewFindingIsClean(normalized) {
+		if normalized.Text == "" {
 			continue
 		}
 		findings = append(findings, normalized)
 	}
 	return findings
-}
-
-func localAIReviewFindingIsClean(finding localAIReviewFinding) bool {
-	text := strings.ToLower(strings.TrimSpace(finding.Text))
-	if text == "" {
-		return true
-	}
-	text = strings.Trim(text, ".! \t\r\n")
-	if text == "none" || text == "n/a" {
-		return true
-	}
-	cleanMarkers := []string{
-		"no problems found",
-		"no issues found",
-		"no issues remain",
-		"no issues remained",
-		"no concrete issues",
-		"no findings",
-		"no blocking findings",
-		"no blocking issues",
-		"looks good",
-		"all tests passed",
-	}
-	for _, marker := range cleanMarkers {
-		if strings.Contains(text, marker) {
-			return true
-		}
-	}
-	return false
 }
 
 func localAIAgentDescriptor(settings agentSettings) string {
