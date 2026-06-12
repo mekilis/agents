@@ -29,6 +29,9 @@ func buildCoordinatorPrompt(e env, state loopState) (string, error) {
 		appendPromptDir(&b, e.cwd, state.Task.Path, "handoffs", "Handoffs")
 		appendPromptDir(&b, e.cwd, state.Task.Path, "decisions", "Decisions")
 	}
+	if advisory, ok := buildLocalAICoordinatorAdvisory(config.Settings, localAICoordinatorInput(e, state, latestText)); ok {
+		appendLocalAICoordinatorAdvisory(&b, advisory)
+	}
 	appendCoordinatorWorkingAgreement(&b)
 	if compact {
 		fmt.Fprintln(&b, "- This is a small-talk turn. Reply in one short sentence or question, and do not inspect files or summarize the project.")
@@ -57,6 +60,52 @@ func appendCoordinatorWorkingAgreement(b *strings.Builder) {
 	fmt.Fprintln(b, "- When work is explicitly ready for another role, end your response with one `agents-handoff` fenced block containing `role`, `ready: true`, and a specific `text` request.")
 	fmt.Fprintln(b, "- Never copy placeholder handoff text; if you are still discussing, do not emit a handoff block.")
 	fmt.Fprintln(b, "- Do not edit implementation code or coordination files directly.")
+}
+
+func localAICoordinatorInput(e env, state loopState, latestText string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Task: %s\n", state.Task.Title)
+	fmt.Fprintf(&b, "Next action: %s\n", state.NextAction)
+	if text := strings.TrimSpace(latestText); text != "" {
+		fmt.Fprintf(&b, "\nLatest coordinator handoff:\n%s\n", text)
+	}
+	for _, file := range []struct {
+		name  string
+		title string
+	}{
+		{name: "scope.md", title: "Scope"},
+		{name: "status.md", title: "Status"},
+		{name: "next.md", title: "Next"},
+	} {
+		data, err := os.ReadFile(filepath.Join(e.cwd, stateDir, state.Task.Path, file.name))
+		if err != nil || strings.TrimSpace(string(data)) == "" {
+			continue
+		}
+		fmt.Fprintf(&b, "\n%s:\n%s\n", file.title, strings.TrimSpace(string(data)))
+	}
+	return b.String()
+}
+
+func appendLocalAICoordinatorAdvisory(b *strings.Builder, advisory localAICoordinatorAdvisory) {
+	fmt.Fprintln(b, "## Local AI coordinator advisory")
+	fmt.Fprintln(b)
+	fmt.Fprintln(b, "Advisory context only. Preserve the configured coordinator role and make all routing decisions yourself.")
+	if advisory.Summary != "" {
+		fmt.Fprintf(b, "Summary: %s\n", advisory.Summary)
+	}
+	if len(advisory.Notes) > 0 {
+		fmt.Fprintln(b, "Notes:")
+		for _, note := range advisory.Notes {
+			fmt.Fprintf(b, "- %s\n", note)
+		}
+	}
+	if len(advisory.Questions) > 0 {
+		fmt.Fprintln(b, "Questions:")
+		for _, question := range advisory.Questions {
+			fmt.Fprintf(b, "- %s\n", question)
+		}
+	}
+	fmt.Fprintln(b)
 }
 
 func latestCoordinatorHandoffText(cwd, taskPath string) (string, error) {

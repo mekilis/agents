@@ -39,7 +39,14 @@ type localAIReviewFinding struct {
 	Evidence string `json:"evidence"`
 }
 
+type localAICoordinatorAdvisory struct {
+	Summary   string   `json:"summary"`
+	Notes     []string `json:"notes"`
+	Questions []string `json:"questions"`
+}
+
 var classifyCoordinatorIntentWithLocalAI = classifyCoordinatorIntentWithOpenAICompat
+var adviseCoordinatorWithLocalAI = adviseCoordinatorWithOpenAICompat
 var runFirstPassReviewWithLocalAI = runFirstPassReviewWithOpenAICompat
 
 func localAIConfigured(settings agentSettings) bool {
@@ -78,6 +85,30 @@ func classifyCoordinatorIntentWithOpenAICompat(settings agentSettings, text stri
 		return localAIClassification{}, err
 	}
 	return parseLocalAIClassification(content)
+}
+
+func buildLocalAICoordinatorAdvisory(settings agentSettings, input string) (localAICoordinatorAdvisory, bool) {
+	if !localAIConfigured(settings) {
+		return localAICoordinatorAdvisory{}, false
+	}
+	advisory, err := adviseCoordinatorWithLocalAI(settings, input)
+	if err != nil || !advisory.valid() {
+		return localAICoordinatorAdvisory{}, false
+	}
+	return advisory.normalized(), true
+}
+
+func adviseCoordinatorWithOpenAICompat(settings agentSettings, input string) (localAICoordinatorAdvisory, error) {
+	content, err := localAIChat(settings,
+		"You are an advisory preflight for an Agents coordinator. You do not route work, select roles, create handoffs, or approve final decisions. "+
+			"Return only JSON: {\"summary\":\"...\",\"notes\":[\"...\"],\"questions\":[\"...\"]}. "+
+			"Keep the advice brief and grounded in the provided task context.",
+		strings.TrimSpace(input),
+	)
+	if err != nil {
+		return localAICoordinatorAdvisory{}, err
+	}
+	return parseLocalAICoordinatorAdvisory(content)
 }
 
 func localAIFirstPassReviewEnabled(settings agentSettings) bool {
@@ -242,6 +273,21 @@ func parseLocalAIClassification(text string) (localAIClassification, error) {
 	return classification, nil
 }
 
+func parseLocalAICoordinatorAdvisory(text string) (localAICoordinatorAdvisory, error) {
+	text = strings.TrimSpace(text)
+	if start := strings.IndexByte(text, '{'); start >= 0 {
+		text = text[start:]
+	}
+	if end := strings.LastIndexByte(text, '}'); end >= 0 {
+		text = text[:end+1]
+	}
+	var advisory localAICoordinatorAdvisory
+	if err := json.Unmarshal([]byte(text), &advisory); err != nil {
+		return localAICoordinatorAdvisory{}, err
+	}
+	return advisory, nil
+}
+
 func parseLocalAIReviewResult(text string) (localAIReviewResult, error) {
 	text = strings.TrimSpace(text)
 	if start := strings.IndexByte(text, '{'); start >= 0 {
@@ -255,6 +301,58 @@ func parseLocalAIReviewResult(text string) (localAIReviewResult, error) {
 		return localAIReviewResult{}, err
 	}
 	return result, nil
+}
+
+func (a localAICoordinatorAdvisory) valid() bool {
+	normalized := a.normalized()
+	if normalized.Summary == "" && len(normalized.Notes) == 0 && len(normalized.Questions) == 0 {
+		return false
+	}
+	for _, text := range append(append([]string{normalized.Summary}, normalized.Notes...), normalized.Questions...) {
+		if localAIAdvisoryContainsRouting(text) {
+			return false
+		}
+	}
+	return true
+}
+
+func (a localAICoordinatorAdvisory) normalized() localAICoordinatorAdvisory {
+	return localAICoordinatorAdvisory{
+		Summary:   strings.TrimSpace(a.Summary),
+		Notes:     normalizedAdvisoryStrings(a.Notes),
+		Questions: normalizedAdvisoryStrings(a.Questions),
+	}
+}
+
+func normalizedAdvisoryStrings(values []string) []string {
+	normalized := make([]string, 0, len(values))
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			normalized = append(normalized, trimmed)
+		}
+	}
+	return normalized
+}
+
+func localAIAdvisoryContainsRouting(text string) bool {
+	normalized := strings.ToLower(text)
+	for _, marker := range []string{"agents-handoff", "to: implementer", "to: reviewer", "\"role\":\"implementer\"", "\"role\":\"reviewer\""} {
+		if strings.Contains(normalized, marker) {
+			return true
+		}
+	}
+	compact := strings.Map(func(r rune) rune {
+		if r == ' ' || r == '\t' || r == '\n' || r == '\r' {
+			return -1
+		}
+		return r
+	}, normalized)
+	for _, marker := range []string{"\"role\":\"implementer\"", "\"role\":\"reviewer\""} {
+		if strings.Contains(compact, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func (r localAIReviewResult) valid() bool {

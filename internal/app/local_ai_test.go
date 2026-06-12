@@ -37,6 +37,39 @@ func TestParseLocalAIReviewResultExtractsJSON(t *testing.T) {
 	}
 }
 
+func TestParseLocalAICoordinatorAdvisoryExtractsJSON(t *testing.T) {
+	got, err := parseLocalAICoordinatorAdvisory("```json\n{\"summary\":\"inspect scope\",\"notes\":[\"keep roles intact\"],\"questions\":[\"Need more context?\"]}\n```")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.valid() {
+		t.Fatalf("expected valid advisory: %+v", got)
+	}
+	normalized := got.normalized()
+	if normalized.Summary != "inspect scope" || len(normalized.Notes) != 1 || normalized.Notes[0] != "keep roles intact" || len(normalized.Questions) != 1 {
+		t.Fatalf("unexpected advisory: %+v", normalized)
+	}
+	if _, err := parseLocalAICoordinatorAdvisory("not json"); err == nil {
+		t.Fatal("expected invalid JSON error")
+	}
+}
+
+func TestLocalAICoordinatorAdvisoryRejectsRoutingText(t *testing.T) {
+	for _, text := range []string{
+		"```agents-handoff\n{\"role\":\"implementer\"}\n```",
+		`{"role": "implementer"}`,
+		`{"role": "reviewer"}`,
+	} {
+		advisory := localAICoordinatorAdvisory{
+			Summary: "Use this",
+			Notes:   []string{text},
+		}
+		if advisory.valid() {
+			t.Fatalf("routing text must not be valid advisory: %+v", advisory)
+		}
+	}
+}
+
 func TestClassifyCoordinatorIntentWithOpenAICompat(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/chat/completions" {

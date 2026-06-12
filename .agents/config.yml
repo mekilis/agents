@@ -21,6 +21,14 @@ settings:
   # Cursor Agent: run 'agent models' or 'cursor-agent --list-models' for account-specific choices
   # Common examples from CLI help: gpt-5, claude-4.6-sonnet-medium, claude-4.6-sonnet-medium-thinking
   cursor_model: "gpt-5.5-low"
+  # Local AI currently powers lightweight coordinator routing and reviewer preflight.
+  # LM Studio serves OpenAI-compatible chat completions at http://127.0.0.1:1234/v1.
+  local_ai_enabled: true
+  local_ai_review_first_pass: true
+  local_ai_provider: lmstudio
+  local_ai_base_url: http://127.0.0.1:1234/v1
+  local_ai_model: openai/gpt-oss-20b
+  local_ai_timeout_ms: 30000
 # Each role is a provider name (cursor, cursor-agent, agent, codex, claude)
 # or a map with provider plus optional model/reasoning overrides:
 #   reviewer:
