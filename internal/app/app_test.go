@@ -1208,6 +1208,16 @@ func TestComposerSuggestionsHideExactCommand(t *testing.T) {
 	}
 }
 
+func TestRenderComposerLineColorsExactSlashCommand(t *testing.T) {
+	got := renderComposerLine("/implement all", true)
+	if !strings.Contains(got, "\x1b[36m/implement\x1b[0m all") {
+		t.Fatalf("slash command should be colored, got %q", got)
+	}
+	if plain := renderComposerLine("/implement all", false); plain != "/implement all" {
+		t.Fatalf("plain composer line got %q", plain)
+	}
+}
+
 func TestComposerSuggestionsAreCompact(t *testing.T) {
 	got := composerSuggestionLines("/", false)
 	if len(got) > liveSuggestionLimit+1 {
@@ -1216,6 +1226,114 @@ func TestComposerSuggestionsAreCompact(t *testing.T) {
 	text := strings.Join(got, "\n")
 	if !strings.Contains(text, "more") || !strings.Contains(text, "? for all") {
 		t.Fatalf("compact suggestions should point to full help, got:\n%s", text)
+	}
+}
+
+func TestReadComposerLineIgnoresArrowKeys(t *testing.T) {
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer read.Close()
+	defer write.Close()
+	go func() {
+		_, _ = write.Write([]byte("\x1b[A\x1b[A/review\n"))
+	}()
+	var out bytes.Buffer
+	got, err := readComposerLine(read, &out, env{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "/review" {
+		t.Fatalf("composer should ignore arrow keys, got %q; rendered:\n%s", got, out.String())
+	}
+}
+
+func TestReadComposerLineNavigatesHistory(t *testing.T) {
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer read.Close()
+	defer write.Close()
+	history := []string{"/review --max-iterations 6", "/implement all"}
+	go func() {
+		_, _ = write.Write([]byte("\x1b[A\n"))
+	}()
+	var out bytes.Buffer
+	got, err := readComposerLine(read, &out, env{}, &history)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "/implement all" {
+		t.Fatalf("composer history got %q", got)
+	}
+}
+
+func TestAppendCommandHistoryTrimsDedupesAndCaps(t *testing.T) {
+	var history []string
+	history = appendCommandHistory(history, "  /run  ")
+	history = appendCommandHistory(history, "/run")
+	history = appendCommandHistory(history, "")
+	if len(history) != 1 || history[0] != "/run" {
+		t.Fatalf("history should trim, skip blank, and dedupe adjacent entries, got %#v", history)
+	}
+	for i := 0; i < 120; i++ {
+		history = appendCommandHistory(history, fmt.Sprintf("/cmd-%03d", i))
+	}
+	if len(history) != 100 {
+		t.Fatalf("history should be capped at 100 entries, got %d", len(history))
+	}
+	if history[0] != "/cmd-020" || history[len(history)-1] != "/cmd-119" {
+		t.Fatalf("history cap kept wrong entries: first=%q last=%q", history[0], history[len(history)-1])
+	}
+}
+
+func TestReadEscapeInputHandlesApplicationCursorKeys(t *testing.T) {
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer read.Close()
+	defer write.Close()
+	go func() {
+		_, _ = write.Write([]byte("OA"))
+	}()
+	escape, pasted, ok, err := readEscapeInput(read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if escape != "up" || pasted != "" || ok {
+		t.Fatalf("application cursor key got escape=%q pasted=%q ok=%v", escape, pasted, ok)
+	}
+}
+
+func TestReadBracketedPasteBodyReturnsPastedText(t *testing.T) {
+	read, write, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer read.Close()
+	defer write.Close()
+	go func() {
+		_, _ = write.Write([]byte("hello\nworld\x1b[201~"))
+	}()
+	got, ok, err := readBracketedPasteBody(read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || got != "hello\nworld" {
+		t.Fatalf("bracketed paste got %q ok=%v", got, ok)
+	}
+}
+
+func TestParseInteractiveRoleCommandArgsAcceptsText(t *testing.T) {
+	maxRuns, note, err := parseInteractiveRoleCommandArgs([]string{"all", "--max-iterations", "2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if maxRuns != 2 || note != "all" {
+		t.Fatalf("parse args got maxRuns=%d note=%q", maxRuns, note)
 	}
 }
 
@@ -1317,15 +1435,17 @@ func TestPrintInteractiveRoleRunResultFallsBackToTaskProgress(t *testing.T) {
 	}
 }
 
-func TestPrintInteractiveRoleHeaderUsesMarkdownHeading(t *testing.T) {
+func TestPrintInteractiveRoleHeaderUsesStyledTitle(t *testing.T) {
 	var out bytes.Buffer
 	printInteractiveRoleHeader(&out, "reviewer")
 	got := ansiEscapes.ReplaceAllString(out.String(), "")
 	if !strings.Contains(got, "Reviewer") {
 		t.Fatalf("role header missing title:\n%s", got)
 	}
-	if strings.Contains(got, "--------") {
-		t.Fatalf("role header should not use underline fallback:\n%s", got)
+	for _, unwanted := range []string{"##", "--------"} {
+		if strings.Contains(got, unwanted) {
+			t.Fatalf("role header should not render %q:\n%s", unwanted, got)
+		}
 	}
 }
 
@@ -1557,6 +1677,76 @@ func TestVerificationDirectiveParsesAndRecords(t *testing.T) {
 	}
 }
 
+func TestCoordinatorCannotRecordVerificationDirective(t *testing.T) {
+	raw := "Looks clean.\n\n```agents-verify\n{\"text\":\"tests passed\",\"cmd\":\"go test ./...\"}\n```\n"
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Review"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		_, err := applyRoleOutputDirectives(e, "coordinator", raw)
+		if err == nil || !strings.Contains(err.Error(), "coordinator cannot record verification") {
+			t.Fatalf("expected coordinator verification rejection, got %v", err)
+		}
+		stats, err := readTaskStats(cwd, readActiveTask(cwd).Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stats.Verification != 0 {
+			t.Fatalf("coordinator must not record verification, got %d", stats.Verification)
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
+func TestCoordinatorPromptAvoidsCannedProgressAndAllowsReadOnlyRepoInspection(t *testing.T) {
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		task, err := openTask(e, []string{"Planning"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		prompt, err := buildRolePrompt(e, loopState{
+			Task:       task,
+			NextRole:   "coordinator",
+			NextAction: "answer latest coordinator chat",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, unwanted := range []string{
+			"Shaping scope",
+			"Checking existing project context and missing constraints",
+		} {
+			if strings.Contains(prompt, unwanted) {
+				t.Fatalf("coordinator prompt should not contain canned progress %q:\n%s", unwanted, prompt)
+			}
+		}
+		for _, want := range []string{
+			"Task record path: .agents/tasks/",
+			"For greetings, thanks, or other small talk, answer briefly",
+			"do not inspect the repository, summarize files, recommend code work, or emit progress",
+			"Inspect the repository only when the user explicitly asks",
+			"use read-only commands such as listing files, reading docs, and searching source",
+			"repo-relative paths such as `README.md` or `.agents/tasks/...`",
+			"do not print absolute machine-local paths",
+			"Task record paths shown as `.agents/tasks/...` are inside the Agents state directory",
+			"do not use canned or example status text",
+		} {
+			if !strings.Contains(prompt, want) {
+				t.Fatalf("coordinator prompt missing %q:\n%s", want, prompt)
+			}
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
 func TestApplyCoordinatorDirectiveWritesHandoffFromParent(t *testing.T) {
 	code := withTempProcessEnv(t, func(home, cwd string) int {
 		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
@@ -1609,6 +1799,50 @@ func TestCoordinatorImplementerHandoffRequiresReady(t *testing.T) {
 		}
 		if len(entries) != 0 {
 			t.Fatalf("planning-only coordinator handoff should not route to implementer, got %d entries", len(entries))
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
+func TestCoordinatorReviewerHandoffRequiresReady(t *testing.T) {
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		task, err := openTask(e, []string{"Review Route"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		directive := coordinatorDirective{Role: "reviewer", Text: "Review the latest changes."}
+		if err := applyCoordinatorDirective(e, "coordinator", directive); err != nil {
+			t.Fatal(err)
+		}
+		entries, err := os.ReadDir(filepath.Join(cwd, ".agents", task.Path, "handoffs"))
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+		if len(entries) != 0 {
+			t.Fatalf("planning-only coordinator handoff should not route to reviewer, got %d entries", len(entries))
+		}
+
+		directive.Ready = true
+		if err := applyCoordinatorDirective(e, "coordinator", directive); err != nil {
+			t.Fatal(err)
+		}
+		entries, err = os.ReadDir(filepath.Join(cwd, ".agents", task.Path, "handoffs"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) != 1 {
+			t.Fatalf("ready coordinator handoff should route to reviewer, got %d entries", len(entries))
+		}
+		data, err := os.ReadFile(filepath.Join(cwd, ".agents", task.Path, "handoffs", entries[0].Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := string(data); !strings.Contains(got, "To: reviewer") || !strings.Contains(got, "Review the latest changes.") {
+			t.Fatalf("unexpected handoff:\n%s", got)
 		}
 		return 0
 	})
@@ -2044,6 +2278,77 @@ func TestInteractiveTTYChatRoutesButWaitsForRun(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(runCwd, "implemented-marker")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("implementer should not have run during coordinator chat, stat err=%v", err)
+	}
+}
+
+func TestInteractiveReviewCommandRunsReviewerDirectly(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{
+			cwd:       cwd,
+			home:      home,
+			isTTY:     true,
+			trustPath: filepath.Join(home, ".agents", "trust.json"),
+		}
+		if _, err := trustWorkspace(e); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := initWorkspace(e, "share"); err != nil {
+			t.Fatal(err)
+		}
+		task, err := openTask(e, []string{"Review Command"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addHandoff(e, []string{"--to", "implementer", "Build it."}, time.Date(2026, 6, 5, 10, 1, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		reviewer := filepath.Join(cwd, "reviewer.sh")
+		verificationPath := filepath.Join(".agents", task.Path, "verification", "2099-01-01T000000Z-review.md")
+		reviewerBody := strings.Join([]string{
+			"#!/bin/sh",
+			"set -eu",
+			"mkdir -p " + shellQuote(filepath.Dir(verificationPath)),
+			"cat > " + shellQuote(verificationPath) + " <<'EOF'",
+			"# Verification: review",
+			"",
+			"Result: pass",
+			"By: reviewer",
+			"",
+			"Review passed.",
+			"EOF",
+			"printf 'reviewer ran\\n'",
+			"",
+		}, "\n")
+		if err := os.WriteFile(reviewer, []byte(reviewerBody), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		coordinator := filepath.Join(cwd, "coordinator.sh")
+		if err := os.WriteFile(coordinator, []byte("#!/bin/sh\nset -eu\ntouch coordinator-ran\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cfg := "roles:\n  implementer: agent\n  reviewer: " + reviewer + " {prompt_file}\n  coordinator: " + coordinator + " {prompt_file}\n"
+		if err := os.WriteFile(filepath.Join(cwd, ".agents", "config.yml"), []byte(cfg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		commandCode, done := handleInteractiveCommand("/review --max-iterations 1", &out, &errOut, e)
+		if done {
+			t.Fatal("/review should not exit interactive terminal")
+		}
+		if _, err := os.Stat(filepath.Join(cwd, "coordinator-ran")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("/review should not run coordinator, stat err=%v", err)
+		}
+		return commandCode
+	})
+	if code != 0 {
+		t.Fatalf("/review code=%d stderr=%s stdout=%s", code, errOut.String(), out.String())
+	}
+	got := ansiEscapes.ReplaceAllString(out.String(), "")
+	if !strings.Contains(got, "Reviewer") || !strings.Contains(got, "reviewer ran") {
+		t.Fatalf("/review should run reviewer, got:\n%s", got)
+	}
+	if strings.Contains(got, "Coordinator is thinking") {
+		t.Fatalf("/review should bypass coordinator chat, got:\n%s", got)
 	}
 }
 
@@ -3303,6 +3608,176 @@ func TestCursorStreamWriterFiltersSplitProgressBlocks(t *testing.T) {
 	}
 }
 
+func TestCursorStreamWriterFiltersInlineProgressBlocks(t *testing.T) {
+	var out, log, live strings.Builder
+	writer := &cursorStreamWriter{output: &out, log: &log, live: &live}
+	text := "Plan. ```agents-progress\n{\"status\":\"updating docs\",\"detail\":\"documenting commands\"}\n``` Done."
+	chunk := fmt.Sprintf(`{"type":"assistant","message":{"content":[{"type":"text","text":%q}]},"timestamp_ms":1}`+"\n", text)
+	if _, err := writer.Write([]byte(chunk)); err != nil {
+		t.Fatal(err)
+	}
+	final := writer.FinalOutput()
+	if strings.Contains(final, "agents-progress") || strings.Contains(final, `"status"`) {
+		t.Fatalf("final output leaked progress directive:\n%s", final)
+	}
+	got := live.String()
+	for _, want := range []string{"Plan. ", "- Updating docs: Documenting commands", " Done."} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("live stream missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestCleanInteractiveAgentOutputStripsProgressDirectives(t *testing.T) {
+	raw := strings.Join([]string{
+		"Implemented changes.",
+		"```agents-progress",
+		`{"status":"running checks","detail":"executing tests"}`,
+		"```",
+		"Checks passed.",
+	}, "\n")
+	got := cleanInteractiveAgentOutput("agent", raw)
+	if strings.Contains(got, "agents-progress") || strings.Contains(got, `"status"`) {
+		t.Fatalf("cleaned output leaked progress directive:\n%s", got)
+	}
+	for _, want := range []string{"Implemented changes.", "Checks passed."} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("cleaned output missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestParseProgressDirectiveFromTextFindsAndTrimsDirective(t *testing.T) {
+	progress, ok := parseProgressDirectiveFromText("before\n```agents-progress\n {\"status\":\" checking \",\"detail\":\" tests \"}\n```\nafter")
+	if !ok {
+		t.Fatal("expected progress directive")
+	}
+	if progress.Status != "checking" || progress.Detail != "tests" {
+		t.Fatalf("unexpected progress directive: %+v", progress)
+	}
+	if _, ok := parseProgressDirectiveFromText("no directive"); ok {
+		t.Fatal("plain text should not parse as progress")
+	}
+}
+
+func TestCursorStreamWriterFinalOutputStripsProgressFromResult(t *testing.T) {
+	var out, log, live strings.Builder
+	writer := &cursorStreamWriter{output: &out, log: &log, live: &live}
+	result := strings.Join([]string{
+		"Done.",
+		"```agents-progress",
+		`{"status":"summarizing","detail":"should not render"}`,
+		"```",
+		"Final words.",
+	}, "\n")
+	chunk := fmt.Sprintf(`{"type":"result","subtype":"success","result":%q}`+"\n", result)
+	if _, err := writer.Write([]byte(chunk)); err != nil {
+		t.Fatal(err)
+	}
+	got := writer.FinalOutput()
+	if strings.Contains(got, "agents-progress") || strings.Contains(got, `"status"`) {
+		t.Fatalf("final result leaked progress directive:\n%s", got)
+	}
+	if !strings.Contains(got, "Done.") || !strings.Contains(got, "Final words.") {
+		t.Fatalf("final result missing user text:\n%s", got)
+	}
+}
+
+func TestCursorStreamWriterFlushesIncompleteAssistantText(t *testing.T) {
+	var out, live strings.Builder
+	writer := &cursorStreamWriter{output: &out, live: &live}
+	if _, err := writer.Write([]byte(`{"type":"assistant","message":{"content":[{"type":"text","text":"partial answer"}]},"timestamp_ms":1}` + "\n")); err != nil {
+		t.Fatal(err)
+	}
+	if got := writer.FinalOutput(); got != "partial answer" {
+		t.Fatalf("FinalOutput should flush pending assistant text, got %q", got)
+	}
+}
+
+func TestCursorStreamEventToolSummaryVariants(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{
+			name: "started shell command fallback",
+			raw:  `{"subtype":"started","tool_call":{"shellToolCall":{"args":{"command":"go test ./...\necho done"}}}}`,
+			want: "Running: go test ./...",
+		},
+		{
+			name: "started read",
+			raw:  `{"subtype":"started","tool_call":{"readToolCall":{"args":{"path":"/tmp/app.go"}}}}`,
+			want: "Reading: app.go",
+		},
+		{
+			name: "started edit",
+			raw:  `{"subtype":"started","tool_call":{"editToolCall":{"args":{"path":"/tmp/app.go"}}}}`,
+			want: "Editing: app.go",
+		},
+		{
+			name: "completed shell command",
+			raw:  `{"subtype":"completed","tool_call":{"shellToolCall":{"args":{"description":"Run checks"}}}}`,
+			want: "Completed: Run checks",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var ev cursorStreamEvent
+			if err := json.Unmarshal([]byte(tc.raw), &ev); err != nil {
+				t.Fatal(err)
+			}
+			if got := ev.toolSummary(); got != tc.want {
+				t.Fatalf("toolSummary got %q want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestFirstShellLineAndShortDuration(t *testing.T) {
+	if got := firstShellLine("  first\nsecond  "); got != "first" {
+		t.Fatalf("firstShellLine got %q", got)
+	}
+	long := firstShellLine(strings.Repeat("x", 90))
+	if len([]rune(long)) != 80 || !strings.HasSuffix(long, "…") {
+		t.Fatalf("long shell line should truncate to 80 runes with ellipsis, got %q", long)
+	}
+	for input, want := range map[time.Duration]string{
+		-1 * time.Second:                     "0s",
+		3*time.Second + 400*time.Millisecond: "3s",
+		65 * time.Second:                     "1m05s",
+	} {
+		if got := shortDuration(input); got != want {
+			t.Fatalf("shortDuration(%s) got %q want %q", input, got, want)
+		}
+	}
+}
+
+func TestEnsureShellCommandAvailableValidatesLocalExecutables(t *testing.T) {
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "missing.sh")
+	if err := ensureShellCommandAvailable(missing+" {prompt_file}", "reviewer"); err == nil || !strings.Contains(err.Error(), "was not found") {
+		t.Fatalf("missing local command error got %v", err)
+	}
+	nonExec := filepath.Join(dir, "non-executable.sh")
+	if err := os.WriteFile(nonExec, []byte("#!/bin/sh\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureShellCommandAvailable(nonExec+" {prompt_file}", "reviewer"); err == nil || !strings.Contains(err.Error(), "is not executable") {
+		t.Fatalf("non-executable command error got %v", err)
+	}
+	execFile := filepath.Join(dir, "ok.sh")
+	if err := os.WriteFile(execFile, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureShellCommandAvailable("AGENTS_TEST=1 "+execFile+" {prompt_file}", "reviewer"); err != nil {
+		t.Fatalf("executable command should pass: %v", err)
+	}
+	if got, err := shellCommandExecutable("AGENTS_TEST=1 " + execFile + " {prompt_file}"); err != nil || got != execFile {
+		t.Fatalf("shellCommandExecutable got %q err=%v", got, err)
+	}
+}
+
 func TestResolveCodexCommandKeepsLegacyModelSettings(t *testing.T) {
 	command, err := resolveAgentCommand("codex", agentSettings{Model: "gpt-5.4", Reasoning: "medium"})
 	if err != nil {
@@ -4099,6 +4574,137 @@ func TestRunLoopChainsRolesToHumanBoundary(t *testing.T) {
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("loop output missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestInteractiveLoopSimulatesAllRolesAndFiltersProgress(t *testing.T) {
+	var out bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := trustWorkspace(e); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := initWorkspace(e, "share"); err != nil {
+			t.Fatal(err)
+		}
+		task, err := openTask(e, []string{"All Roles"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addHandoff(e, []string{"--to", "coordinator", "Route this through every role."}, time.Date(2026, 6, 5, 10, 1, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+
+		coordinator := filepath.Join(cwd, "coordinator.sh")
+		coordinatorBody := strings.Join([]string{
+			"#!/bin/sh",
+			"set -eu",
+			"printf '%s\\n' '```agents-progress'",
+			"printf '%s\\n' '{\"status\":\"routing work\",\"detail\":\"sending a ready task to implementer\"}'",
+			"printf '%s\\n' '```'",
+			"cat <<'EOF'",
+			"Coordinator routed the task.",
+			"",
+			"```agents-handoff",
+			"role: implementer",
+			"ready: true",
+			"text: Build the requested behavior and hand it to review.",
+			"```",
+			"EOF",
+		}, "\n")
+		if err := os.WriteFile(coordinator, []byte(coordinatorBody), 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		implementer := filepath.Join(cwd, "implementer.sh")
+		implementerBody := strings.Join([]string{
+			"#!/bin/sh",
+			"set -eu",
+			"printf '%s\\n' '```agents-progress'",
+			"printf '%s\\n' '{\"status\":\"editing files\",\"detail\":\"making the requested change\"}'",
+			"printf '%s\\n' '```'",
+			"cat <<'EOF'",
+			"Implementation complete.",
+			"",
+			"```agents-handoff",
+			"role: reviewer",
+			"text: Review the implemented behavior and checks.",
+			"```",
+			"EOF",
+		}, "\n")
+		if err := os.WriteFile(implementer, []byte(implementerBody), 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		reviewer := filepath.Join(cwd, "reviewer.sh")
+		reviewerBody := strings.Join([]string{
+			"#!/bin/sh",
+			"set -eu",
+			"printf '%s\\n' '```agents-progress'",
+			"printf '%s\\n' '{\"status\":\"running checks\",\"detail\":\"simulating reviewer verification\"}'",
+			"printf '%s\\n' '```'",
+			"cat <<'EOF'",
+			"Review complete.",
+			"",
+			"```agents-verify",
+			"{\"text\":\"simulated reviewer checks passed\",\"cmd\":\"printf ok\"}",
+			"```",
+			"EOF",
+		}, "\n")
+		if err := os.WriteFile(reviewer, []byte(reviewerBody), 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		cfg := strings.Join([]string{
+			"roles:",
+			"  coordinator: " + coordinator + " {prompt_file}",
+			"  implementer: " + implementer + " {prompt_file}",
+			"  reviewer: " + reviewer + " {prompt_file}",
+			"",
+		}, "\n")
+		if err := os.WriteFile(filepath.Join(cwd, ".agents", "config.yml"), []byte(cfg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		stop, err := runManagedLoop(e, &out, 3, false, nil, nil, loopDisplayInteractive, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stop.Reason != "human" || stop.Runs != 3 {
+			t.Fatalf("expected all roles to reach human boundary, got %+v", stop)
+		}
+		stats, err := readTaskStats(cwd, task.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stats.Handoffs != 3 || stats.Verification != 1 {
+			t.Fatalf("unexpected task stats after simulated roles: %+v", stats)
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+	got := ansiEscapes.ReplaceAllString(out.String(), "")
+	for _, want := range []string{
+		"Coordinator",
+		"- Routing work: Sending a ready task to implementer",
+		"Implementer",
+		"- Editing files: Making the requested change",
+		"Reviewer",
+		"- Running checks: Simulating reviewer verification",
+		"Coordinator routed the task.",
+		"Implementation complete.",
+		"Review complete.",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("interactive loop output missing %q:\n%s", want, got)
+		}
+	}
+	for _, leaked := range []string{"```agents-progress", `"status":"routing work"`, `"status":"editing files"`, `"status":"running checks"`} {
+		if strings.Contains(got, leaked) {
+			t.Fatalf("interactive loop leaked progress directive %q:\n%s", leaked, got)
 		}
 	}
 }

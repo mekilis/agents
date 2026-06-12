@@ -135,6 +135,20 @@ func TestReadySummaryLinesRendersSections(t *testing.T) {
 	}
 }
 
+func TestFindingGlyphCoversStatuses(t *testing.T) {
+	for status, want := range map[string]string{
+		"verified": "✓",
+		"fixed":    "◐",
+		"deferred": "—",
+		"wontfix":  "—",
+		"open":     "●",
+	} {
+		if got := findingGlyph(status); got != want {
+			t.Fatalf("findingGlyph(%q) got %q want %q", status, got, want)
+		}
+	}
+}
+
 func feedKeys(input string) chan byte {
 	keys := make(chan byte, len(input))
 	for i := 0; i < len(input); i++ {

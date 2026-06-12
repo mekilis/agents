@@ -2,6 +2,8 @@ package app
 
 import (
 	"bytes"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -299,6 +301,81 @@ func TestLoopViewTerminalsRejectsNonTTYInputs(t *testing.T) {
 	var buf bytes.Buffer
 	if _, _, ok := loopViewTerminals(strings.NewReader(""), &buf); ok {
 		t.Fatal("expected non-file reader/writer to be rejected for the split view")
+	}
+}
+
+func TestLoopViewLineFiltersCoverUserFacingAndProviderNoise(t *testing.T) {
+	for _, line := range []string{
+		"OpenAI Codex v0.137.0",
+		"--------",
+		"workdir: /tmp/repo",
+		"model: gpt",
+		"provider: codex",
+		"approval: never",
+		"sandbox: workspace-write",
+	} {
+		if !startsRawTranscript(line) {
+			t.Fatalf("expected raw transcript starter %q", line)
+		}
+	}
+	if startsRawTranscript("regular output") {
+		t.Fatal("regular output should not start raw transcript skip mode")
+	}
+
+	userFacing := []string{
+		"Issues found",
+		"Findings: none",
+		"Verified fix",
+		"No findings",
+		"Review passed",
+		"Implemented change",
+		"I recorded this as a finding",
+	}
+	for _, line := range userFacing {
+		if !isUserFacingAgentLine(line) {
+			t.Fatalf("expected user-facing line %q", line)
+		}
+	}
+	for _, line := range []string{"", "raw provider trace"} {
+		if isUserFacingAgentLine(line) {
+			t.Fatalf("expected non-user-facing line %q", line)
+		}
+	}
+	for _, line := range []string{
+		"Reading additional input from stdin...",
+		"2026 WARN codex_core_plugins::manifest",
+		"ignoring interface.defaultPrompt[0]",
+		"ignoring interface.icon_small",
+		"prompt must be at most 128 characters",
+	} {
+		if !shouldDropLaneLine(line) {
+			t.Fatalf("expected provider noise to be dropped: %q", line)
+		}
+	}
+	if shouldDropLaneLine("useful output") {
+		t.Fatal("useful output should not be dropped")
+	}
+}
+
+func TestPrintLoopViewEndingExitCodes(t *testing.T) {
+	outFile, err := os.CreateTemp(t.TempDir(), "out")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outFile.Close()
+	state := loopState{NextRole: "human", NextAction: "approve", Boundary: "human approval required"}
+	if code := printLoopViewEnding(outFile, io.Discard, env{}, loopResult{stop: loopStop{Reason: "human", State: state}}); code != 0 {
+		t.Fatalf("human stop code=%d", code)
+	}
+	var errOut bytes.Buffer
+	if code := printLoopViewEnding(outFile, &errOut, env{}, loopResult{err: errors.New("boom")}); code != 1 {
+		t.Fatalf("error stop code=%d", code)
+	}
+	if !strings.Contains(errOut.String(), "agents: go: boom") {
+		t.Fatalf("error output missing message: %q", errOut.String())
+	}
+	if code := printLoopViewEnding(outFile, io.Discard, env{}, loopResult{stop: loopStop{Reason: "max-runs", Runs: 1, State: state}}); code != 1 {
+		t.Fatalf("max-runs stop code=%d", code)
 	}
 }
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io"
 	"os"
 
 	"github.com/mekilis/agents/internal/app"
@@ -13,6 +14,10 @@ var (
 )
 
 func main() {
+	os.Exit(runMain(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
+}
+
+func runMain(args []string, in io.Reader, out, errOut io.Writer) int {
 	app.SetVersion(version, commit, date)
-	os.Exit(app.Run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
+	return app.Run(args, in, out, errOut)
 }

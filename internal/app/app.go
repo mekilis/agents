@@ -21,6 +21,8 @@ import (
 	"golang.org/x/term"
 )
 
+// Keep this file from growing further: put new cohesive behavior in focused
+// files by area, such as coordinator, loop, terminal, prompts, or task records.
 const (
 	productName         = "Agents"
 	stateDir            = ".agents"
@@ -64,6 +66,8 @@ var interactiveSlashCommands = []slashCommandSpec{
 	{Name: "/verify", Usage: `/verify "text" [--cmd 'shell command']`, Description: "Record verification evidence"},
 	{Name: "/dispatch", Usage: "/dispatch <role>", Description: "Print a role packet"},
 	{Name: "/run", Usage: "/run", Description: "Run queued roles until a stop condition"},
+	{Name: "/review", Usage: "/review [--max-iterations N]", Description: "Start reviewer, then keep looping"},
+	{Name: "/implement", Usage: "/implement [--max-iterations N]", Description: "Start implementer, then keep looping"},
 	{Name: "/archive", Usage: "/archive", Description: "Archive the active task"},
 	{Name: "/help", Usage: "/help", Description: "Show this command menu"},
 	{Name: "/quit", Usage: "/quit", Description: "Exit the interactive terminal"},
@@ -930,6 +934,21 @@ func handleInteractiveCommand(rawCommand string, out, errOut io.Writer, e env) (
 					}
 					fmt.Fprintf(errOut, "agents: loop: %v\n", runErr)
 				}
+			} else if len(args) > 0 && (args[0] == "review" || args[0] == "implement") && e.isTTY {
+				role := "reviewer"
+				if args[0] == "implement" {
+					role = "implementer"
+				}
+				maxRuns, note, flagErr := parseInteractiveRoleCommandArgs(args[1:])
+				if flagErr != nil {
+					fmt.Fprintf(errOut, "agents: %s: %v\n", args[0], flagErr)
+				} else if runErr := runInteractiveQueuedRole(e, out, maxRuns, role, note); runErr != nil {
+					if errors.Is(runErr, errRunInterrupted) {
+						printInterruptHint(out, e)
+						return 130, true
+					}
+					fmt.Fprintf(errOut, "agents: loop: %v\n", runErr)
+				}
 			} else if len(args) > 0 {
 				// The composer owns stdin here; a non-file reader makes
 				// TTY-gated commands (go's view) fall back to plain output.
@@ -968,8 +987,9 @@ func runTerminalLoopTTY(in *os.File, out, errOut io.Writer, e env) int {
 	fmt.Fprint(out, "\x1b[?2004h")
 	defer fmt.Fprint(out, "\x1b[?2004l")
 
+	history := []string{}
 	for {
-		rawCommand, err := readComposerLine(in, out, e)
+		rawCommand, err := readComposerLine(in, out, e, &history)
 		if err != nil {
 			if err == io.EOF {
 				fmt.Fprintln(out)
@@ -985,6 +1005,7 @@ func runTerminalLoopTTY(in *os.File, out, errOut io.Writer, e env) int {
 		if rawCommand == "" {
 			continue
 		}
+		history = appendCommandHistory(history, rawCommand)
 		term.Restore(fd, oldState)
 		code, done := handleInteractiveCommand(rawCommand, out, errOut, e)
 		if done {
@@ -1006,8 +1027,9 @@ func printInterruptHint(out io.Writer, e env) {
 	fmt.Fprintln(out, "To continue this session, run agents")
 }
 
-func readComposerLine(in *os.File, out io.Writer, e env) (string, error) {
+func readComposerLine(in *os.File, out io.Writer, e env, history *[]string) (string, error) {
 	var line []rune
+	historyIndex := len(commandHistory(history))
 	renderedLines := 0
 	renderedLines = renderComposer(out, string(line), e.isTTY, renderedLines)
 	buf := make([]byte, 1)
@@ -1031,12 +1053,29 @@ func readComposerLine(in *os.File, out io.Writer, e env) (string, error) {
 				line = []rune(completed)
 			}
 		case 27:
-			pasted, ok, err := readBracketedPaste(in)
+			escape, pasted, ok, err := readEscapeInput(in)
 			if err != nil {
 				return "", err
 			}
 			if ok {
 				line = append(line, []rune(normalizePastedText(pasted))...)
+			} else if escape == "up" || escape == "down" {
+				items := commandHistory(history)
+				if len(items) == 0 {
+					break
+				}
+				if escape == "up" {
+					if historyIndex > 0 {
+						historyIndex--
+					}
+				} else if historyIndex < len(items) {
+					historyIndex++
+				}
+				if historyIndex >= len(items) {
+					line = nil
+				} else {
+					line = []rune(items[historyIndex])
+				}
 			}
 		case 127, 8:
 			if len(line) > 0 {
@@ -1051,9 +1090,32 @@ func readComposerLine(in *os.File, out io.Writer, e env) (string, error) {
 	}
 }
 
+func commandHistory(history *[]string) []string {
+	if history == nil {
+		return nil
+	}
+	return *history
+}
+
+func appendCommandHistory(history []string, command string) []string {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return history
+	}
+	if len(history) > 0 && history[len(history)-1] == command {
+		return history
+	}
+	const maxHistory = 100
+	history = append(history, command)
+	if len(history) > maxHistory {
+		history = history[len(history)-maxHistory:]
+	}
+	return history
+}
+
 func renderComposer(out io.Writer, line string, color bool, previousExtraLines int) int {
 	fmt.Fprint(out, "\r\033[J")
-	fmt.Fprintf(out, "› %s", line)
+	fmt.Fprintf(out, "› %s", renderComposerLine(line, color))
 	suggestions := composerSuggestionLines(line, color)
 	for _, suggestion := range suggestions {
 		fmt.Fprintf(out, "\r\n%s", suggestion)
@@ -1066,6 +1128,23 @@ func renderComposer(out io.Writer, line string, color bool, previousExtraLines i
 		fmt.Fprintf(out, "\033[%dC", width)
 	}
 	return len(suggestions)
+}
+
+func renderComposerLine(line string, color bool) string {
+	if !color || !strings.HasPrefix(line, "/") {
+		return line
+	}
+	commandEnd := strings.IndexFunc(line, unicode.IsSpace)
+	if commandEnd < 0 {
+		commandEnd = len(line)
+	}
+	command := line[:commandEnd]
+	for _, spec := range interactiveSlashCommands {
+		if spec.Name == command {
+			return "\x1b[36m" + command + "\x1b[0m" + line[commandEnd:]
+		}
+	}
+	return line
 }
 
 func composerSuggestionLines(line string, color bool) []string {
@@ -1100,14 +1179,59 @@ func composerSuggestionLines(line string, color bool) []string {
 	return lines
 }
 
-func readBracketedPaste(in *os.File) (string, bool, error) {
-	seq := make([]byte, 5)
-	if _, err := io.ReadFull(in, seq); err != nil {
-		return "", false, err
+func readEscapeInput(in *os.File) (string, string, bool, error) {
+	buf := make([]byte, 1)
+	if _, err := in.Read(buf); err != nil {
+		return "", "", false, err
 	}
-	if string(seq) != "[200~" {
-		return "", false, nil
+	switch buf[0] {
+	case '[':
+		return readCSIInput(in)
+	case 'O':
+		// Application cursor-key mode sends ESC O A/B/C/D.
+		if _, err := in.Read(buf); err != nil {
+			return "", "", false, err
+		}
+		switch buf[0] {
+		case 'A':
+			return "up", "", false, nil
+		case 'B':
+			return "down", "", false, nil
+		default:
+			return "", "", false, nil
+		}
+	default:
+		return "", "", false, nil
 	}
+}
+
+func readCSIInput(in *os.File) (string, string, bool, error) {
+	var seq strings.Builder
+	buf := make([]byte, 1)
+	for {
+		if _, err := in.Read(buf); err != nil {
+			return "", "", false, err
+		}
+		b := buf[0]
+		seq.WriteByte(b)
+		if b >= 0x40 && b <= 0x7e {
+			break
+		}
+	}
+	switch seq.String() {
+	case "A":
+		return "up", "", false, nil
+	case "B":
+		return "down", "", false, nil
+	case "200~":
+		pasted, ok, err := readBracketedPasteBody(in)
+		return "", pasted, ok, err
+	default:
+		return "", "", false, nil
+	}
+}
+
+func readBracketedPasteBody(in *os.File) (string, bool, error) {
 	var b strings.Builder
 	window := make([]byte, 0, 6)
 	buf := make([]byte, 1)
@@ -1438,6 +1562,9 @@ func applyCoordinatorDirective(e env, actor string, directive coordinatorDirecti
 	if !coordinatorDirectiveActionable(actor, directive) {
 		return nil
 	}
+	if !policyForRole(actor).canHandoffTo(directive.Role, directive.Ready) {
+		return fmt.Errorf("%s cannot hand off to %s in this context", actor, directive.Role)
+	}
 	args := []string{"--to", directive.Role, directive.Text}
 	if strings.TrimSpace(actor) != "" {
 		args = append(args, "--by", actor)
@@ -1450,14 +1577,11 @@ func coordinatorDirectiveActionable(actor string, directive coordinatorDirective
 	if coordinatorDirectivePlaceholder(directive) {
 		return false
 	}
-	if actor != "coordinator" || directive.Role != "implementer" {
-		return true
-	}
-	if !directive.Ready {
+	text := strings.TrimSpace(strings.ToLower(directive.Text))
+	if text == "" || text == "clear implementation request with context and verification" {
 		return false
 	}
-	text := strings.TrimSpace(strings.ToLower(directive.Text))
-	return text != "" && text != "clear implementation request with context and verification"
+	return policyForRole(actor).canHandoffTo(directive.Role, directive.Ready)
 }
 
 func coordinatorDirectivePlaceholder(directive coordinatorDirective) bool {
@@ -1743,8 +1867,7 @@ func sentenceCase(text string) string {
 
 func printInteractiveRoleHeader(w io.Writer, role string) {
 	title := titleRole(role)
-	fmt.Fprintln(w)
-	printInteractiveMarkdown(w, "## "+title)
+	fmt.Fprintf(w, "\n\033[1m%s\033[0m\n\n", title)
 }
 
 func titleRole(role string) string {
@@ -1778,6 +1901,20 @@ func printInteractiveRoleRunResult(w io.Writer, result roleRunResult) {
 
 func runInteractiveQueuedRoles(e env, out io.Writer, maxRuns int) error {
 	stop, err := runManagedLoop(e, out, maxRuns, true, nil, nil, loopDisplayInteractive, "")
+	return printInteractiveLoopStop(out, stop, err)
+}
+
+func runInteractiveQueuedRole(e env, out io.Writer, maxRuns int, role, note string) error {
+	if strings.TrimSpace(note) != "" {
+		if _, err := addHandoff(e, []string{"--to", role, strings.TrimSpace(note)}, time.Now().UTC()); err != nil {
+			return err
+		}
+	}
+	stop, err := runManagedLoop(e, out, maxRuns, true, nil, nil, loopDisplayInteractive, role)
+	return printInteractiveLoopStop(out, stop, err)
+}
+
+func printInteractiveLoopStop(out io.Writer, stop loopStop, err error) error {
 	if err != nil {
 		return err
 	}
@@ -1795,6 +1932,77 @@ func runInteractiveQueuedRoles(e env, out io.Writer, maxRuns int) error {
 		fmt.Fprintf(out, "\nLoop paused after %d role runs; use /run to continue.\n", stop.Runs)
 	}
 	return nil
+}
+
+func parseInteractiveRoleCommandArgs(args []string) (int, string, error) {
+	maxRuns := defaultMaxLoopRuns
+	var note []string
+	for i := 0; i < len(args); i++ {
+		arg := strings.TrimSpace(args[i])
+		switch arg {
+		case "":
+			continue
+		case "--max-iterations":
+			if i+1 >= len(args) {
+				return 0, "", fmt.Errorf("--max-iterations requires a number")
+			}
+			n, err := strconv.Atoi(strings.TrimSpace(args[i+1]))
+			if err != nil || n < 1 {
+				return 0, "", fmt.Errorf("--max-iterations requires a positive number")
+			}
+			maxRuns = n
+			i++
+		default:
+			if strings.HasPrefix(arg, "--") {
+				return 0, "", fmt.Errorf("unknown flag %s", arg)
+			}
+			note = append(note, arg)
+		}
+	}
+	return maxRuns, strings.TrimSpace(strings.Join(note, " ")), nil
+}
+
+type rolePolicy struct {
+	Role                string
+	MayHandoffTo        map[string]bool
+	RequiresReady       map[string]bool
+	MayRecordVerify     bool
+	MayRecordFindingFix bool
+}
+
+func policyForRole(role string) rolePolicy {
+	switch role {
+	case "implementer":
+		return rolePolicy{
+			Role:                role,
+			MayHandoffTo:        map[string]bool{"reviewer": true, "coordinator": true},
+			MayRecordFindingFix: true,
+		}
+	case "reviewer":
+		return rolePolicy{
+			Role:            role,
+			MayHandoffTo:    map[string]bool{"implementer": true, "coordinator": true},
+			MayRecordVerify: true,
+		}
+	case "coordinator":
+		return rolePolicy{
+			Role:          role,
+			MayHandoffTo:  map[string]bool{"implementer": true, "reviewer": true},
+			RequiresReady: map[string]bool{"implementer": true, "reviewer": true},
+		}
+	default:
+		return rolePolicy{Role: role}
+	}
+}
+
+func (p rolePolicy) canHandoffTo(role string, ready bool) bool {
+	if !p.MayHandoffTo[role] {
+		return false
+	}
+	if p.RequiresReady[role] && !ready {
+		return false
+	}
+	return true
 }
 
 func coordinatorChatTitle(text string) string {
@@ -4492,6 +4700,7 @@ func (w *cursorStreamWriter) FinalOutput() string {
 	}
 	w.flushAssistantText()
 	text := firstNonEmpty(w.result, w.finalAssistant, w.deltas.String(), w.output.String())
+	text, _ = stripProgressDirectives(text)
 	if w.usage != "" {
 		text = strings.TrimSpace(text) + "\nToken usage: " + w.usage
 	}
@@ -4544,33 +4753,6 @@ func (w *cursorStreamWriter) handleLine(line string) {
 func (w *cursorStreamWriter) processAssistantText(text string) {
 	w.textPending += text
 	for {
-		if w.inProgress {
-			line, rest, ok := strings.Cut(w.textPending, "\n")
-			if !ok {
-				if strings.TrimSpace(w.textPending) == "```" {
-					if progress, ok := parseProgressDirectiveLines(w.progressBlock); ok {
-						w.printProgress(progress)
-					}
-					w.textPending = ""
-					w.progressBlock = nil
-					w.inProgress = false
-					continue
-				}
-				return
-			}
-			w.textPending = rest
-			if strings.TrimSpace(line) == "```" {
-				if progress, ok := parseProgressDirectiveLines(w.progressBlock); ok {
-					w.printProgress(progress)
-				}
-				w.progressBlock = nil
-				w.inProgress = false
-				continue
-			}
-			w.progressBlock = append(w.progressBlock, line)
-			continue
-		}
-
 		idx := strings.Index(w.textPending, "```agents-progress")
 		if idx < 0 {
 			keepFrom := partialFenceStart(w.textPending)
@@ -4589,13 +4771,20 @@ func (w *cursorStreamWriter) processAssistantText(text string) {
 			w.emitAssistantText(w.textPending[:idx])
 			w.textPending = w.textPending[idx:]
 		}
-		if newline := strings.IndexByte(w.textPending, '\n'); newline >= 0 {
-			w.textPending = w.textPending[newline+1:]
-			w.inProgress = true
-			w.progressBlock = nil
-			continue
+		contentStartRel := strings.IndexByte(w.textPending, '\n')
+		if contentStartRel < 0 {
+			return
 		}
-		return
+		contentStart := contentStartRel + 1
+		endRel := strings.Index(w.textPending[contentStart:], "```")
+		if endRel < 0 {
+			return
+		}
+		content := w.textPending[contentStart : contentStart+endRel]
+		if progress, ok := parseProgressDirectiveContent(content); ok {
+			w.printProgress(progress)
+		}
+		w.textPending = w.textPending[contentStart+endRel+len("```"):]
 	}
 }
 
@@ -4717,20 +4906,54 @@ func (e cursorStreamEvent) messageText() string {
 }
 
 func parseProgressDirectiveFromText(text string) (progressDirective, bool) {
-	lines := strings.Split(text, "\n")
-	for i, line := range lines {
-		if strings.TrimSpace(line) != "```agents-progress" {
-			continue
-		}
-		var block []string
-		for _, blockLine := range lines[i+1:] {
-			if strings.TrimSpace(blockLine) == "```" {
-				return parseProgressDirectiveLines(block)
-			}
-			block = append(block, blockLine)
-		}
+	_, directives := stripProgressDirectives(text)
+	if len(directives) > 0 {
+		return directives[0], true
 	}
 	return progressDirective{}, false
+}
+
+func stripProgressDirectives(text string) (string, []progressDirective) {
+	var out strings.Builder
+	var directives []progressDirective
+	for {
+		idx := strings.Index(text, "```agents-progress")
+		if idx < 0 {
+			out.WriteString(text)
+			break
+		}
+		out.WriteString(text[:idx])
+		rest := text[idx:]
+		contentStartRel := strings.IndexByte(rest, '\n')
+		if contentStartRel < 0 {
+			out.WriteString(rest)
+			break
+		}
+		contentStart := contentStartRel + 1
+		endRel := strings.Index(rest[contentStart:], "```")
+		if endRel < 0 {
+			out.WriteString(rest)
+			break
+		}
+		content := rest[contentStart : contentStart+endRel]
+		if progress, ok := parseProgressDirectiveContent(content); ok {
+			directives = append(directives, progress)
+		}
+		text = rest[contentStart+endRel+len("```"):]
+	}
+	return out.String(), directives
+}
+
+func parseProgressDirectiveContent(content string) (progressDirective, bool) {
+	var lines []string
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	return parseProgressDirectiveLines(lines)
 }
 
 func (e cursorStreamEvent) usageString() string {
@@ -4997,6 +5220,7 @@ func cleanCodexExecOutput(output string) string {
 }
 
 func cleanAgentsCLIRecordOutput(output string) string {
+	output, _ = stripProgressDirectives(output)
 	var kept []string
 	inProgressBlock := false
 	skipNextUsageLine := false
@@ -5129,31 +5353,7 @@ func buildRolePrompt(e env, state loopState) (string, error) {
 		fmt.Fprintln(&b, "- Keep build caches, compiled binaries, and scratch files out of the repository (including .agents/); use the system temp directory instead.")
 		fmt.Fprintln(&b, "- Do not edit implementation code, do not mark findings fixed, and do not commit.")
 	case "coordinator":
-		fmt.Fprintf(&b, "You are the coordinator for this Agents task.\n\n")
-		fmt.Fprintf(&b, "Task: %s\nPath: %s\nNext action: %s\n\n", state.Task.Title, state.Task.Path, state.NextAction)
-		appendPromptFile(&b, e.cwd, state.Task.Path, "scope.md", "Scope")
-		appendPromptFile(&b, e.cwd, state.Task.Path, "status.md", "Status")
-		appendPromptFile(&b, e.cwd, state.Task.Path, "next.md", "Next")
-		appendPromptDir(&b, e.cwd, state.Task.Path, "handoffs", "Handoffs")
-		appendPromptDir(&b, e.cwd, state.Task.Path, "decisions", "Decisions")
-		fmt.Fprintln(&b, "Working agreement:")
-		fmt.Fprintln(&b, "- Treat user handoffs to coordinator as conversational planning context.")
-		fmt.Fprintln(&b, "- Emit brief JSON progress updates for the interactive UI when phases change:")
-		fmt.Fprintln(&b, "  ```agents-progress")
-		fmt.Fprintln(&b, `  {"status":"Shaping scope","detail":"Checking existing project context and missing constraints"}`)
-		fmt.Fprintln(&b, "  ```")
-		fmt.Fprintln(&b, "- If the user is asking a question, comparing options, or says they are not ready to change code, answer and stop without an `agents-handoff` block.")
-		fmt.Fprintln(&b, "- Emit an `agents-handoff` to implementer only when the user clearly asks to implement, proceed, run, or hand work to an agent.")
-		fmt.Fprintln(&b, "- Handoffs to implementer must include `ready: true`; without it, Agents treats the response as planning-only.")
-		fmt.Fprintln(&b, "- You may inspect the repository in read-only mode to answer planning or project-understanding questions.")
-		fmt.Fprintln(&b, "- Use whatever read-only tools are available; do not block only because a preferred search tool is unavailable.")
-		fmt.Fprintln(&b, "- If evidence is limited, answer with what you can infer and name the missing context briefly.")
-		fmt.Fprintln(&b, "- Ask concise follow-up questions when the task, desired behavior, ref, constraints, or verification are unclear.")
-		fmt.Fprintln(&b, "- Record decisions when the plan becomes concrete.")
-		fmt.Fprintln(&b, "- Do not run `agents` commands yourself; the parent Agents process records coordination state.")
-		fmt.Fprintln(&b, "- When implementation is explicitly ready, end your response with one `agents-handoff` fenced block containing `role: implementer`, `ready: true`, and a specific `text:` request for the implementer.")
-		fmt.Fprintln(&b, "- Never copy placeholder handoff text; if you are still discussing, do not emit a handoff block.")
-		fmt.Fprintln(&b, "- Do not edit implementation code or coordination files directly.")
+		return buildCoordinatorPrompt(e, state)
 	}
 	return b.String(), nil
 }
@@ -5198,6 +5398,9 @@ func applyRoleOutputDirectives(e env, actor, output string) (string, error) {
 func applyVerificationDirective(e env, actor string, directive verificationDirective) error {
 	if verificationDirectivePlaceholder(directive) {
 		return nil
+	}
+	if !policyForRole(actor).MayRecordVerify {
+		return fmt.Errorf("%s cannot record verification", actor)
 	}
 	args := []string{directive.Text, "--by", actor}
 	if directive.Cmd != "" {
