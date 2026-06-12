@@ -5702,14 +5702,71 @@ func TestRunActivityCoalescesTokenStreamFragments(t *testing.T) {
 	}
 }
 
+func TestRunActivityCoalescesCommandAndFenceFragments(t *testing.T) {
+	dir := t.TempDir()
+	sink := newTestRunActivitySink(dir)
+	sink.handle(loopEvent{Event: "run_started", RunID: "r1", Role: "implementer", Agent: "agent"})
+	for _, chunk := range []string{
+		"go\n",
+		"test\n",
+		"./...\n",
+		"```\n",
+		"bash\n",
+		"go\n",
+		"test\n",
+		"./...\n",
+		"```\n",
+	} {
+		sink.handle(loopEvent{Event: "output", RunID: "r1", Role: "implementer", Chunk: chunk})
+	}
+	sink.handle(loopEvent{Event: "run_finished", RunID: "r1", Role: "implementer", Agent: "agent"})
+
+	messages := readTestRunActivityMessages(t, dir)
+	got := strings.Join(messages, "\n---\n")
+	for _, want := range []string{"go test ./...", "```bash\ngo test ./...\n```"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("activity missing coalesced fragment %q:\n%s", want, got)
+		}
+	}
+	for _, leaked := range []string{"\ngo\n", "\ntest\n", "\n./...\n---\n```"} {
+		if strings.Contains("\n"+got+"\n", leaked) {
+			t.Fatalf("activity persisted split fragment %q:\n%s", leaked, got)
+		}
+	}
+}
+
+func TestRunActivityCoalescesFencedTokenFragments(t *testing.T) {
+	dir := t.TempDir()
+	sink := newTestRunActivitySink(dir)
+	sink.handle(loopEvent{Event: "run_started", RunID: "r1", Role: "implementer", Agent: "agent"})
+	for _, chunk := range []string{
+		"```\n",
+		"sh\n",
+		"go\n",
+		"test\n",
+		"./...\n",
+		"```\n",
+	} {
+		sink.handle(loopEvent{Event: "output", RunID: "r1", Role: "implementer", Chunk: chunk})
+	}
+	sink.handle(loopEvent{Event: "run_finished", RunID: "r1", Role: "implementer", Agent: "agent"})
+
+	messages := readTestRunActivityMessages(t, dir)
+	got := strings.Join(messages, "\n")
+	want := "```sh\ngo test ./...\n```"
+	if got != want {
+		t.Fatalf("fenced token fragments = %q, want %q", got, want)
+	}
+	for _, fragment := range []string{"\nsh\n", "\ngo\n", "\ntest\n", "\n./...\n"} {
+		if strings.Contains("\n"+got+"\n", fragment) {
+			t.Fatalf("activity persisted fenced token fragment %q:\n%s", fragment, got)
+		}
+	}
+}
+
 func TestRunActivityPreservesShortProgressLines(t *testing.T) {
 	dir := t.TempDir()
-	sink := &runActivitySink{
-		dir:     dir,
-		starts:  make(map[string]time.Time),
-		agents:  make(map[string]string),
-		pending: make(map[string][]string),
-	}
+	sink := newTestRunActivitySink(dir)
 	sink.handle(loopEvent{Event: "run_started", RunID: "r1", Role: "implementer", Agent: "agent"})
 	for _, chunk := range []string{
 		"Reading files\n",
@@ -5724,13 +5781,7 @@ func TestRunActivityPreservesShortProgressLines(t *testing.T) {
 	}
 	sink.handle(loopEvent{Event: "run_finished", RunID: "r1", Role: "implementer", Agent: "agent"})
 
-	records := readTestRunActivity(t, dir)
-	var messages []string
-	for _, rec := range records {
-		if rec.Event == "message" {
-			messages = append(messages, rec.Text)
-		}
-	}
+	messages := readTestRunActivityMessages(t, dir)
 	if len(messages) != 3 {
 		t.Fatalf("expected short progress lines plus coalesced full sentence, got %#v", messages)
 	}
@@ -5743,6 +5794,28 @@ func TestRunActivityPreservesShortProgressLines(t *testing.T) {
 			t.Fatalf("message %d = %q, want %q (all messages: %#v)", i, messages[i], want, messages)
 		}
 	}
+}
+
+func newTestRunActivitySink(dir string) *runActivitySink {
+	return &runActivitySink{
+		dir:     dir,
+		starts:  make(map[string]time.Time),
+		agents:  make(map[string]string),
+		pending: make(map[string][]string),
+	}
+}
+
+func readTestRunActivityMessages(t *testing.T, dir string) []string {
+	t.Helper()
+
+	records := readTestRunActivity(t, dir)
+	var messages []string
+	for _, rec := range records {
+		if rec.Event == "message" {
+			messages = append(messages, rec.Text)
+		}
+	}
+	return messages
 }
 
 func TestRunPersistsFailedRunFinishedActivity(t *testing.T) {
@@ -5902,6 +5975,33 @@ func TestRunsAndWatchDisplayRunActivity(t *testing.T) {
 	}
 }
 
+func TestRunActivityRendersMarkdownOnlyForTTY(t *testing.T) {
+	text := "## Status\n\n- **Task** routing\n\n```sh\ngo test ./...\n```\n"
+
+	var ttyOut bytes.Buffer
+	printRunActivityRecord(&ttyOut, runActivityRecord{Event: "message", Text: text}, true)
+	ttyPlain := ansiEscapes.ReplaceAllString(ttyOut.String(), "")
+	for _, want := range []string{"Status", "Task routing", "go test ./..."} {
+		if !strings.Contains(ttyPlain, want) {
+			t.Fatalf("TTY markdown output missing %q:\n%s", want, ttyPlain)
+		}
+	}
+	for _, raw := range []string{"## Status", "**Task**", "```sh"} {
+		if strings.Contains(ttyPlain, raw) {
+			t.Fatalf("TTY markdown output kept raw markdown %q:\n%s", raw, ttyPlain)
+		}
+	}
+
+	var scriptOut bytes.Buffer
+	printRunActivityRecord(&scriptOut, runActivityRecord{Event: "message", Text: text}, false)
+	script := scriptOut.String()
+	for _, want := range []string{"  ## Status", "  - **Task** routing", "  ```sh", "  go test ./..."} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("script output missing stable raw line %q:\n%s", want, script)
+		}
+	}
+}
+
 func TestWatchFollowStartingEmptyKeepsPolling(t *testing.T) {
 	var out bytes.Buffer
 	code := withTempProcessEnv(t, func(home, cwd string) int {
@@ -5911,9 +6011,12 @@ func TestWatchFollowStartingEmptyKeepsPolling(t *testing.T) {
 		}
 		oldFollow := followRunActivityFunc
 		defer func() { followRunActivityFunc = oldFollow }()
-		followRunActivityFunc = func(out io.Writer, dir string, printed int) error {
+		followRunActivityFunc = func(out io.Writer, dir string, printed int, renderMarkdown bool) error {
 			if printed != 0 {
 				t.Fatalf("expected empty follow to start at printed=0, got %d", printed)
+			}
+			if !renderMarkdown {
+				t.Fatal("expected TTY watch follow to render markdown")
 			}
 			fmt.Fprintln(out, "follow started")
 			return nil
@@ -5948,7 +6051,7 @@ func TestFollowRunActivityPollsAfterStartingEmpty(t *testing.T) {
 		interrupts := make(chan os.Signal, 1)
 		errs := make(chan error, 1)
 		go func() {
-			errs <- followRunActivityUntilInterrupted(&out, dir, 0, ticks, interrupts)
+			errs <- followRunActivityUntilInterrupted(&out, dir, 0, ticks, interrupts, false)
 		}()
 
 		if err := appendRunActivityRecord(filepath.Join(dir, "r1.jsonl"), runActivityRecord{Event: "run_started", Time: "2026-06-05T10:01:00Z", RunID: "r1", Role: "implementer", Agent: "codex"}); err != nil {
@@ -6333,16 +6436,25 @@ func TestMCPInitializeListsRequestedTools(t *testing.T) {
 	}
 }
 
-func TestMCPRejectsBareJSONInput(t *testing.T) {
+func TestMCPAcceptsLineDelimitedJSONInput(t *testing.T) {
 	var out, errOut bytes.Buffer
+	input := mcpTestLines(
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}`,
+		`{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`,
+		`{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`,
+	)
 	code := withTempProcessEnv(t, func(home, cwd string) int {
-		return Run([]string{"mcp"}, strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`), &out, &errOut)
+		return Run([]string{"mcp"}, strings.NewReader(input), &out, &errOut)
 	})
-	if code != 1 {
-		t.Fatalf("expected bare JSON input to fail, code=%d stdout=%s stderr=%s", code, out.String(), errOut.String())
+	if code != 0 {
+		t.Fatalf("Run mcp code=%d stdout=%s stderr=%s", code, out.String(), errOut.String())
 	}
-	if !strings.Contains(errOut.String(), "missing Content-Length header") {
-		t.Fatalf("expected missing Content-Length error, got %s", errOut.String())
+	responses := decodeMCPTestResponses(t, out.String())
+	if len(responses) != 2 {
+		t.Fatalf("expected initialize and tools/list responses, got %d: %s", len(responses), out.String())
+	}
+	if got := responses[0]["result"].(map[string]any)["serverInfo"].(map[string]any)["name"]; got != "agents" {
+		t.Fatalf("unexpected server name: %v", got)
 	}
 }
 
@@ -6476,12 +6588,16 @@ func mcpTestFrames(messages ...string) string {
 	return b.String()
 }
 
+func mcpTestLines(messages ...string) string {
+	return strings.Join(messages, "\n") + "\n"
+}
+
 func decodeMCPTestResponses(t *testing.T, output string) []map[string]any {
 	t.Helper()
 	var responses []map[string]any
 	reader := bufio.NewReader(strings.NewReader(output))
 	for {
-		message, err := readMCPMessage(reader)
+		message, _, err := readMCPMessage(reader)
 		if err == io.EOF {
 			break
 		}

@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-const mcpProtocolVersion = "2024-11-05"
+const mcpProtocolVersion = "2025-06-18"
 
 type mcpRequest struct {
 	JSONRPC string          `json:"jsonrpc"`
@@ -69,17 +69,19 @@ func runMCPCommand(args []string, in io.Reader, out, errOut io.Writer, e env) in
 
 func serveMCP(in io.Reader, out io.Writer, e env) error {
 	reader := bufio.NewReader(in)
+	framing := "line"
 	for {
-		message, err := readMCPMessage(reader)
+		message, messageFraming, err := readMCPMessage(reader)
 		if err == io.EOF {
 			return nil
 		}
 		if err != nil {
 			return err
 		}
+		framing = messageFraming
 		var req mcpRequest
 		if err := json.Unmarshal(message, &req); err != nil {
-			if err := writeMCPMessage(out, mcpResponse{JSONRPC: "2.0", Error: &mcpError{Code: -32700, Message: "parse error"}}); err != nil {
+			if err := writeMCPMessage(out, framing, mcpResponse{JSONRPC: "2.0", Error: &mcpError{Code: -32700, Message: "parse error"}}); err != nil {
 				return err
 			}
 			continue
@@ -88,38 +90,56 @@ func serveMCP(in io.Reader, out io.Writer, e env) error {
 		if !ok {
 			continue
 		}
-		if err := writeMCPMessage(out, resp); err != nil {
+		if err := writeMCPMessage(out, framing, resp); err != nil {
 			return err
 		}
 	}
 }
 
-func readMCPMessage(reader *bufio.Reader) ([]byte, error) {
+func readMCPMessage(reader *bufio.Reader) ([]byte, string, error) {
+	peek, err := reader.Peek(1)
+	if err != nil {
+		return nil, "", err
+	}
+	if peek[0] != 'C' && peek[0] != 'c' {
+		line, err := reader.ReadBytes('\n')
+		if err != nil && !(err == io.EOF && len(line) > 0) {
+			return nil, "", err
+		}
+		return bytes.TrimSpace(line), "line", nil
+	}
 	header, err := textproto.NewReader(reader).ReadMIMEHeader()
 	if err != nil {
 		if err != io.EOF {
-			return nil, fmt.Errorf("missing Content-Length header: %w", err)
+			return nil, "", fmt.Errorf("missing Content-Length header: %w", err)
 		}
-		return nil, err
+		return nil, "", err
 	}
 	lengthText := strings.TrimSpace(header.Get("Content-Length"))
 	if lengthText == "" {
-		return nil, fmt.Errorf("missing Content-Length header")
+		return nil, "", fmt.Errorf("missing Content-Length header")
 	}
 	length, err := strconv.Atoi(lengthText)
 	if err != nil || length < 0 {
-		return nil, fmt.Errorf("invalid Content-Length header")
+		return nil, "", fmt.Errorf("invalid Content-Length header")
 	}
 	message := make([]byte, length)
 	if _, err := io.ReadFull(reader, message); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return message, nil
+	return message, "content-length", nil
 }
 
-func writeMCPMessage(out io.Writer, payload any) error {
+func writeMCPMessage(out io.Writer, framing string, payload any) error {
 	data, err := json.Marshal(payload)
 	if err != nil {
+		return err
+	}
+	if framing == "line" {
+		if _, err := out.Write(data); err != nil {
+			return err
+		}
+		_, err = fmt.Fprintln(out)
 		return err
 	}
 	if _, err := fmt.Fprintf(out, "Content-Length: %d\r\n\r\n", len(data)); err != nil {

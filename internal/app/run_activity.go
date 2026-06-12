@@ -113,13 +113,30 @@ func (s *runActivitySink) coalesceMessageText(runID, text string) string {
 		if line == "" {
 			continue
 		}
-		if isTinyRunActivityFragment(line) {
+		if s.pendingInRunActivityFence(runID) {
 			s.pending[runID] = append(s.pending[runID], line)
+			if completesRunActivityFence(s.pending[runID]) {
+				kept = append(kept, formatRunActivityPending(s.pending[runID]))
+				delete(s.pending, runID)
+			}
 			continue
 		}
-		pending := strings.Join(s.pending[runID], " ")
+		if isTinyRunActivityFragment(line) {
+			s.pending[runID] = append(s.pending[runID], line)
+			if completesRunActivityFence(s.pending[runID]) {
+				kept = append(kept, formatRunActivityPending(s.pending[runID]))
+				delete(s.pending, runID)
+			}
+			continue
+		}
+		pending := formatRunActivityPending(s.pending[runID])
 		if pending != "" {
-			if !strings.Contains(normalizeRunActivityFragment(line), normalizeRunActivityFragment(pending)) {
+			switch {
+			case strings.Contains(normalizeRunActivityFragment(line), normalizeRunActivityFragment(pending)):
+				// Full text arrived after token fragments; keep the complete line only.
+			case shouldJoinRunActivityPending(pending, line):
+				line = pending + " " + line
+			default:
 				kept = append(kept, pending)
 			}
 			delete(s.pending, runID)
@@ -129,8 +146,13 @@ func (s *runActivitySink) coalesceMessageText(runID, text string) string {
 	return strings.Join(kept, "\n")
 }
 
+func (s *runActivitySink) pendingInRunActivityFence(runID string) bool {
+	pending := s.pending[runID]
+	return len(pending) > 0 && strings.HasPrefix(pending[0], "```") && !completesRunActivityFence(pending)
+}
+
 func (s *runActivitySink) flushPendingMessage(runID, at string) {
-	pending := strings.TrimSpace(strings.Join(s.pending[runID], " "))
+	pending := strings.TrimSpace(formatRunActivityPending(s.pending[runID]))
 	delete(s.pending, runID)
 	if pending == "" {
 		return
@@ -147,11 +169,83 @@ func isTinyRunActivityFragment(line string) bool {
 	if len([]rune(line)) > 32 {
 		return false
 	}
-	if strings.ContainsAny(line, ".!?:`/\\") {
+	if line == "```" || strings.HasPrefix(line, "```") {
+		return true
+	}
+	if strings.ContainsAny(line, ".!?:/\\") {
 		return false
 	}
 	fields := strings.Fields(line)
 	return len(fields) == 1
+}
+
+func formatRunActivityPending(parts []string) string {
+	if len(parts) == 0 {
+		return ""
+	}
+	if !strings.HasPrefix(parts[0], "```") {
+		return strings.TrimSpace(strings.Join(parts, " "))
+	}
+	opening := parts[0]
+	bodyStart := 1
+	if opening == "```" && len(parts) > 1 && isLikelyFenceLanguage(parts[1]) {
+		opening += parts[1]
+		bodyStart = 2
+	}
+	bodyEnd := len(parts)
+	closing := ""
+	if bodyEnd > bodyStart && parts[bodyEnd-1] == "```" {
+		closing = "```"
+		bodyEnd--
+	}
+	var lines []string
+	lines = append(lines, opening)
+	if bodyEnd > bodyStart {
+		lines = append(lines, strings.Join(parts[bodyStart:bodyEnd], " "))
+	}
+	if closing != "" {
+		lines = append(lines, closing)
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
+func isLikelyFenceLanguage(s string) bool {
+	if s == "" || strings.HasPrefix(s, "```") || strings.ContainsAny(s, " \t/\\.") {
+		return false
+	}
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func completesRunActivityFence(parts []string) bool {
+	if len(parts) < 2 || !strings.HasPrefix(parts[0], "```") {
+		return false
+	}
+	return parts[len(parts)-1] == "```"
+}
+
+func shouldJoinRunActivityPending(pending, line string) bool {
+	if pending == "" || line == "" {
+		return false
+	}
+	if strings.HasPrefix(pending, "```") || strings.HasPrefix(line, "```") {
+		return true
+	}
+	if strings.ContainsAny(line, "/\\") {
+		return true
+	}
+	lower := strings.ToLower(pending)
+	for _, cmd := range []string{"go", "git", "npm", "pnpm", "yarn", "make", "cargo", "python", "pytest"} {
+		if lower == cmd || strings.HasPrefix(lower, cmd+" ") {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizeRunActivityFragment(line string) string {
@@ -260,36 +354,36 @@ func printRunActivity(out io.Writer, e env, follow bool) error {
 		if follow {
 			fmt.Fprintln(out, "Run `agents run` or `agents go` to create activity.")
 			if e.isTTY {
-				return followRunActivityFunc(out, dir, 0)
+				return followRunActivityFunc(out, dir, 0, e.isTTY)
 			}
 		}
 		return nil
 	}
 	fmt.Fprintf(out, "Task: %s\n", active.Title)
 	for _, rec := range records {
-		printRunActivityRecord(out, rec)
+		printRunActivityRecord(out, rec, e.isTTY)
 	}
 	if follow && !e.isTTY {
 		fmt.Fprintln(out, "Follow mode shows persisted activity; rerun to refresh.")
 	}
 	if follow && e.isTTY {
-		return followRunActivityFunc(out, dir, len(records))
+		return followRunActivityFunc(out, dir, len(records), e.isTTY)
 	}
 	return nil
 }
 
 var followRunActivityFunc = followRunActivity
 
-func followRunActivity(out io.Writer, dir string, printed int) error {
+func followRunActivity(out io.Writer, dir string, printed int, renderMarkdown bool) error {
 	interrupts := make(chan os.Signal, 1)
 	signal.Notify(interrupts, os.Interrupt)
 	defer signal.Stop(interrupts)
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
-	return followRunActivityUntilInterrupted(out, dir, printed, ticker.C, interrupts)
+	return followRunActivityUntilInterrupted(out, dir, printed, ticker.C, interrupts, renderMarkdown)
 }
 
-func followRunActivityUntilInterrupted(out io.Writer, dir string, printed int, ticks <-chan time.Time, interrupts <-chan os.Signal) error {
+func followRunActivityUntilInterrupted(out io.Writer, dir string, printed int, ticks <-chan time.Time, interrupts <-chan os.Signal, renderMarkdown bool) error {
 	for {
 		select {
 		case <-interrupts:
@@ -304,7 +398,7 @@ func followRunActivityUntilInterrupted(out io.Writer, dir string, printed int, t
 				printed = 0
 			}
 			for _, rec := range records[printed:] {
-				printRunActivityRecord(out, rec)
+				printRunActivityRecord(out, rec, renderMarkdown)
 			}
 			printed = len(records)
 		}
@@ -348,7 +442,7 @@ func readRunActivityRecords(dir string) ([]runActivityRecord, error) {
 	return records, nil
 }
 
-func printRunActivityRecord(out io.Writer, rec runActivityRecord) {
+func printRunActivityRecord(out io.Writer, rec runActivityRecord, renderMarkdown bool) {
 	switch rec.Event {
 	case "run_started":
 		fmt.Fprintf(out, "[%s] %s started", rec.RunID, titleRole(rec.Role))
@@ -357,11 +451,7 @@ func printRunActivityRecord(out io.Writer, rec runActivityRecord) {
 		}
 		fmt.Fprintln(out)
 	case "message":
-		for _, line := range strings.Split(rec.Text, "\n") {
-			if strings.TrimSpace(line) != "" {
-				fmt.Fprintf(out, "  %s\n", strings.TrimSpace(line))
-			}
-		}
+		printRunActivityMessage(out, rec.Text, renderMarkdown)
 	case "run_finished":
 		status := rec.Status
 		if status == "" {
@@ -374,6 +464,34 @@ func printRunActivityRecord(out io.Writer, rec runActivityRecord) {
 		}
 		if rec.Error != "" {
 			fmt.Fprintf(out, "  error: %s\n", firstActivityLine(rec.Error))
+		}
+	}
+}
+
+func printRunActivityMessage(out io.Writer, text string, renderMarkdown bool) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return
+	}
+	if renderMarkdown && looksLikeMarkdown(text) {
+		width := terminalWriterWidth(out) - 2
+		if width <= 0 {
+			width = 100
+		}
+		if rendered, err := renderTerminalMarkdown(text, width); err == nil {
+			rendered = ansiEscapes.ReplaceAllString(rendered, "")
+			rendered = strings.TrimRight(rendered, "\n")
+			if rendered != "" {
+				for _, line := range cleanRenderedLaneMarkdown(strings.Split(rendered, "\n")) {
+					fmt.Fprintf(out, "  %s\n", strings.TrimRight(line, " "))
+				}
+				return
+			}
+		}
+	}
+	for _, line := range strings.Split(text, "\n") {
+		if strings.TrimSpace(line) != "" {
+			fmt.Fprintf(out, "  %s\n", strings.TrimSpace(line))
 		}
 	}
 }
