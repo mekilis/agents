@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -79,16 +80,23 @@ func (s *runActivitySink) handle(ev loopEvent) {
 		s.agents[ev.RunID] = ev.Agent
 		rec.Status = "started"
 	case "output":
-		text := cleanRunActivityText(s.agents[ev.RunID], ev.Chunk)
-		if text == "" {
+		if s.suppressRunActivityDirectiveChunk(ev.RunID, ev.Chunk) {
 			return
 		}
-		text = s.coalesceMessageText(ev.RunID, text)
-		if text == "" {
-			return
+		events := classifyRunActivityText(s.agents[ev.RunID], ev.Chunk)
+		for _, activity := range events {
+			text := s.coalesceMessageText(ev.RunID, activity.Text)
+			if text == "" {
+				continue
+			}
+			rec.Event = "message"
+			rec.Text = normalizeRunActivityEventText(activity.Kind, text)
+			if rec.Text == "" {
+				continue
+			}
+			_ = appendRunActivityRecord(filepath.Join(s.dir, ev.RunID+".jsonl"), rec)
 		}
-		rec.Event = "message"
-		rec.Text = text
+		return
 	case "run_finished":
 		s.flushPendingMessage(ev.RunID, now.Format(time.RFC3339))
 		rec.Status = "finished"
@@ -117,7 +125,9 @@ func (s *runActivitySink) coalesceMessageText(runID, text string) string {
 		if s.pendingInRunActivityFence(runID) {
 			s.pending[runID] = append(s.pending[runID], line)
 			if completesRunActivityFence(s.pending[runID]) {
-				kept = append(kept, formatRunActivityPending(s.pending[runID]))
+				if pending := formatRunActivityPending(s.pending[runID]); !isSuppressedRunActivityDirectiveFence(pending) {
+					kept = append(kept, pending)
+				}
 				delete(s.pending, runID)
 			}
 			continue
@@ -126,10 +136,16 @@ func (s *runActivitySink) coalesceMessageText(runID, text string) string {
 			s.pending[runID] = append(s.pending[runID], line)
 			continue
 		}
+		if isRunActivityCommandPrefixFragment(line) {
+			s.pending[runID] = append(s.pending[runID], line)
+			continue
+		}
 		if isRunActivityFragment(line) {
 			s.pending[runID] = append(s.pending[runID], line)
 			if completesRunActivityFence(s.pending[runID]) {
-				kept = append(kept, formatRunActivityPending(s.pending[runID]))
+				if pending := formatRunActivityPending(s.pending[runID]); !isSuppressedRunActivityDirectiveFence(pending) {
+					kept = append(kept, pending)
+				}
 				delete(s.pending, runID)
 			}
 			continue
@@ -156,9 +172,49 @@ func (s *runActivitySink) pendingInRunActivityFence(runID string) bool {
 	return len(pending) > 0 && strings.HasPrefix(pending[0], "```") && !completesRunActivityFence(pending)
 }
 
+func (s *runActivitySink) suppressRunActivityDirectiveChunk(runID, chunk string) bool {
+	lines := nonEmptyRunActivityLines(chunk)
+	if len(lines) == 0 {
+		return false
+	}
+	if pending := s.pending[runID]; len(pending) > 0 && isSuppressedRunActivityDirectiveFence(pending[0]) {
+		s.pending[runID] = append(s.pending[runID], lines...)
+		if completesRunActivityFence(s.pending[runID]) {
+			delete(s.pending, runID)
+		}
+		return true
+	}
+	if !isSuppressedRunActivityDirectiveFence(lines[0]) {
+		return false
+	}
+	if len(lines) == 1 || !completesRunActivityFence(lines) {
+		s.pending[runID] = lines
+		return true
+	}
+	return true
+}
+
+func nonEmptyRunActivityLines(text string) []string {
+	var lines []string
+	for _, line := range strings.Split(text, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed != "" {
+			lines = append(lines, trimmed)
+		}
+	}
+	return lines
+}
+
 func (s *runActivitySink) flushPendingMessage(runID, at string) {
 	pending := strings.TrimSpace(formatRunActivityPending(s.pending[runID]))
 	delete(s.pending, runID)
+	if pending == "" {
+		return
+	}
+	if isSuppressedRunActivityDirectiveFence(pending) {
+		return
+	}
+	pending = normalizeRunActivityEventText(classifyRunActivityLine(pending), pending)
 	if pending == "" {
 		return
 	}
@@ -284,14 +340,11 @@ func shouldJoinRunActivityPending(pending, line string) bool {
 	if strings.HasPrefix(pending, "```") || strings.HasPrefix(line, "```") {
 		return true
 	}
-	if strings.ContainsAny(line, "/\\") {
+	if isRunActivityCommandPrefixFragment(pending) {
 		return true
 	}
-	lower := strings.ToLower(pending)
-	for _, cmd := range []string{"go", "git", "npm", "pnpm", "yarn", "make", "cargo", "python", "pytest"} {
-		if lower == cmd || strings.HasPrefix(lower, cmd+" ") {
-			return true
-		}
+	if strings.ContainsAny(line, "/\\") {
+		return true
 	}
 	return false
 }
@@ -318,11 +371,34 @@ func appendRunActivityRecord(path string, rec runActivityRecord) error {
 }
 
 func cleanRunActivityText(agent, chunk string) string {
-	text := strings.TrimSpace(cleanInteractiveAgentOutput(agent, chunk))
-	if text == "" {
-		return ""
+	events := classifyRunActivityText(agent, chunk)
+	var lines []string
+	for _, event := range events {
+		lines = append(lines, event.Text)
 	}
-	var kept []string
+	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
+type runActivityEventKind string
+
+const (
+	runActivityMessage  runActivityEventKind = "message"
+	runActivityProgress runActivityEventKind = "progress"
+	runActivityCommand  runActivityEventKind = "command"
+	runActivitySummary  runActivityEventKind = "summary"
+)
+
+type classifiedRunActivityEvent struct {
+	Kind runActivityEventKind
+	Text string
+}
+
+func classifyRunActivityText(agent, chunk string) []classifiedRunActivityEvent {
+	text := strings.TrimSpace(cleanInteractiveAgentOutput(agent, stripRunActivityDirectiveFences(chunk)))
+	if text == "" {
+		return nil
+	}
+	var events []classifiedRunActivityEvent
 	for _, line := range strings.Split(text, "\n") {
 		trimmed := strings.TrimSpace(line)
 		lower := strings.ToLower(trimmed)
@@ -338,9 +414,177 @@ func cleanRunActivityText(agent, chunk string) string {
 		case strings.Contains(lower, "heartbeat"):
 			continue
 		}
-		kept = append(kept, trimmed)
+		events = append(events, classifiedRunActivityEvent{
+			Kind: classifyRunActivityLine(trimmed),
+			Text: trimmed,
+		})
 	}
-	return strings.TrimSpace(strings.Join(kept, "\n"))
+	return events
+}
+
+func stripRunActivityDirectiveFences(text string) string {
+	cleaned := text
+	for {
+		name, ok := nextRunActivityDirectiveFenceName(cleaned)
+		if !ok {
+			return cleaned
+		}
+		cleaned = removeFencedDirective(cleaned, name)
+	}
+}
+
+func isSuppressedRunActivityDirectiveFence(text string) bool {
+	name, ok := fencedCodeBlockLanguage(strings.TrimSpace(text))
+	return ok && isAgentsDirectiveFenceLanguage(name)
+}
+
+func nextRunActivityDirectiveFenceName(text string) (string, bool) {
+	for _, line := range strings.Split(text, "\n") {
+		name, ok := fencedCodeBlockLanguage(line)
+		if ok && isAgentsDirectiveFenceLanguage(name) {
+			return name, true
+		}
+	}
+	return "", false
+}
+
+func fencedCodeBlockLanguage(text string) (string, bool) {
+	if !strings.HasPrefix(text, "```") {
+		return "", false
+	}
+	line := text
+	if i := strings.IndexByte(line, '\n'); i >= 0 {
+		line = line[:i]
+	}
+	lang := strings.TrimSpace(strings.TrimPrefix(line, "```"))
+	if lang == "" {
+		return "", false
+	}
+	return lang, true
+}
+
+func isAgentsDirectiveFenceLanguage(language string) bool {
+	return strings.HasPrefix(language, "agents-")
+}
+
+func classifyRunActivityLine(line string) runActivityEventKind {
+	trimmed := strings.TrimSpace(line)
+	lower := strings.ToLower(trimmed)
+	switch {
+	case hasRunActivityCommandPrefix(trimmed):
+		return runActivityCommand
+	case strings.HasPrefix(lower, "summary:") || strings.HasPrefix(lower, "done:") || strings.HasPrefix(lower, "result:"):
+		return runActivitySummary
+	default:
+		return runActivityMessage
+	}
+}
+
+func normalizeRunActivityEventText(kind runActivityEventKind, text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	if kind != runActivityCommand && !containsRunActivityCommandPrefix(text) && !containsRunActivityEnvAssignment(text) {
+		return text
+	}
+	return normalizeRunActivityCommandText(text)
+}
+
+func hasRunActivityCommandPrefix(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	lower := strings.ToLower(trimmed)
+	return strings.HasPrefix(lower, "running:") || strings.HasPrefix(lower, "command:") || strings.HasPrefix(trimmed, "$ ")
+}
+
+func isRunActivityCommandPrefixFragment(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	return isRunActivityEnvAssignment(trimmed)
+}
+
+func containsRunActivityCommandPrefix(text string) bool {
+	for _, line := range strings.Split(text, "\n") {
+		if hasRunActivityCommandPrefix(line) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsRunActivityEnvAssignment(text string) bool {
+	for _, field := range strings.Fields(text) {
+		if isRunActivityEnvAssignment(field) {
+			return true
+		}
+	}
+	return false
+}
+
+var runActivityShellToken = regexp.MustCompile(`([A-Za-z_][A-Za-z0-9_]*=)?(?:"[^"]+"|'[^']+'|[^ \t\n"']+)`)
+
+func normalizeRunActivityCommandText(text string) string {
+	return sanitizeRunActivityLocalValues(text)
+}
+
+func sanitizeRunActivityLocalValues(text string) string {
+	return runActivityShellToken.ReplaceAllStringFunc(text, sanitizeRunActivityShellToken)
+}
+
+func sanitizeRunActivityShellToken(token string) string {
+	name, value, ok := splitRunActivityEnvAssignment(token)
+	if !ok {
+		return sanitizeRunActivityTokenValue("", token)
+	}
+	return name + "=" + sanitizeRunActivityTokenValue(name, value)
+}
+
+func sanitizeRunActivityTokenValue(name, value string) string {
+	quote := ""
+	unquoted := value
+	if len(value) >= 2 {
+		first := value[0]
+		if (first == '"' || first == '\'') && value[len(value)-1] == first {
+			quote = string(first)
+			unquoted = value[1 : len(value)-1]
+		}
+	}
+	if !isRunActivityLocalPath(unquoted) {
+		return value
+	}
+	placeholder := "<temp-path>"
+	if strings.Contains(strings.ToUpper(name), "CACHE") {
+		placeholder = "<isolated-cache>"
+	}
+	if quote == "" {
+		return placeholder
+	}
+	return quote + placeholder + quote
+}
+
+func isRunActivityEnvAssignment(text string) bool {
+	_, _, ok := splitRunActivityEnvAssignment(text)
+	return ok
+}
+
+func splitRunActivityEnvAssignment(text string) (string, string, bool) {
+	before, after, ok := strings.Cut(strings.TrimSpace(text), "=")
+	if !ok || before == "" || after == "" || strings.ContainsAny(before, " \t") {
+		return "", "", false
+	}
+	for i, r := range before {
+		if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || r == '_' || (i > 0 && r >= '0' && r <= '9') {
+			continue
+		}
+		return "", "", false
+	}
+	return before, after, true
+}
+
+func isRunActivityLocalPath(value string) bool {
+	return strings.HasPrefix(value, "/tmp/") ||
+		strings.HasPrefix(value, "/private/tmp/") ||
+		strings.HasPrefix(value, "/var/folders/") ||
+		strings.HasPrefix(value, "/private/var/folders/")
 }
 
 func combineEventSinks(sinks ...loopEventSink) loopEventSink {

@@ -5838,6 +5838,113 @@ func TestRunActivityCoalescesFencedTokenFragments(t *testing.T) {
 	}
 }
 
+func TestRunActivitySuppressesDirectiveFences(t *testing.T) {
+	dir := t.TempDir()
+	sink := newTestRunActivitySink(dir)
+	sink.handle(loopEvent{Event: "run_started", RunID: "r1", Role: "implementer", Agent: "agent"})
+	for _, chunk := range []string{
+		"Implemented recorder changes.",
+		"```agents-progress",
+		`{"status":"Running checks","detail":"Executing go test"}`,
+		"```",
+		"```agents-handoff",
+		`{"role":"reviewer","text":"Review structured activity recorder."}`,
+		"```",
+		"```agents-verify",
+		`{"text":"go test ./... passed","cmd":"go test ./..."}`,
+		"```",
+		"```agents-custom",
+		`{"text":"future directive shape"}`,
+		"```",
+		"Ready for review.",
+	} {
+		sink.handle(loopEvent{Event: "output", RunID: "r1", Role: "implementer", Chunk: chunk + "\n"})
+	}
+	sink.handle(loopEvent{Event: "run_finished", RunID: "r1", Role: "implementer", Agent: "agent"})
+
+	got := strings.Join(readTestRunActivityMessages(t, dir), "\n")
+	for _, unwanted := range []string{"agents-progress", "agents-handoff", "agents-verify", "agents-custom", `"role":"reviewer"`, `"cmd":"go test ./..."`, "future directive shape"} {
+		if strings.Contains(got, unwanted) {
+			t.Fatalf("activity leaked directive fragment %q:\n%s", unwanted, got)
+		}
+	}
+	for _, want := range []string{"Implemented recorder changes.", "Ready for review."} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("activity missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestRunActivityNormalizesCommandLocalPaths(t *testing.T) {
+	dir := t.TempDir()
+	sink := newTestRunActivitySink(dir)
+	sink.handle(loopEvent{Event: "run_started", RunID: "r1", Role: "implementer", Agent: "agent"})
+	sink.handle(loopEvent{Event: "output", RunID: "r1", Role: "implementer", Chunk: "Running: GOCACHE=/var/folders/_r/6vpq9cdn41nf2qznd89khv5m0000gn/T/tmp.HgDXDsvtUu go test ./...\n"})
+	sink.handle(loopEvent{Event: "output", RunID: "r1", Role: "implementer", Chunk: "Command: python /tmp/agents-check-123/run.py\n"})
+	sink.handle(loopEvent{Event: "run_finished", RunID: "r1", Role: "implementer", Agent: "agent"})
+
+	got := strings.Join(readTestRunActivityMessages(t, dir), "\n")
+	for _, want := range []string{"GOCACHE=<isolated-cache> go test ./...", "Command: python <temp-path>"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("activity missing normalized command %q:\n%s", want, got)
+		}
+	}
+	for _, leaked := range []string{"/var/folders/", "/tmp/agents-check-123"} {
+		if strings.Contains(got, leaked) {
+			t.Fatalf("activity leaked local path %q:\n%s", leaked, got)
+		}
+	}
+	bare := "go test /tmp/not-a-structured-command"
+	if got := normalizeRunActivityEventText(runActivityMessage, bare); got != bare {
+		t.Fatalf("bare command-like message was normalized: got %q, want %q", got, bare)
+	}
+}
+
+func TestRunActivityPreservesSplitCommandWithNormalizedCache(t *testing.T) {
+	dir := t.TempDir()
+	sink := newTestRunActivitySink(dir)
+	sink.handle(loopEvent{Event: "run_started", RunID: "r1", Role: "implementer", Agent: "agent"})
+	for _, chunk := range []string{
+		"GOCACHE=/var/folders/_r/6vpq9cdn41nf2qznd89khv5m0000gn/T/tmp.HgDXDsvtUu\n",
+		"go\n",
+		"test\n",
+		"./...\n",
+	} {
+		sink.handle(loopEvent{Event: "output", RunID: "r1", Role: "implementer", Chunk: chunk})
+	}
+	sink.handle(loopEvent{Event: "run_finished", RunID: "r1", Role: "implementer", Agent: "agent"})
+
+	messages := readTestRunActivityMessages(t, dir)
+	got := strings.Join(messages, "\n")
+	want := "GOCACHE=<isolated-cache> go test ./..."
+	if got != want {
+		t.Fatalf("split command = %#v, want %q", messages, want)
+	}
+}
+
+func TestRunActivitySuppressesDirtyDuplicateSummary(t *testing.T) {
+	dir := t.TempDir()
+	sink := newTestRunActivitySink(dir)
+	sink.handle(loopEvent{Event: "run_started", RunID: "r1", Role: "implementer", Agent: "agent"})
+	for _, chunk := range []string{
+		"Summary: updated run activity clean up , command normal izing , and directive filter\n",
+		"ing.\n",
+		"Summary: updated run activity cleanup, command normalizing, and directive filtering.\n",
+	} {
+		sink.handle(loopEvent{Event: "output", RunID: "r1", Role: "implementer", Chunk: chunk})
+	}
+	sink.handle(loopEvent{Event: "run_finished", RunID: "r1", Role: "implementer", Agent: "agent"})
+
+	messages := readTestRunActivityMessages(t, dir)
+	if len(messages) != 1 {
+		t.Fatalf("expected only clean summary, got %#v", messages)
+	}
+	want := "Summary: updated run activity cleanup, command normalizing, and directive filtering."
+	if messages[0] != want {
+		t.Fatalf("summary = %q, want %q", messages[0], want)
+	}
+}
+
 func TestRunActivityPreservesShortProgressLines(t *testing.T) {
 	dir := t.TempDir()
 	sink := newTestRunActivitySink(dir)
