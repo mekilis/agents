@@ -1,3 +1,0 @@
-# Next
-
-Reviewer should review the working tree and independently verify go test ./...
