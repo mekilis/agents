@@ -4130,7 +4130,7 @@ func resolveAgentCommand(agent string, settings agentSettings) (string, error) {
 	case "codex":
 		// Codex's workspace-write sandbox protects .agents/ like .git/, which
 		// blocks reviewers from recording findings. Re-add it explicitly.
-		args := []string{`codex exec --sandbox workspace-write -c 'sandbox_workspace_write.writable_roots=[".agents"]'`}
+		args := []string{`codex exec --skip-git-repo-check --sandbox workspace-write -c 'sandbox_workspace_write.writable_roots=[".agents"]'`}
 		codexModel := firstNonEmpty(settings.CodexModel, settings.Model)
 		codexReasoning := firstNonEmpty(settings.CodexReasoning, settings.Reasoning)
 		if strings.TrimSpace(codexModel) != "" {
@@ -4351,9 +4351,11 @@ type cursorStreamWriter struct {
 	live           io.Writer
 	pending        string
 	deltas         strings.Builder
+	deltaLineOpen  bool
 	finalAssistant string
 	result         string
 	usage          string
+	seenProgress   map[string]bool
 }
 
 func (w *cursorStreamWriter) Write(p []byte) (int, error) {
@@ -4408,27 +4410,63 @@ func (w *cursorStreamWriter) handleLine(line string) {
 			return
 		}
 		if ev.TimestampMS != nil {
+			if progress, ok := parseProgressDirectiveFromText(text); ok {
+				w.printProgress(progress)
+				return
+			}
 			w.deltas.WriteString(text)
 			if w.live != nil {
 				fmt.Fprint(w.live, text)
+				w.deltaLineOpen = true
 			}
 			return
+		}
+		if w.deltaLineOpen && w.live != nil {
+			fmt.Fprintln(w.live)
+			w.deltaLineOpen = false
 		}
 		w.finalAssistant = text
 	case "result":
 		w.result = strings.TrimSpace(ev.Result)
 		w.usage = ev.usageString()
-	case "system", "user":
+	case "tool_call":
+		w.printToolEvent(ev)
+	case "system", "user", "thinking":
 		return
 	default:
-		summary := ev.summary()
-		if summary == "" {
-			return
+		return
+	}
+}
+
+func (w *cursorStreamWriter) printProgress(progress progressDirective) {
+	if w.seenProgress == nil {
+		w.seenProgress = map[string]bool{}
+	}
+	key := progress.Status + "\x00" + progress.Detail
+	if w.seenProgress[key] {
+		return
+	}
+	w.seenProgress[key] = true
+	if w.live != nil {
+		if w.deltaLineOpen {
+			fmt.Fprintln(w.live)
+			w.deltaLineOpen = false
 		}
-		fmt.Fprintln(w.output, summary)
-		if w.live != nil {
-			fmt.Fprintln(w.live, summary)
+		printInteractiveProgress(w.live, progress)
+	}
+}
+
+func (w *cursorStreamWriter) printToolEvent(ev cursorStreamEvent) {
+	summary := ev.toolSummary()
+	if summary == "" {
+		return
+	}
+	if w.live != nil {
+		if w.deltaLineOpen {
+			fmt.Fprintln(w.live)
+			w.deltaLineOpen = false
 		}
+		fmt.Fprintln(w.live, summary)
 	}
 }
 
@@ -4438,7 +4476,26 @@ type cursorStreamEvent struct {
 	Message     cursorStreamMessage `json:"message"`
 	Result      string              `json:"result"`
 	TimestampMS *int64              `json:"timestamp_ms"`
-	Usage       struct {
+	ToolCall    struct {
+		ShellToolCall struct {
+			Args struct {
+				Description string `json:"description"`
+				Command     string `json:"command"`
+			} `json:"args"`
+			Description string `json:"description"`
+		} `json:"shellToolCall"`
+		ReadToolCall struct {
+			Args struct {
+				Path string `json:"path"`
+			} `json:"args"`
+		} `json:"readToolCall"`
+		EditToolCall struct {
+			Args struct {
+				Path string `json:"path"`
+			} `json:"args"`
+		} `json:"editToolCall"`
+	} `json:"tool_call"`
+	Usage struct {
 		InputTokens      int `json:"inputTokens"`
 		OutputTokens     int `json:"outputTokens"`
 		CacheReadTokens  int `json:"cacheReadTokens"`
@@ -4464,6 +4521,23 @@ func (e cursorStreamEvent) messageText() string {
 	return b.String()
 }
 
+func parseProgressDirectiveFromText(text string) (progressDirective, bool) {
+	lines := strings.Split(text, "\n")
+	for i, line := range lines {
+		if strings.TrimSpace(line) != "```agents-progress" {
+			continue
+		}
+		var block []string
+		for _, blockLine := range lines[i+1:] {
+			if strings.TrimSpace(blockLine) == "```" {
+				return parseProgressDirectiveLines(block)
+			}
+			block = append(block, blockLine)
+		}
+	}
+	return progressDirective{}, false
+}
+
 func (e cursorStreamEvent) usageString() string {
 	if e.Usage.InputTokens == 0 && e.Usage.OutputTokens == 0 &&
 		e.Usage.CacheReadTokens == 0 && e.Usage.CacheWriteTokens == 0 {
@@ -4482,15 +4556,50 @@ func (e cursorStreamEvent) usageString() string {
 	return strings.Join(parts, " ")
 }
 
-func (e cursorStreamEvent) summary() string {
-	name := strings.TrimSpace(e.Subtype)
-	if name == "" {
-		name = strings.TrimSpace(e.Type)
-	}
-	if name == "" {
+func (e cursorStreamEvent) toolSummary() string {
+	switch e.Subtype {
+	case "started":
+		switch {
+		case e.ToolCall.ShellToolCall.Args.Description != "":
+			return "Running: " + e.ToolCall.ShellToolCall.Args.Description
+		case e.ToolCall.ShellToolCall.Description != "":
+			return "Running: " + e.ToolCall.ShellToolCall.Description
+		case e.ToolCall.ShellToolCall.Args.Command != "":
+			return "Running: " + firstShellLine(e.ToolCall.ShellToolCall.Args.Command)
+		case e.ToolCall.ReadToolCall.Args.Path != "":
+			return "Reading: " + filepath.Base(e.ToolCall.ReadToolCall.Args.Path)
+		case e.ToolCall.EditToolCall.Args.Path != "":
+			return "Editing: " + filepath.Base(e.ToolCall.EditToolCall.Args.Path)
+		default:
+			return ""
+		}
+	case "completed":
+		switch {
+		case e.ToolCall.ShellToolCall.Args.Description != "":
+			return "Completed: " + e.ToolCall.ShellToolCall.Args.Description
+		case e.ToolCall.ShellToolCall.Description != "":
+			return "Completed: " + e.ToolCall.ShellToolCall.Description
+		case e.ToolCall.ReadToolCall.Args.Path != "":
+			return "Read: " + filepath.Base(e.ToolCall.ReadToolCall.Args.Path)
+		case e.ToolCall.EditToolCall.Args.Path != "":
+			return "Edited: " + filepath.Base(e.ToolCall.EditToolCall.Args.Path)
+		default:
+			return ""
+		}
+	default:
 		return ""
 	}
-	return "Cursor: " + name
+}
+
+func firstShellLine(command string) string {
+	command = strings.TrimSpace(command)
+	if idx := strings.IndexByte(command, '\n'); idx >= 0 {
+		command = command[:idx]
+	}
+	if len([]rune(command)) > 80 {
+		return string([]rune(command)[:79]) + "…"
+	}
+	return command
 }
 
 func shortDuration(d time.Duration) string {

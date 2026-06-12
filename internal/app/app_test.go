@@ -2791,7 +2791,9 @@ func TestResolveCodexCommandUsesModelSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		"codex exec --sandbox workspace-write",
+		"codex exec",
+		"--sandbox workspace-write",
+		"--skip-git-repo-check",
 		`-c 'sandbox_workspace_write.writable_roots=[".agents"]'`,
 		"-m 'gpt-5.5'",
 		"-c 'model_reasoning_effort=\"low\"'",
@@ -2829,6 +2831,7 @@ func TestCursorStreamWriterDecodesDeltasResultAndUsage(t *testing.T) {
 	writer := &cursorStreamWriter{output: &out, log: &log, live: &live}
 	chunks := []string{
 		`{"type":"system","subtype":"init"}` + "\n",
+		`{"type":"thinking","subtype":"delta","text":"hidden thought"}` + "\n",
 		`{"type":"assistant","message":{"content":[{"type":"text","text":"Hel"}]},"timestamp_ms":1}` + "\n",
 		`{"type":"assistant","message":{"content":[{"type":"text","text":"lo"}]},"timestamp_ms":2}` + "\n",
 		`{"type":"assistant","message":{"content":[{"type":"text","text":"Hello"}]}}` + "\n",
@@ -2842,11 +2845,39 @@ func TestCursorStreamWriterDecodesDeltasResultAndUsage(t *testing.T) {
 	if got := writer.FinalOutput(); got != "Hello\nToken usage: input=12 output=3 cache_read=4" {
 		t.Fatalf("FinalOutput got %q", got)
 	}
-	if got := live.String(); got != "Hello" {
+	if got := live.String(); got != "Hello\n" {
 		t.Fatalf("live stream got %q", got)
 	}
 	if !strings.Contains(log.String(), `"type":"system"`) || !strings.Contains(log.String(), `"type":"result"`) {
 		t.Fatalf("raw JSON should be preserved in log, got:\n%s", log.String())
+	}
+	if strings.Contains(live.String(), "hidden thought") || strings.Contains(live.String(), "Cursor:") {
+		t.Fatalf("live stream should hide thinking and generic event labels, got:\n%s", live.String())
+	}
+}
+
+func TestCursorStreamWriterRendersProgressAndToolSummaries(t *testing.T) {
+	var out, log, live strings.Builder
+	writer := &cursorStreamWriter{output: &out, log: &log, live: &live}
+	chunks := []string{
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"` + "```agents-progress\\n{\\\"status\\\":\\\"editing files\\\",\\\"detail\\\":\\\"adding tests\\\"}\\n```" + `"}]},"timestamp_ms":1}` + "\n",
+		`{"type":"tool_call","subtype":"started","tool_call":{"shellToolCall":{"args":{"description":"Run tests","command":"python3 -m unittest"}}}}` + "\n",
+		`{"type":"tool_call","subtype":"completed","tool_call":{"editToolCall":{"args":{"path":"/tmp/tiny_habits.py"}}}}` + "\n",
+	}
+	for _, chunk := range chunks {
+		if _, err := writer.Write([]byte(chunk)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := live.String()
+	for _, want := range []string{
+		"- Editing files: Adding tests",
+		"Running: Run tests",
+		"Edited: tiny_habits.py",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("live stream missing %q:\n%s", want, got)
+		}
 	}
 }
 
