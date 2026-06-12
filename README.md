@@ -15,6 +15,11 @@ available.
 
 ## Install
 
+Download archives for tagged releases from
+[GitHub Releases](https://github.com/mekilis/agents/releases). Pick the archive
+for your OS and CPU, unpack it, and put the `agents` binary somewhere on
+`PATH`.
+
 From this repository:
 
 ```bash
@@ -51,6 +56,19 @@ agents version
 
 The completion script comes from the `agents` binary. If you prefer to install
 it yourself, write `agents completion zsh` to a directory on your zsh `fpath`.
+
+## Release
+
+Releases are published by GoReleaser from version tags:
+
+```bash
+git tag v0.4.1
+git push origin v0.4.1
+```
+
+The `release` workflow builds archives for Linux, macOS, and Windows, attaches
+checksums, and publishes them to GitHub Releases. The workflow uses Node 24
+compatible GitHub Actions.
 
 ## Tutorial
 
