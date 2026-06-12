@@ -98,11 +98,12 @@ func TestLoopViewRendersLifecycleFrames(t *testing.T) {
 		}
 	}
 
-	view.handle(loopEvent{Event: "run_finished", RunID: "r1", Role: "implementer", State: state})
+	reviewerState := &loopJSON{NextRole: "reviewer", Task: state.Task}
+	view.handle(loopEvent{Event: "run_finished", RunID: "r1", Role: "implementer", State: reviewerState})
 	view.handle(loopEvent{Event: "run_started", RunID: "r2", Role: "reviewer", Agent: "codex"})
 	view.handle(loopEvent{Event: "output", RunID: "r2", Role: "reviewer", Chunk: "checking diff\n"})
 	frame = strings.Join(view.frame(80, 16), "\n")
-	for _, want := range []string{"Checking ●", "checking diff", "Loop 1/6"} {
+	for _, want := range []string{"Checking ●", "checking diff", "Loop 1/6", "Done. Next: Checking."} {
 		if !strings.Contains(frame, want) {
 			t.Fatalf("reviewer frame missing %q:\n%s", want, frame)
 		}
@@ -120,6 +121,16 @@ func TestLoopViewRendersLifecycleFrames(t *testing.T) {
 	}
 	if !strings.Contains(frame, "[q] close") {
 		t.Fatalf("stopped frame should swap key hints:\n%s", frame)
+	}
+}
+
+func TestLoopViewShowsQuietProviderHeartbeat(t *testing.T) {
+	view := newLoopView("Tiny todo CLI", 6)
+	view.handle(loopEvent{Event: "run_started", RunID: "r1", Role: "implementer", Agent: "agent"})
+	view.handle(loopEvent{Event: "output", RunID: "r1", Role: "implementer", Chunk: "Still running...\n"})
+	frame := strings.Join(view.frame(80, 12), "\n")
+	if !strings.Contains(frame, "Still running...") {
+		t.Fatalf("quiet provider heartbeat should be visible:\n%s", frame)
 	}
 }
 

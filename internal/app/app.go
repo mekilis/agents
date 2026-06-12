@@ -4261,6 +4261,7 @@ func runStreamingShellCommand(cwd, command string, artifacts runArtifactPaths, s
 				return
 			case now := <-ticker.C:
 				fmt.Fprintf(logFile, "\n[agents] still running at %s\n", now.UTC().Format(time.RFC3339))
+				fmt.Fprintln(live, "Still running...")
 			}
 		}
 	}()
@@ -4291,6 +4292,7 @@ func runStreamingShellCommand(cwd, command string, artifacts runArtifactPaths, s
 		err = errRunInterrupted
 	case completedBy = <-completedByHandoff:
 		fmt.Fprintf(logFile, "\n[agents] detected completion handoff to %s at %s\n", completedBy, time.Now().UTC().Format(time.RFC3339))
+		fmt.Fprintf(live, "Handoff recorded. Moving to %s...\n", activityName(completedBy))
 		_ = interruptManagedProcess(cmd)
 		select {
 		case err = <-waitErr:

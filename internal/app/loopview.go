@@ -194,6 +194,12 @@ func (v *loopView) handle(ev loopEvent) {
 			v.runs++
 		}
 		v.applyState(ev.State)
+		if ev.Error == "" && ev.State != nil && ev.State.NextRole != "" && ev.State.NextRole != ev.Role {
+			lane.appendChunk(fmt.Sprintf("Done. Next: %s.\n", activityName(ev.State.NextRole)))
+			if ev.State.NextRole == "reviewer" {
+				v.check.note = "next"
+			}
+		}
 	case "stopped":
 		stop := ev
 		v.stopped = &stop
@@ -378,7 +384,7 @@ func runLoopWithView(in, out *os.File, errOut io.Writer, e env, taskTitle string
 	}
 	restore := func() {
 		_ = term.Restore(fd, oldState)
-		fmt.Fprint(out, "\x1b[?25h\x1b[?1049l")
+		fmt.Fprint(out, "\x1b[?25h\x1b[?1049l\r\033[2K")
 	}
 	defer restore()
 
@@ -548,6 +554,7 @@ func printLoopViewEnding(out *os.File, errOut io.Writer, e env, result loopResul
 		return 1
 	}
 	stop := result.stop
+	fmt.Fprintln(out)
 	fmt.Fprintln(out, translateStop(stop.Reason, stop.Runs, statePayload(stop.State)))
 	fmt.Fprintln(out)
 	printLoopState(out, stop.State)
