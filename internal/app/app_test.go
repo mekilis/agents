@@ -1660,6 +1660,38 @@ func TestApplyRoleOutputDirectivesSkipsPlaceholderHandoff(t *testing.T) {
 	}
 }
 
+func TestTaskProgressLinesSummarizeStateChanges(t *testing.T) {
+	before := taskStats{
+		Next:         "decide next step",
+		Handoffs:     1,
+		FindingsOpen: 1,
+	}
+	after := taskStats{
+		Next:             "review implementation",
+		Handoffs:         2,
+		LatestHandoffTo:  "reviewer",
+		Verification:     1,
+		VerificationFail: 1,
+		FindingsOpen:     2,
+		FindingsFixed:    1,
+		FindingsVerified: 1,
+	}
+	got := strings.Join(taskProgressLines(before, after), "\n")
+	for _, want := range []string{
+		"Handoff recorded for Checking.",
+		"Verification recorded.",
+		"Verification failed.",
+		"Finding added (2 open).",
+		"Finding fixed (1 fixed).",
+		"Finding verified (1 verified).",
+		"Next: review implementation",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("progress lines missing %q:\n%s", want, got)
+		}
+	}
+}
+
 func TestInteractiveRequiresSlashForCommandsAndChatsWithCoordinator(t *testing.T) {
 	var out, errOut bytes.Buffer
 	code := withTempProcessEnv(t, func(home, cwd string) int {

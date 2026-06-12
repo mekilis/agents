@@ -4252,16 +4252,27 @@ func runStreamingShellCommand(cwd, command string, artifacts runArtifactPaths, s
 		return output.String(), err
 	}
 	done := make(chan struct{})
+	startedAt := time.Now()
 	go func() {
 		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
+		lastStats := state.Stats
 		for {
 			select {
 			case <-done:
 				return
 			case now := <-ticker.C:
 				fmt.Fprintf(logFile, "\n[agents] still running at %s\n", now.UTC().Format(time.RFC3339))
-				fmt.Fprintln(live, "Still running...")
+				fmt.Fprintf(live, "\rStill running... %s\r", shortDuration(now.Sub(startedAt)))
+				stats, err := readTaskStats(cwd, state.Task.Path)
+				if err != nil {
+					continue
+				}
+				for _, line := range taskProgressLines(lastStats, stats) {
+					fmt.Fprintln(live)
+					fmt.Fprintln(live, line)
+				}
+				lastStats = stats
 			}
 		}
 	}()
@@ -4312,6 +4323,47 @@ func runStreamingShellCommand(cwd, command string, artifacts runArtifactPaths, s
 		fmt.Fprintf(logFile, "\n[agents] completed at %s\n", time.Now().UTC().Format(time.RFC3339))
 	}
 	return output.String(), err
+}
+
+func shortDuration(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	total := int(d.Round(time.Second).Seconds())
+	if total < 60 {
+		return fmt.Sprintf("%ds", total)
+	}
+	return fmt.Sprintf("%dm%02ds", total/60, total%60)
+}
+
+func taskProgressLines(before, after taskStats) []string {
+	var lines []string
+	if after.Handoffs > before.Handoffs {
+		if after.LatestHandoffTo != "" {
+			lines = append(lines, fmt.Sprintf("Handoff recorded for %s.", activityName(after.LatestHandoffTo)))
+		} else {
+			lines = append(lines, "Handoff recorded.")
+		}
+	}
+	if after.Verification > before.Verification {
+		lines = append(lines, "Verification recorded.")
+	}
+	if after.VerificationFail > before.VerificationFail {
+		lines = append(lines, "Verification failed.")
+	}
+	if after.FindingsOpen > before.FindingsOpen {
+		lines = append(lines, fmt.Sprintf("Finding added (%d open).", after.FindingsOpen))
+	}
+	if after.FindingsFixed > before.FindingsFixed {
+		lines = append(lines, fmt.Sprintf("Finding fixed (%d fixed).", after.FindingsFixed))
+	}
+	if after.FindingsVerified > before.FindingsVerified {
+		lines = append(lines, fmt.Sprintf("Finding verified (%d verified).", after.FindingsVerified))
+	}
+	if after.Next != "" && after.Next != before.Next {
+		lines = append(lines, "Next: "+strings.TrimPrefix(after.Next, "- "))
+	}
+	return lines
 }
 
 func completionHandoffTarget(role string) string {
