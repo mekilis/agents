@@ -199,11 +199,11 @@ agents plan clear
 
 The canonical plan lives at `.agents/tasks/<task>/plan.md`. Runs may mention
 plan updates, but durable plan content belongs to the task. A draft or stale
-plan routes the loop to the coordinator for approval or refinement before Agents
-runs the implementer. Reviewers inspect the current task plan as part of review
-and should record findings when the implementation does not match the plan, or
-when the plan is stale, missing, shallow, or incorrect for the work under
-review.
+plan routes the loop to the reviewer for a plan review gate before Agents runs
+the implementer. Reviewers should record findings when the plan is stale,
+missing, shallow, incorrect, or missing enough evidence, validation, risks, or
+constraints for the work. Passing plan review still stops at the human approval
+boundary; `agents plan approve` is what allows implementation to proceed.
 
 `agents plan refine` accepts refinement feedback only when it can be handled
 honestly. Because current plans are free-form Markdown, the command refuses

@@ -3429,7 +3429,7 @@ func TestRolePromptBoundsLongPlanContent(t *testing.T) {
 	}
 }
 
-func TestDraftPlanRoutesImplementerHandoffToCoordinator(t *testing.T) {
+func TestDraftPlanRoutesImplementerHandoffToReviewerPlanReview(t *testing.T) {
 	var out, errOut bytes.Buffer
 	code := withTempProcessEnv(t, func(home, cwd string) int {
 		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
@@ -3454,11 +3454,146 @@ func TestDraftPlanRoutesImplementerHandoffToCoordinator(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
 		t.Fatalf("run JSON should decode: %v\n%s", err, out.String())
 	}
-	if got.NextRole != "coordinator" || got.NextAction != "approve or refine plan before implementation" || got.Boundary != "plan approval required" {
+	if got.NextRole != "reviewer" || got.NextAction != "review plan before implementation" || got.Boundary != "plan approval required" {
 		t.Fatalf("unexpected loop state: %+v", got)
 	}
 	if got.Task == nil || got.Task.Plan != "draft" {
 		t.Fatalf("expected draft plan in loop JSON, got %+v", got.Task)
+	}
+}
+
+func TestStalePlanRoutesImplementationToReviewerPlanReview(t *testing.T) {
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Stale Plan Boundary"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addHandoff(e, []string{"--to", "implementer", "Build it."}, time.Date(2026, 6, 5, 10, 1, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writeActiveTaskPlan(e, []string{"Stale plan that needs reviewer attention."}, planStateStale); err != nil {
+			t.Fatal(err)
+		}
+		state, err := analyzeLoopState(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state.NextRole != "reviewer" || state.NextAction != "review plan before implementation" || state.Boundary != "plan approval required" {
+			t.Fatalf("unexpected loop state: %+v", state)
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
+func TestReviewerPromptExplainsPlanReviewGate(t *testing.T) {
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		task, err := openTask(e, []string{"Plan Review Prompt"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writeActiveTaskPlan(e, []string{"Review this plan before implementation."}, planStateDraft); err != nil {
+			t.Fatal(err)
+		}
+		prompt, err := buildRolePrompt(e, loopState{
+			Task:       task,
+			NextRole:   "reviewer",
+			NextAction: "review plan before implementation",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, want := range []string{
+			"This is a plan review gate before implementation",
+			"record findings against the plan",
+			"The human must still approve the plan before implementation proceeds",
+		} {
+			if !strings.Contains(prompt, want) {
+				t.Fatalf("reviewer prompt missing %q:\n%s", want, prompt)
+			}
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
+func writeTestPlanAt(t *testing.T, cwd, activePath, state, text string, updated time.Time) {
+	t.Helper()
+	taskDir := filepath.Join(cwd, stateDir, activePath)
+	body := fmt.Sprintf("# Plan\n\nState: %s\nUpdated: %s\n\n%s\n", state, updated.UTC().Format(time.RFC3339), text)
+	if err := os.WriteFile(filepath.Join(taskDir, "plan.md"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPassingPlanReviewStopsForHumanPlanApproval(t *testing.T) {
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		task, err := openTask(e, []string{"Plan Review Approval"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addHandoff(e, []string{"--to", "implementer", "Build it after the plan is ready."}, time.Date(2026, 6, 5, 10, 1, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		writeTestPlanAt(t, cwd, task.Path, planStateDraft, "Plan reviewed before implementation.", time.Date(2026, 6, 5, 10, 1, 30, 0, time.UTC))
+		if _, _, err := addVerification(e, []string{"reviewer checked plan readiness", "--by", "reviewer"}, time.Date(2026, 6, 5, 10, 2, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		state, err := analyzeLoopState(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state.NextRole != "human" || state.NextAction != "approve reviewed plan before implementation" || state.Boundary != "plan approval required" {
+			t.Fatalf("unexpected loop state before approval: %+v", state)
+		}
+		if _, err := approveActiveTaskPlan(e); err != nil {
+			t.Fatal(err)
+		}
+		state, err = analyzeLoopState(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state.NextRole != "implementer" || state.NextAction != "act on latest handoff" {
+			t.Fatalf("approved reviewed plan should return to implementation, got %+v", state)
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
+func TestPlanReviewEvidenceMustBeNewerThanPlanRevision(t *testing.T) {
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		task, err := openTask(e, []string{"Plan Review Freshness"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addHandoff(e, []string{"--to", "implementer", "Build it after plan review."}, time.Date(2026, 6, 5, 10, 1, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := addVerification(e, []string{"reviewed the earlier plan", "--by", "reviewer"}, time.Date(2026, 6, 5, 10, 2, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		writeTestPlanAt(t, cwd, task.Path, planStateDraft, "Newer plan that has not been reviewed.", time.Date(2026, 6, 5, 10, 3, 0, 0, time.UTC))
+		state, err := analyzeLoopState(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state.NextRole != "reviewer" || state.NextAction != "review plan before implementation" || state.Boundary != "plan approval required" {
+			t.Fatalf("stale plan-review evidence must route back to reviewer, got %+v", state)
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
 	}
 }
 

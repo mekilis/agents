@@ -2587,6 +2587,7 @@ type activeTask struct {
 type taskStats struct {
 	Next             string
 	PlanState        string
+	PlanUpdatedStamp string
 	Decisions        int
 	Handoffs         int
 	LatestHandoffTo  string
@@ -2861,9 +2862,13 @@ func readTaskStats(cwd, activePath string) (taskStats, error) {
 	if err != nil {
 		return taskStats{}, err
 	}
-	planState, err := planStateForStats(cwd, activePath, latestHandoffName)
+	plan, err := readTaskPlan(cwd, activePath)
 	if err != nil {
 		return taskStats{}, err
+	}
+	planState := plan.State
+	if planState == planStateApproved && planStale(cwd, activePath, latestHandoffName) {
+		planState = planStateStale
 	}
 	verificationPass, verificationFail, latestVerificationName, err := readVerificationStats(filepath.Join(taskDir, "verification"))
 	if err != nil {
@@ -2880,6 +2885,7 @@ func readTaskStats(cwd, activePath string) (taskStats, error) {
 	return taskStats{
 		Next:                   next,
 		PlanState:              planState,
+		PlanUpdatedStamp:       plan.UpdatedStamp,
 		Decisions:              decisions,
 		Handoffs:               handoffs,
 		LatestHandoffTo:        latestHandoffTo,
@@ -4951,7 +4957,9 @@ func dispatchPacket(e env, role string) (dispatchInfo, error) {
 			info.Action = "implement the next task step, run relevant checks, then write a handoff"
 		}
 	case "reviewer":
-		if state.Stats.LatestHandoffTo != "reviewer" {
+		if state.NextAction == "review plan before implementation" {
+			info.Action = "review the draft or stale plan; add findings or record plan review evidence"
+		} else if state.Stats.LatestHandoffTo != "reviewer" {
 			info.Action = "wait for an implementer handoff before reviewing"
 			info.Boundary = "handoff required"
 		} else {
@@ -4980,7 +4988,11 @@ func analyzeLoopState(e env) (loopState, error) {
 	case stats.FindingsFixed > 0:
 		state.NextRole = "reviewer"
 		state.NextAction = "verify fixed findings independently"
-	case verificationCurrent(stats):
+	case planRequiresApproval(stats.PlanState) && planReviewCurrent(stats):
+		state.NextRole = "human"
+		state.NextAction = "approve reviewed plan before implementation"
+		state.Boundary = "plan approval required"
+	case verificationCurrent(stats) && !planRequiresApproval(stats.PlanState) && !(stats.PlanState == planStateApproved && stats.LatestHandoffTo == "implementer"):
 		state.NextRole = "human"
 		state.NextAction = "approve archive, commit, or next task"
 		state.Boundary = "human approval required"
@@ -4998,8 +5010,8 @@ func analyzeLoopState(e env) (loopState, error) {
 		state.NextAction = "start or continue implementation"
 	}
 	if state.NextRole == "implementer" && planRequiresApproval(stats.PlanState) {
-		state.NextRole = "coordinator"
-		state.NextAction = "approve or refine plan before implementation"
+		state.NextRole = "reviewer"
+		state.NextAction = "review plan before implementation"
 		state.Boundary = "plan approval required"
 	}
 	return state, nil
@@ -5028,6 +5040,16 @@ func verificationCurrent(stats taskStats) bool {
 		return false
 	}
 	return chunkStamp(stats.LatestVerificationName) >= chunkStamp(stats.LatestHandoffName)
+}
+
+func planReviewCurrent(stats taskStats) bool {
+	if !verificationCurrent(stats) {
+		return false
+	}
+	if stats.PlanUpdatedStamp == "" {
+		return false
+	}
+	return chunkStamp(stats.LatestVerificationName) >= stats.PlanUpdatedStamp
 }
 
 // chunkStamp returns the leading UTC timestamp of a chunk filename
@@ -6114,6 +6136,11 @@ func buildRolePrompt(e env, state loopState) (string, error) {
 		appendPromptDir(&b, e.cwd, state.Task.Path, "findings", "Findings")
 		appendPromptDir(&b, e.cwd, state.Task.Path, "verification", "Verification")
 		fmt.Fprintln(&b, "Working agreement:")
+		if state.NextAction == "review plan before implementation" {
+			fmt.Fprintln(&b, "- This is a plan review gate before implementation. Review `plan.md` for readiness; do not review or request implementation changes unless they are needed to make the plan actionable.")
+			fmt.Fprintln(&b, "- If the plan is shallow, stale, missing evidence, incorrect, or omits validation or constraints, record findings against the plan so the implementer can fix it before code changes.")
+			fmt.Fprintln(&b, "- If the plan is ready, record review evidence. The human must still approve the plan before implementation proceeds.")
+		}
 		fmt.Fprintln(&b, "- Review the working tree, tests, and task chunks; verify claims against the code, not the handoff text.")
 		fmt.Fprintln(&b, "- Review the current task plan in `plan.md` when present. Check for substantive objective, repo-relative evidence, assumptions or open questions, implementation shape, validation, risks, and constraints; do not require exact section headings.")
 		fmt.Fprintln(&b, "- Check whether the implementation and review scope match the approved or draft plan.")

@@ -17,9 +17,10 @@ const (
 )
 
 type taskPlan struct {
-	State string
-	Text  string
-	Path  string
+	State        string
+	Text         string
+	Path         string
+	UpdatedStamp string
 }
 
 func runPlanCommand(args []string, out, errOut io.Writer, e env) int {
@@ -106,12 +107,22 @@ func readTaskPlan(cwd, activePath string) (taskPlan, error) {
 		return taskPlan{}, err
 	}
 	state := planStateDraft
+	updatedStamp := ""
 	body := planBodyWithoutState(stripFirstMarkdownHeading(string(data)))
 	for _, line := range strings.Split(string(data), "\n") {
 		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(strings.ToLower(trimmed), "state:") {
+		lower := strings.ToLower(trimmed)
+		if strings.HasPrefix(lower, "state:") {
 			state = strings.ToLower(strings.TrimSpace(trimmed[len("state:"):]))
-			break
+			continue
+		}
+		if strings.HasPrefix(lower, "updated:") {
+			updatedStamp = planUpdatedStamp(strings.TrimSpace(trimmed[len("updated:"):]))
+		}
+	}
+	if updatedStamp == "" {
+		if info, err := os.Stat(path); err == nil {
+			updatedStamp = info.ModTime().UTC().Format("2006-01-02T150405Z")
 		}
 	}
 	switch state {
@@ -120,9 +131,10 @@ func readTaskPlan(cwd, activePath string) (taskPlan, error) {
 		state = planStateDraft
 	}
 	return taskPlan{
-		State: state,
-		Text:  strings.TrimSpace(body),
-		Path:  filepath.Join(activePath, "plan.md"),
+		State:        state,
+		Text:         strings.TrimSpace(body),
+		Path:         filepath.Join(activePath, "plan.md"),
+		UpdatedStamp: updatedStamp,
 	}, nil
 }
 
@@ -239,6 +251,16 @@ func planBodyWithoutState(text string) string {
 		lines = append(lines, line)
 	}
 	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
+func planUpdatedStamp(updated string) string {
+	if updated == "" {
+		return ""
+	}
+	if t, err := time.Parse(time.RFC3339, updated); err == nil {
+		return t.UTC().Format("2006-01-02T150405Z")
+	}
+	return chunkStamp(updated)
 }
 
 func planStateForStats(cwd, activePath, latestHandoffName string) (string, error) {
