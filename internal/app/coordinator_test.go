@@ -89,13 +89,48 @@ func TestCoordinatorPromptKeepsHistoryForConcreteRequests(t *testing.T) {
 
 func TestCoordinatorSmallTalkHeuristic(t *testing.T) {
 	for _, text := range []string{"hi", "hello!", "thanks", "good morning"} {
-		if !coordinatorSmallTalk(text) {
+		if !coordinatorCompactPromptEligible(agentSettings{}, text) {
 			t.Fatalf("expected small talk for %q", text)
 		}
 	}
 	for _, text := range []string{"", "hi inspect repo", "check the code", "plan a change"} {
-		if coordinatorSmallTalk(text) {
+		if coordinatorCompactPromptEligible(agentSettings{}, text) {
 			t.Fatalf("did not expect small talk for %q", text)
 		}
+	}
+}
+
+func TestCoordinatorCompactPromptUsesLocalAIForAmbiguousSmallTalk(t *testing.T) {
+	old := classifyCoordinatorIntentWithLocalAI
+	defer func() { classifyCoordinatorIntentWithLocalAI = old }()
+	classifyCoordinatorIntentWithLocalAI = func(settings agentSettings, text string) (localAIClassification, error) {
+		if text != "appreciate it" {
+			t.Fatalf("unexpected classifier text %q", text)
+		}
+		return localAIClassification{Intent: localAIIntentSmallTalk, Confidence: 0.92}, nil
+	}
+	settings := agentSettings{
+		LocalAIEnabled: true,
+		LocalAIBaseURL: "http://127.0.0.1:1234/v1",
+		LocalAIModel:   "google/gemma-3-4b",
+	}
+	if !coordinatorCompactPromptEligible(settings, "appreciate it") {
+		t.Fatal("local AI small-talk classification should enable compact prompt")
+	}
+}
+
+func TestCoordinatorCompactPromptFallsBackConservatively(t *testing.T) {
+	old := classifyCoordinatorIntentWithLocalAI
+	defer func() { classifyCoordinatorIntentWithLocalAI = old }()
+	classifyCoordinatorIntentWithLocalAI = func(settings agentSettings, text string) (localAIClassification, error) {
+		return localAIClassification{Intent: localAIIntentSmallTalk, Confidence: 0.4}, nil
+	}
+	settings := agentSettings{
+		LocalAIEnabled: true,
+		LocalAIBaseURL: "http://127.0.0.1:1234/v1",
+		LocalAIModel:   "google/gemma-3-4b",
+	}
+	if coordinatorCompactPromptEligible(settings, "appreciate it") {
+		t.Fatal("low-confidence local AI classification should not compact")
 	}
 }

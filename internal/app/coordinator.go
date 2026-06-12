@@ -9,7 +9,11 @@ import (
 
 func buildCoordinatorPrompt(e env, state loopState) (string, error) {
 	latestText, _ := latestCoordinatorHandoffText(e.cwd, state.Task.Path)
-	compact := coordinatorSmallTalk(latestText)
+	config, err := readConfig(e.cwd)
+	if err != nil {
+		return "", err
+	}
+	compact := coordinatorCompactPromptEligible(config.Settings, latestText)
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "You are the coordinator for this Agents task.\n\n")
@@ -114,6 +118,17 @@ func handoffBodyText(markdown string) string {
 	return strings.Join(lines, "\n")
 }
 
+func coordinatorCompactPromptEligible(settings agentSettings, text string) bool {
+	if coordinatorSmallTalk(text) {
+		return true
+	}
+	if coordinatorActionRequest(text) {
+		return false
+	}
+	classification, ok := classifyCoordinatorIntent(settings, text)
+	return ok && classification.Intent == localAIIntentSmallTalk && classification.Confidence >= 0.8
+}
+
 func coordinatorSmallTalk(text string) bool {
 	normalized := strings.ToLower(strings.TrimSpace(strings.Trim(text, ".!? \t\r\n")))
 	if normalized == "" {
@@ -140,4 +155,14 @@ func coordinatorSmallTalk(text string) bool {
 		}
 	}
 	return true
+}
+
+func coordinatorActionRequest(text string) bool {
+	normalized := strings.ToLower(text)
+	for _, keyword := range []string{"code", "repo", "inspect", "review", "implement", "plan", "fix", "change", "build", "test", "check"} {
+		if strings.Contains(normalized, keyword) {
+			return true
+		}
+	}
+	return false
 }

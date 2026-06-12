@@ -3459,6 +3459,11 @@ func TestReadConfigParsesModelSettings(t *testing.T) {
 		"  claude_model: opus",
 		"  claude_effort: high",
 		"  cursor_model: claude-4.6-sonnet-medium-thinking",
+		"  local_ai_enabled: true",
+		"  local_ai_provider: lmstudio",
+		"  local_ai_base_url: http://127.0.0.1:1234/v1",
+		"  local_ai_model: google/gemma-3-4b",
+		"  local_ai_timeout_ms: 700",
 		"roles:",
 		"  implementer: agent",
 		"  reviewer: codex",
@@ -3478,8 +3483,45 @@ func TestReadConfigParsesModelSettings(t *testing.T) {
 	if cfg.Settings.ClaudeModel != "opus" || cfg.Settings.ClaudeEffort != "high" || cfg.Settings.CursorModel != "claude-4.6-sonnet-medium-thinking" {
 		t.Fatalf("unexpected settings: %+v", cfg.Settings)
 	}
+	if !cfg.Settings.LocalAIEnabled || cfg.Settings.LocalAIProvider != "lmstudio" ||
+		cfg.Settings.LocalAIBaseURL != "http://127.0.0.1:1234/v1" ||
+		cfg.Settings.LocalAIModel != "google/gemma-3-4b" ||
+		cfg.Settings.LocalAITimeout != 700 {
+		t.Fatalf("unexpected local AI settings: %+v", cfg.Settings)
+	}
 	if cfg.Roles["coordinator"].Provider != "codex" {
 		t.Fatalf("expected coordinator role to parse, got %+v", cfg.Roles)
+	}
+}
+
+func TestLocalAISettingsDoNotReplaceCoordinatorRole(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".agents"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgText := strings.Join([]string{
+		"settings:",
+		"  local_ai_enabled: true",
+		"  local_ai_provider: lmstudio",
+		"  local_ai_base_url: http://127.0.0.1:1234/v1",
+		"  local_ai_model: google/gemma-3-4b",
+		"roles:",
+		"  coordinator: codex",
+		"",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(dir, ".agents", "config.yml"), []byte(cfgText), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := readConfig(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command, agent, _, err := resolveRoleCommand(cfg.Roles["coordinator"], cfg.Settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if agent != "codex" || !strings.Contains(command, "codex exec") {
+		t.Fatalf("local AI settings must not replace coordinator role, agent=%q command=%q", agent, command)
 	}
 }
 

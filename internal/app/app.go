@@ -116,13 +116,18 @@ func (rc roleConfig) configured() bool {
 }
 
 type agentSettings struct {
-	Model          string
-	Reasoning      string
-	CodexModel     string
-	CodexReasoning string
-	ClaudeModel    string
-	ClaudeEffort   string
-	CursorModel    string
+	Model           string
+	Reasoning       string
+	CodexModel      string
+	CodexReasoning  string
+	ClaudeModel     string
+	ClaudeEffort    string
+	CursorModel     string
+	LocalAIEnabled  bool
+	LocalAIProvider string
+	LocalAIBaseURL  string
+	LocalAIModel    string
+	LocalAITimeout  int
 }
 
 const promptFileMarker = "{prompt_file}"
@@ -489,6 +494,19 @@ func readConfig(cwd string) (config, error) {
 				cfg.Settings.ClaudeEffort = value
 			case "cursor_model":
 				cfg.Settings.CursorModel = value
+			case "local_ai_enabled":
+				cfg.Settings.LocalAIEnabled = strings.EqualFold(value, "true")
+			case "local_ai_provider":
+				cfg.Settings.LocalAIProvider = value
+			case "local_ai_base_url":
+				cfg.Settings.LocalAIBaseURL = value
+			case "local_ai_model":
+				cfg.Settings.LocalAIModel = value
+			case "local_ai_timeout_ms":
+				n, err := strconv.Atoi(value)
+				if err == nil {
+					cfg.Settings.LocalAITimeout = n
+				}
 			}
 		}
 	}
@@ -2427,6 +2445,14 @@ settings:
   # Cursor Agent: run 'agent models' or 'cursor-agent --list-models' for account-specific choices
   # Common examples from CLI help: gpt-5, claude-4.6-sonnet-medium, claude-4.6-sonnet-medium-thinking
   cursor_model: ""
+  # Optional local AI classifier for ambiguous coordinator chat routing.
+  # LM Studio: base URL http://127.0.0.1:1234/v1, provider lmstudio.
+  # Ollama: base URL http://127.0.0.1:11434/v1, provider ollama.
+  local_ai_enabled: false
+  local_ai_provider: lmstudio
+  local_ai_base_url: http://127.0.0.1:1234/v1
+  local_ai_model: google/gemma-3-4b
+  local_ai_timeout_ms: 800
 # Each role is a provider name (cursor, cursor-agent, agent, codex, claude)
 # or a map with provider plus optional model/reasoning overrides:
 #   reviewer:
