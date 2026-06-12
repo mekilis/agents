@@ -3576,6 +3576,79 @@ func TestReadConfigParsesProviderMapAndReviewFirstPass(t *testing.T) {
 	}
 }
 
+func TestReadConfigParsesReviewerRoleList(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".agents"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgText := strings.Join([]string{
+		"providers:",
+		"  local-reviewer:",
+		"    type: openai_compatible",
+		"    base_url: http://127.0.0.1:1234/v1",
+		"    model: google/gemma-3-4b",
+		"  reviewer-codex:",
+		"    provider: codex",
+		"    model: gpt-5.5",
+		"    reasoning: high",
+		"roles:",
+		"  reviewer: [local-reviewer, reviewer-codex]",
+		"",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(dir, ".agents", "config.yml"), []byte(cfgText), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := readConfig(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reviewers := cfg.reviewerRoles()
+	if len(reviewers) != 2 || reviewers[0].Provider != "local-reviewer" || reviewers[1].Provider != "reviewer-codex" {
+		t.Fatalf("unexpected reviewer pipeline: %+v", reviewers)
+	}
+	resolved, settings := resolvedRole(cfg, reviewers[0])
+	if resolved.Provider != "local-reviewer" || !localAIProviderRole(resolved, settings) || settings.LocalAIModel != "google/gemma-3-4b" {
+		t.Fatalf("local reviewer did not resolve from provider map: resolved=%+v settings=%+v", resolved, settings)
+	}
+	resolved, settings = resolvedRole(cfg, reviewers[1])
+	if resolved.Provider != "codex" || settings.CodexModel != "gpt-5.5" || settings.CodexReasoning != "high" {
+		t.Fatalf("codex reviewer did not resolve from provider map: resolved=%+v settings=%+v", resolved, settings)
+	}
+}
+
+func TestReadConfigParsesReviewerBlockListWithMapItems(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".agents"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgText := strings.Join([]string{
+		"roles:",
+		"  reviewer:",
+		"    - provider: codex",
+		"      model: gpt-5.5",
+		"      reasoning: high",
+		"    - claude",
+		"",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(dir, ".agents", "config.yml"), []byte(cfgText), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := readConfig(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reviewers := cfg.reviewerRoles()
+	if len(reviewers) != 2 {
+		t.Fatalf("expected two reviewers, got %+v", reviewers)
+	}
+	if reviewers[0].Provider != "codex" || reviewers[0].Model != "gpt-5.5" || reviewers[0].Reasoning != "high" {
+		t.Fatalf("unexpected map reviewer item: %+v", reviewers[0])
+	}
+	if reviewers[1].Provider != "claude" {
+		t.Fatalf("unexpected scalar reviewer item: %+v", reviewers[1])
+	}
+}
+
 func TestReviewerPromptDoesNotIncludeLocalAIReviewNotes(t *testing.T) {
 	code := withTempProcessEnv(t, func(home, cwd string) int {
 		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
@@ -3887,6 +3960,130 @@ func TestLocalAIFirstPassMalformedResultContinuesToConfiguredReviewer(t *testing
 		}
 		if !strings.Contains(live.String(), "Local AI first-pass unavailable") {
 			t.Fatalf("missing local unavailable output:\n%s", live.String())
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
+func TestReviewerPipelineLocalFindingStopsNextReviewer(t *testing.T) {
+	old := runFirstPassReviewWithLocalAI
+	defer func() { runFirstPassReviewWithLocalAI = old }()
+	runFirstPassReviewWithLocalAI = func(settings agentSettings, input string) (localAIReviewResult, error) {
+		return localAIReviewResult{
+			Result: "fail",
+			Findings: []localAIReviewFinding{{
+				Severity: "high",
+				Text:     "pipeline-local issue",
+				Evidence: "diff shows bug",
+			}},
+		}, nil
+	}
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Reviewer Pipeline Local Finding"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addHandoff(e, []string{"--to", "reviewer", "Ready for review."}, time.Date(2026, 6, 5, 10, 1, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		marker := filepath.Join(cwd, "next-reviewer-ran")
+		nextReviewer := filepath.Join(cwd, "next-reviewer.sh")
+		if err := os.WriteFile(nextReviewer, []byte("#!/bin/sh\ntouch "+shellQuote(marker)+"\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cfg := strings.Join([]string{
+			"providers:",
+			"  lmstudio:",
+			"    type: openai_compatible",
+			"    base_url: http://127.0.0.1:1234/v1",
+			"    model: google/gemma-3-4b",
+			"roles:",
+			"  reviewer:",
+			"    - lmstudio",
+			"    - " + nextReviewer + " {prompt_file}",
+			"",
+		}, "\n")
+		if err := os.WriteFile(filepath.Join(cwd, ".agents", "config.yml"), []byte(cfg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		state, err := analyzeLoopState(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var live bytes.Buffer
+		result, err := runConfiguredRole(e, state, &live)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.After.NextRole != "implementer" || result.After.Stats.FindingsOpen != 1 {
+			t.Fatalf("expected local finding to route to implementer: %+v", result)
+		}
+		if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("next reviewer should not run after blocking finding, stat err=%v", err)
+		}
+		if !strings.Contains(live.String(), "Local reviewer lmstudio found 1 finding") {
+			t.Fatalf("missing local reviewer output:\n%s", live.String())
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
+func TestReviewerPipelineCleanLocalContinuesToNextReviewerAndVerification(t *testing.T) {
+	old := runFirstPassReviewWithLocalAI
+	defer func() { runFirstPassReviewWithLocalAI = old }()
+	runFirstPassReviewWithLocalAI = func(settings agentSettings, input string) (localAIReviewResult, error) {
+		return localAIReviewResult{Result: "pass", Summary: "clean"}, nil
+	}
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Reviewer Pipeline Verification"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addHandoff(e, []string{"--to", "reviewer", "Ready for review."}, time.Date(2026, 6, 5, 10, 1, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		marker := filepath.Join(cwd, "next-reviewer-ran")
+		nextReviewer := filepath.Join(cwd, "next-reviewer.sh")
+		reviewerBody := "#!/bin/sh\nset -eu\ntouch " + shellQuote(marker) + "\necho '```agents-verify'\necho '{\"text\":\"pipeline reviewers passed\",\"cmd\":\"echo ok\"}'\necho '```'\n"
+		if err := os.WriteFile(nextReviewer, []byte(reviewerBody), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cfg := strings.Join([]string{
+			"providers:",
+			"  lmstudio:",
+			"    type: openai_compatible",
+			"    base_url: http://127.0.0.1:1234/v1",
+			"    model: google/gemma-3-4b",
+			"roles:",
+			"  reviewer: [lmstudio, " + nextReviewer + " {prompt_file}]",
+			"",
+		}, "\n")
+		if err := os.WriteFile(filepath.Join(cwd, ".agents", "config.yml"), []byte(cfg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		state, err := analyzeLoopState(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var live bytes.Buffer
+		result, err := runConfiguredRole(e, state, &live)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(marker); err != nil {
+			t.Fatalf("next reviewer did not run after clean local reviewer: %v", err)
+		}
+		if result.After.NextRole != "human" || result.After.Stats.Verification != 1 {
+			t.Fatalf("expected final verification to reach human boundary: %+v", result.After)
+		}
+		if !strings.Contains(live.String(), "Local reviewer lmstudio found no blocking findings") {
+			t.Fatalf("missing clean local reviewer output:\n%s", live.String())
 		}
 		return 0
 	})

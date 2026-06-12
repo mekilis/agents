@@ -275,9 +275,73 @@ func runLocalAIFirstPassReview(e env, state loopState, cfg config, options roleR
 	return false, roleRunResult{}, nil
 }
 
+func runLocalAIReviewerItem(e env, state loopState, rc roleConfig, settings agentSettings, options roleRunOptions) (roleRunResult, error) {
+	live := options.LiveOutput
+	if live == nil {
+		live = io.Discard
+	}
+	agent := strings.TrimSpace(rc.Provider)
+	agentDesc := agentDescriptor(agent, settings)
+	review, err := runFirstPassReviewWithLocalAI(settings, localAIReviewInput(e, state))
+	result := roleRunResult{
+		Role:         state.NextRole,
+		Agent:        agent,
+		AgentDesc:    agentDesc,
+		Before:       state,
+		AgentSkipped: true,
+	}
+	if err != nil || !review.valid() {
+		msg := fmt.Sprintf("Local reviewer %s unavailable; continuing to next reviewer.\n", agent)
+		if err != nil {
+			msg = fmt.Sprintf("Local reviewer %s unavailable (%s); continuing to next reviewer.\n", agent, err)
+		}
+		fmt.Fprint(live, msg)
+		after, analyzeErr := analyzeLoopState(e)
+		if analyzeErr != nil {
+			return result, analyzeErr
+		}
+		result.After = after
+		result.AgentOutput = msg
+		return result, nil
+	}
+	var output strings.Builder
+	if review.blocksReviewer() {
+		fmt.Fprintf(&output, "Local reviewer %s found %d finding(s); stopping reviewer pipeline until they are fixed.\n", agent, len(review.Findings))
+		if summary := strings.TrimSpace(review.Summary); summary != "" {
+			fmt.Fprintf(&output, "%s\n", summary)
+		}
+		localEnv := e
+		localEnv.actor = agent
+		localEnv.agentDesc = agentDesc
+		for _, finding := range review.normalizedFindings() {
+			text := "Local reviewer " + agent + ": " + finding.Text
+			if evidence := strings.TrimSpace(finding.Evidence); evidence != "" {
+				text += "\nEvidence: " + evidence
+			}
+			if _, err := addFinding(localEnv, []string{text, "--severity", finding.Severity, "--by", agent}, time.Now().UTC()); err != nil {
+				return result, err
+			}
+		}
+	} else {
+		fmt.Fprintf(&output, "Local reviewer %s found no blocking findings; continuing to next reviewer.\n", agent)
+		if strings.EqualFold(strings.TrimSpace(review.Result), "escalate") {
+			output.Reset()
+			fmt.Fprintf(&output, "Local reviewer %s requested escalation; continuing to next reviewer.\n", agent)
+		}
+	}
+	after, err := analyzeLoopState(e)
+	if err != nil {
+		return result, err
+	}
+	result.After = after
+	result.AgentOutput = output.String()
+	fmt.Fprint(live, result.AgentOutput)
+	return result, nil
+}
+
 func runFirstPassReviewWithOpenAICompat(settings agentSettings, input string) (localAIReviewResult, error) {
 	content, err := localAIChat(settings,
-		"You are the first-pass reviewer in an Agents workflow. Review only the provided task context. "+
+		"You are a reviewer in an ordered Agents review pipeline. Review only the provided task context. "+
 			"Return only JSON: {\"result\":\"pass|fail|escalate\",\"summary\":\"...\",\"findings\":[{\"severity\":\"low|medium|high\",\"text\":\"...\",\"evidence\":\"...\"}]}. "+
 			"Use fail only for concrete, grounded issues. Use pass when there are no blocking issues. Use escalate when the context is insufficient or uncertain.",
 		strings.TrimSpace(input),

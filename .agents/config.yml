@@ -28,7 +28,7 @@ providers:
 # Advanced escape hatch: a cmd template containing {prompt_file}.
 roles:
   implementer: agent
-  reviewer: codex
+  reviewer:
+    - lmstudio
+    - codex
   coordinator: codex
-review:
-  first_pass: lmstudio

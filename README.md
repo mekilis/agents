@@ -255,25 +255,26 @@ providers:
 roles:
   implementer: cursor
   coordinator: lmstudio
-  # A role can also be a map with per-role overrides:
+  # A role can be a scalar, a map with per-role overrides, or for reviewer,
+  # an ordered list of reviewer providers.
   reviewer:
-    provider: codex
-    reasoning: high
-review:
-  first_pass: lmstudio
+    - lmstudio
+    - provider: codex
+      reasoning: high
 ```
 
 Providers are named by who runs them or how Agents reaches them. Built-in
 provider names are `cursor`, `cursor-agent`, `agent`, `codex`, and `claude`;
 local OpenAI-compatible providers such as `lmstudio` and `ollama` can be used
-for coordinator preflight and `review.first_pass`. Models and provider-specific
-settings live under `providers`; use `type: openai_compatible` for local chat
-completion servers. Per-role `model`/`reasoning` values override the named
-provider for that role only. Set `cmd: my-agent {prompt_file}` as an advanced
-escape hatch, or put provider flags directly in a custom role command.
+for coordinator preflight and as reviewer list items. Models and
+provider-specific settings live under `providers`; use `type:
+openai_compatible` for local chat completion servers. Per-role
+`model`/`reasoning` values override the named provider for that role only. Set
+`cmd: my-agent {prompt_file}` as an advanced escape hatch, or put provider
+flags directly in a custom role command.
 Legacy `settings.local_ai_*`, `settings.codex_*`, `settings.claude_*`, and
 `settings.cursor_model` keys still work, but new config should prefer
-`providers` and explicit `review.first_pass`.
+`providers` and `roles.reviewer`.
 
 ```bash
 agents archive

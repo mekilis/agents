@@ -89,10 +89,11 @@ type env struct {
 }
 
 type config struct {
-	Roles     map[string]roleConfig
-	Providers map[string]providerConfig
-	Review    reviewConfig
-	Settings  agentSettings
+	Roles            map[string]roleConfig
+	ReviewerPipeline []roleConfig
+	Providers        map[string]providerConfig
+	Review           reviewConfig
+	Settings         agentSettings
 }
 
 // providerConfig holds reusable provider settings. Name is the map key.
@@ -134,6 +135,38 @@ func (rc roleConfig) agentLabel() string {
 
 func (rc roleConfig) configured() bool {
 	return rc.agentLabel() != ""
+}
+
+func roleConfigFromValue(value string) roleConfig {
+	value = strings.Trim(strings.TrimSpace(value), `"`)
+	if strings.Contains(value, promptFileMarker) {
+		return roleConfig{Cmd: value}
+	}
+	return roleConfig{Provider: value}
+}
+
+func (cfg *config) setRole(role string, rc roleConfig) {
+	cfg.Roles[role] = rc
+	if role == "reviewer" {
+		cfg.ReviewerPipeline = []roleConfig{rc}
+	}
+}
+
+func (cfg *config) appendReviewer(rc roleConfig) {
+	cfg.ReviewerPipeline = append(cfg.ReviewerPipeline, rc)
+	if _, ok := cfg.Roles["reviewer"]; !ok {
+		cfg.Roles["reviewer"] = rc
+	}
+}
+
+func (cfg config) reviewerRoles() []roleConfig {
+	if len(cfg.ReviewerPipeline) > 0 {
+		return cfg.ReviewerPipeline
+	}
+	if rc := cfg.Roles["reviewer"]; rc.configured() {
+		return []roleConfig{rc}
+	}
+	return nil
 }
 
 type agentSettings struct {
@@ -424,6 +457,7 @@ func readConfig(cwd string) (config, error) {
 	inSettings := false
 	currentRole := ""
 	currentProvider := ""
+	currentReviewerIndex := -1
 	for _, line := range strings.Split(string(data), "\n") {
 		if strings.TrimSpace(line) == "" || strings.HasPrefix(strings.TrimSpace(line), "#") {
 			continue
@@ -436,6 +470,7 @@ func readConfig(cwd string) (config, error) {
 			inSettings = false
 			currentRole = ""
 			currentProvider = ""
+			currentReviewerIndex = -1
 			continue
 		}
 		if trimmedLine == "providers:" {
@@ -445,6 +480,7 @@ func readConfig(cwd string) (config, error) {
 			inSettings = false
 			currentRole = ""
 			currentProvider = ""
+			currentReviewerIndex = -1
 			continue
 		}
 		if trimmedLine == "review:" {
@@ -454,6 +490,7 @@ func readConfig(cwd string) (config, error) {
 			inSettings = false
 			currentRole = ""
 			currentProvider = ""
+			currentReviewerIndex = -1
 			continue
 		}
 		if trimmedLine == "settings:" {
@@ -463,15 +500,48 @@ func readConfig(cwd string) (config, error) {
 			inSettings = true
 			currentRole = ""
 			currentProvider = ""
+			currentReviewerIndex = -1
 			continue
 		}
 		if inRoles {
 			if !strings.HasPrefix(line, "  ") {
 				inRoles = false
 				currentRole = ""
+				currentReviewerIndex = -1
 				continue
 			}
 			trimmed := strings.TrimSpace(line)
+			if currentRole == "reviewer" && strings.HasPrefix(trimmed, "- ") {
+				item := strings.TrimSpace(strings.TrimPrefix(trimmed, "- "))
+				if item == "" {
+					cfg.appendReviewer(roleConfig{})
+					currentReviewerIndex = len(cfg.ReviewerPipeline) - 1
+					continue
+				}
+				if parts := strings.SplitN(item, ":", 2); len(parts) == 2 {
+					cfg.appendReviewer(roleConfig{})
+					currentReviewerIndex = len(cfg.ReviewerPipeline) - 1
+					key := strings.TrimSpace(parts[0])
+					value := strings.Trim(strings.TrimSpace(parts[1]), `"`)
+					rc := cfg.ReviewerPipeline[currentReviewerIndex]
+					switch key {
+					case "provider":
+						rc.Provider = value
+					case "model":
+						rc.Model = value
+					case "reasoning":
+						rc.Reasoning = value
+					case "cmd":
+						rc.Cmd = value
+					}
+					cfg.ReviewerPipeline[currentReviewerIndex] = rc
+					cfg.Roles["reviewer"] = cfg.ReviewerPipeline[0]
+					continue
+				}
+				cfg.appendReviewer(roleConfigFromValue(item))
+				currentReviewerIndex = len(cfg.ReviewerPipeline) - 1
+				continue
+			}
 			parts := strings.SplitN(trimmed, ":", 2)
 			if len(parts) != 2 {
 				continue
@@ -481,6 +551,22 @@ func readConfig(cwd string) (config, error) {
 			if strings.HasPrefix(line, "    ") {
 				// Nested role field, e.g. "    model: gpt-5.5".
 				if currentRole == "" {
+					continue
+				}
+				if currentRole == "reviewer" && currentReviewerIndex >= 0 {
+					rc := cfg.ReviewerPipeline[currentReviewerIndex]
+					switch key {
+					case "provider":
+						rc.Provider = value
+					case "model":
+						rc.Model = value
+					case "reasoning":
+						rc.Reasoning = value
+					case "cmd":
+						rc.Cmd = value
+					}
+					cfg.ReviewerPipeline[currentReviewerIndex] = rc
+					cfg.Roles["reviewer"] = cfg.ReviewerPipeline[0]
 					continue
 				}
 				rc := cfg.Roles[currentRole]
@@ -504,17 +590,27 @@ func readConfig(cwd string) (config, error) {
 			if value == "" {
 				// Map form: fields follow on deeper-indented lines.
 				currentRole = key
+				currentReviewerIndex = -1
 				if _, ok := cfg.Roles[key]; !ok {
 					cfg.Roles[key] = roleConfig{}
 				}
 				continue
 			}
 			currentRole = ""
-			if strings.Contains(value, promptFileMarker) {
-				cfg.Roles[key] = roleConfig{Cmd: value}
-			} else {
-				cfg.Roles[key] = roleConfig{Provider: value}
+			currentReviewerIndex = -1
+			if key == "reviewer" && strings.HasPrefix(value, "[") && strings.HasSuffix(value, "]") {
+				cfg.ReviewerPipeline = nil
+				cfg.Roles["reviewer"] = roleConfig{}
+				for _, item := range strings.Split(strings.TrimSuffix(strings.TrimPrefix(value, "["), "]"), ",") {
+					item = strings.TrimSpace(item)
+					if item == "" {
+						continue
+					}
+					cfg.appendReviewer(roleConfigFromValue(item))
+				}
+				continue
 			}
+			cfg.setRole(key, roleConfigFromValue(value))
 			continue
 		}
 		if inProviders {
@@ -699,6 +795,7 @@ func providerSettings(pc providerConfig, settings agentSettings) agentSettings {
 	}
 	if strings.TrimSpace(pc.BaseURL) != "" {
 		effective.LocalAIBaseURL = strings.TrimSpace(pc.BaseURL)
+		effective.LocalAIEnabled = true
 	}
 	if model != "" {
 		effective.LocalAIModel = model
@@ -2653,7 +2750,7 @@ settings:
   # Common examples from CLI help: gpt-5, claude-4.6-sonnet-medium, claude-4.6-sonnet-medium-thinking
   cursor_model: ""
 providers:
-  # Local OpenAI-compatible providers can coordinate or run first-pass review.
+  # Local OpenAI-compatible providers can coordinate or act as reviewer entries.
   # LM Studio: base URL http://127.0.0.1:1234/v1.
   # Ollama: base URL http://127.0.0.1:11434/v1.
   lmstudio:
@@ -2661,15 +2758,12 @@ providers:
     base_url: http://127.0.0.1:1234/v1
     model: google/gemma-3-4b
     timeout_ms: 800
-review:
-  # Optional first-pass reviewer. Example: lmstudio.
-  first_pass: ""
 # Each role is a provider name (cursor, cursor-agent, agent, codex, claude)
-# or a map with provider plus optional model/reasoning overrides:
+# or a map with provider plus optional model/reasoning overrides. The reviewer
+# role can also be an ordered list, e.g.:
 #   reviewer:
-#     provider: codex
-#     model: gpt-5.5
-#     reasoning: high
+#     - lmstudio
+#     - codex
 # Advanced escape hatch: a cmd template containing {prompt_file}.
 roles:
   implementer: agent
@@ -4587,7 +4681,74 @@ func runConfiguredRoleWithOptions(e env, state loopState, options roleRunOptions
 	if err != nil {
 		return roleRunResult{}, err
 	}
+	if state.NextRole == "reviewer" && len(config.reviewerRoles()) > 1 {
+		return runReviewerPipeline(e, state, config, options)
+	}
 	rc := config.Roles[state.NextRole]
+	if state.NextRole == "reviewer" && len(config.reviewerRoles()) == 1 {
+		rc = config.reviewerRoles()[0]
+	}
+	return runConfiguredRoleItem(e, state, config, rc, options)
+}
+
+func runReviewerPipeline(e env, state loopState, config config, options roleRunOptions) (roleRunResult, error) {
+	reviewers := config.reviewerRoles()
+	result := roleRunResult{Role: "reviewer", Before: state, After: state}
+	var output strings.Builder
+	for i, rc := range reviewers {
+		if !rc.configured() {
+			continue
+		}
+		itemState := state
+		itemState.NextRole = "reviewer"
+		itemConfig := config
+		itemConfig.Review = reviewConfig{}
+		itemConfig.Settings.LocalAIReviewFirstPass = false
+		itemResult, err := runConfiguredRoleItem(e, itemState, itemConfig, rc, options)
+		if err != nil {
+			return result, err
+		}
+		if result.RunID == "" {
+			result.RunID = itemResult.RunID
+			result.Agent = itemResult.Agent
+			result.AgentDesc = itemResult.AgentDesc
+			result.Command = itemResult.Command
+			result.PromptPath = itemResult.PromptPath
+			result.LogPath = itemResult.LogPath
+			result.AgentSkipped = itemResult.AgentSkipped
+		} else {
+			result.Agent = strings.TrimSpace(result.Agent + ", " + itemResult.Agent)
+			result.AgentDesc = strings.TrimSpace(result.AgentDesc + ", " + itemResult.AgentDesc)
+			result.AgentSkipped = result.AgentSkipped && itemResult.AgentSkipped
+		}
+		if strings.TrimSpace(itemResult.AgentOutput) != "" {
+			if output.Len() > 0 {
+				output.WriteByte('\n')
+			}
+			output.WriteString(itemResult.AgentOutput)
+		}
+		result.After = itemResult.After
+		if itemResult.After.Stats.FindingsOpen > state.Stats.FindingsOpen || itemResult.After.NextRole == "implementer" {
+			result.AgentOutput = output.String()
+			return result, nil
+		}
+		if i < len(reviewers)-1 {
+			continue
+		}
+	}
+	if after, err := analyzeLoopState(e); err == nil {
+		result.After = after
+	} else {
+		return result, err
+	}
+	result.AgentOutput = output.String()
+	if result.Agent == "" {
+		return result, fmt.Errorf("no agent configured for reviewer")
+	}
+	return result, nil
+}
+
+func runConfiguredRoleItem(e env, state loopState, config config, rc roleConfig, options roleRunOptions) (roleRunResult, error) {
 	if !rc.configured() {
 		return roleRunResult{}, fmt.Errorf("no agent configured for %s", state.NextRole)
 	}
@@ -4595,6 +4756,9 @@ func runConfiguredRoleWithOptions(e env, state loopState, options roleRunOptions
 		return result, err
 	}
 	resolved, settings := resolvedRole(config, rc)
+	if state.NextRole == "reviewer" && localAIProviderRole(resolved, settings) {
+		return runLocalAIReviewerItem(e, state, resolved, settings, options)
+	}
 	if localAIProviderRole(resolved, settings) {
 		return runLocalAIConfiguredRole(e, state, resolved, settings, options)
 	}
