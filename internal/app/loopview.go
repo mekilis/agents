@@ -721,10 +721,14 @@ func watchLoopInView(out *os.File, e env, taskTitle string, maxRuns int, forceFi
 	events := make(chan loopEvent, 256)
 	loopDone := make(chan loopResult, 1)
 
+	activity, activityErr := newRunActivitySink(e)
+	if activityErr != nil {
+		return loopResult{err: activityErr}
+	}
 	go func() {
-		stop, loopErr := runManagedLoop(e, io.Discard, maxRuns, false, func(ev loopEvent) {
+		stop, loopErr := runManagedLoop(e, io.Discard, maxRuns, false, combineEventSinks(func(ev loopEvent) {
 			events <- ev
-		}, control, loopDisplayView, forceFirstRole)
+		}, activity), control, loopDisplayView, forceFirstRole, true)
 		loopDone <- loopResult{stop: stop, err: loopErr}
 	}()
 

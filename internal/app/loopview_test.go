@@ -394,7 +394,7 @@ func TestLoopControlStopsBetweenRuns(t *testing.T) {
 		var events []loopEvent
 		stop, err := runManagedLoop(e, discardWriter{}, 6, false, func(ev loopEvent) {
 			events = append(events, ev)
-		}, control, loopDisplayPlain, "")
+		}, control, loopDisplayPlain, "", false)
 		if err != nil {
 			t.Fatal(err)
 		}

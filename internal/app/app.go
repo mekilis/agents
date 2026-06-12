@@ -154,7 +154,7 @@ func (cfg *config) setRole(role string, rc roleConfig) {
 
 func (cfg *config) appendReviewer(rc roleConfig) {
 	cfg.ReviewerPipeline = append(cfg.ReviewerPipeline, rc)
-	if _, ok := cfg.Roles["reviewer"]; !ok {
+	if existing, ok := cfg.Roles["reviewer"]; !ok || !existing.configured() {
 		cfg.Roles["reviewer"] = rc
 	}
 }
@@ -286,6 +286,10 @@ func runOneShot(args []string, in io.Reader, out, errOut io.Writer, e env) int {
 		return runDispatchCommand(args[1:], out, errOut, e)
 	case "run":
 		return runLoopCommand(args[1:], out, errOut, e)
+	case "watch":
+		return runWatchCommand(args[1:], out, errOut, e)
+	case "runs":
+		return runRunsCommand(args[1:], out, errOut, e)
 	default:
 		fmt.Fprintf(errOut, "agents: unknown command: %s\n", strings.Join(args, " "))
 		fmt.Fprintln(errOut, "Run `agents help` for usage.")
@@ -901,6 +905,8 @@ func printHelp(w io.Writer) {
 	fmt.Fprintln(w, "  agents archive")
 	fmt.Fprintln(w, "  agents dispatch <implementer|reviewer|coordinator> [--json]")
 	fmt.Fprintln(w, "  agents run [--max-iterations N] [--once] [--json] [--json-events]")
+	fmt.Fprintln(w, "  agents watch")
+	fmt.Fprintln(w, "  agents runs [--follow]")
 	fmt.Fprintln(w, "  agents completion zsh")
 	fmt.Fprintln(w, "  agents completion install-zsh")
 	fmt.Fprintln(w, "  agents version")
@@ -986,6 +992,8 @@ _agents() {
     'archive:archive the active task'
     'dispatch:print a role packet'
     'run:run queued roles until a stop condition'
+    'watch:show active task run activity'
+    'runs:show recent run activity'
     'completion:generate shell completion'
   )
 
@@ -1019,6 +1027,9 @@ _agents() {
           ;;
         run)
           _arguments '--json[print JSON]' '--once[run a single role]' '--max-iterations[role run budget]:count:'
+          ;;
+        runs)
+          _arguments '--follow[follow active task run activity]'
           ;;
         go)
           _arguments '--ref[task reference]:ref:' '--max-iterations[role run budget]:count:' '--plain[plain output instead of the split view]'
@@ -2222,7 +2233,11 @@ func printInteractiveRoleRunResult(w io.Writer, result roleRunResult) {
 }
 
 func runInteractiveQueuedRoles(e env, out io.Writer, maxRuns int) error {
-	stop, err := runManagedLoop(e, out, maxRuns, true, nil, nil, loopDisplayInteractive, "")
+	activity, activityErr := newRunActivitySink(e)
+	if activityErr != nil {
+		return activityErr
+	}
+	stop, err := runManagedLoop(e, out, maxRuns, true, activity, nil, loopDisplayInteractive, "", false)
 	return printInteractiveLoopStop(out, stop, err)
 }
 
@@ -2232,7 +2247,11 @@ func runInteractiveQueuedRole(e env, out io.Writer, maxRuns int, role, note stri
 			return err
 		}
 	}
-	stop, err := runManagedLoop(e, out, maxRuns, true, nil, nil, loopDisplayInteractive, role)
+	activity, activityErr := newRunActivitySink(e)
+	if activityErr != nil {
+		return activityErr
+	}
+	stop, err := runManagedLoop(e, out, maxRuns, true, activity, nil, loopDisplayInteractive, role, false)
 	return printInteractiveLoopStop(out, stop, err)
 }
 
@@ -3064,7 +3083,7 @@ func runGoCommand(args []string, in io.Reader, out, errOut io.Writer, e env) int
 		fmt.Fprintf(out, "task: %s\n", task.Title)
 		fmt.Fprintf(out, "task path: %s\n", task.Path)
 		fmt.Fprintln(out)
-		return runLoopToStop("go", out, errOut, e, maxRuns, nil, targetRole)
+		return runLoopToStop("go", out, errOut, e, maxRuns, nil, targetRole, false)
 	}
 	if text == "" {
 		fmt.Fprintln(errOut, "agents: go: instruction text is required, e.g. agents go \"Add /history command\"")
@@ -3096,7 +3115,7 @@ func runGoCommand(args []string, in io.Reader, out, errOut io.Writer, e env) int
 	fmt.Fprintf(out, "task: %s\n", task.Title)
 	fmt.Fprintf(out, "task path: %s\n", task.Path)
 	fmt.Fprintln(out)
-	return runLoopToStop("go", out, errOut, e, maxRuns, nil, "")
+	return runLoopToStop("go", out, errOut, e, maxRuns, nil, "", false)
 }
 
 func parseGoArgs(args []string) (text, ref string, maxRuns int, plain, continueActive bool, targetRole string, err error) {
@@ -3987,6 +4006,10 @@ func writeArchiveSummary(taskDir, archiveDir string, active activeTask, now time
 	if err != nil {
 		return err
 	}
+	runCount, err := countJSONLFiles(filepath.Join(taskDir, "runs"))
+	if err != nil {
+		return err
+	}
 	openFindings, fixedFindings, verifiedFindings, err := countFindingStatuses(filepath.Join(taskDir, "findings"))
 	if err != nil {
 		return err
@@ -4004,6 +4027,7 @@ func writeArchiveSummary(taskDir, archiveDir string, active activeTask, now time
 	fmt.Fprintf(&b, "- decisions: %d\n", decisionCount)
 	fmt.Fprintf(&b, "- handoffs: %d\n", handoffCount)
 	fmt.Fprintf(&b, "- verification records: %d\n", verificationCount)
+	fmt.Fprintf(&b, "- run activity records: %d\n", runCount)
 	fmt.Fprintf(&b, "- findings open: %d\n", openFindings)
 	fmt.Fprintf(&b, "- findings fixed: %d\n", fixedFindings)
 	fmt.Fprintf(&b, "- findings verified: %d\n", verifiedFindings)
@@ -4040,6 +4064,14 @@ func stripFirstMarkdownHeading(markdown string) string {
 }
 
 func countMarkdownFiles(dir string) (int, error) {
+	return countFilesWithSuffix(dir, ".md")
+}
+
+func countJSONLFiles(dir string) (int, error) {
+	return countFilesWithSuffix(dir, ".jsonl")
+}
+
+func countFilesWithSuffix(dir, suffix string) (int, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -4049,7 +4081,7 @@ func countMarkdownFiles(dir string) (int, error) {
 	}
 	count := 0
 	for _, entry := range entries {
-		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".md") {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), suffix) {
 			count++
 		}
 	}
@@ -4305,7 +4337,7 @@ const (
 	loopDisplayView
 )
 
-func runManagedLoop(e env, out io.Writer, maxRuns int, stopAtCoordinator bool, events loopEventSink, control *loopControl, display loopDisplayMode, forceFirstRole string) (loopStop, error) {
+func runManagedLoop(e env, out io.Writer, maxRuns int, stopAtCoordinator bool, events loopEventSink, control *loopControl, display loopDisplayMode, forceFirstRole string, hideRunHeader bool) (loopStop, error) {
 	emit := func(ev loopEvent) {
 		if events != nil {
 			events(ev)
@@ -4364,7 +4396,7 @@ func runManagedLoop(e env, out io.Writer, maxRuns int, stopAtCoordinator bool, e
 			liveOut = &interactiveRunHeaderWriter{out: out}
 		}
 		result, err := runConfiguredRoleWithOptions(e, state, roleRunOptions{
-			ShowRunHeader:    events == nil,
+			ShowRunHeader:    !hideRunHeader,
 			LiveOutput:       liveOut,
 			Events:           events,
 			CleanEventOutput: events != nil && display == loopDisplayView,
@@ -4421,18 +4453,34 @@ func runLoopCommand(args []string, out, errOut io.Writer, e env) int {
 	// discarded and every lifecycle change is emitted as an event instead.
 	var events loopEventSink
 	loopOut := out
+	hideRunHeader := false
+	activity, err := newRunActivitySink(e)
+	if err != nil {
+		fmt.Fprintf(errOut, "agents: run: %v\n", err)
+		return 1
+	}
 	if flags.JSONEvents {
 		events = jsonlEventSink(out)
 		loopOut = io.Discard
+		hideRunHeader = true
 	}
-	return runLoopToStop("run", loopOut, errOut, e, flags.MaxRuns, events, "")
+	events = combineEventSinks(events, activity)
+	return runLoopToStop("run", loopOut, errOut, e, flags.MaxRuns, events, "", hideRunHeader)
 }
 
 // runLoopToStop drives the managed loop until a stop condition and translates
 // the stop into plain output and an exit code. Shared by `agents run` and
 // `agents go`; cmd names the invoking command in error output.
-func runLoopToStop(cmd string, loopOut, errOut io.Writer, e env, maxRuns int, events loopEventSink, forceFirstRole string) int {
-	stop, err := runManagedLoop(e, loopOut, maxRuns, false, events, nil, loopDisplayPlain, forceFirstRole)
+func runLoopToStop(cmd string, loopOut, errOut io.Writer, e env, maxRuns int, events loopEventSink, forceFirstRole string, hideRunHeader bool) int {
+	if events == nil {
+		activity, activityErr := newRunActivitySink(e)
+		if activityErr != nil {
+			fmt.Fprintf(errOut, "agents: %s: %v\n", cmd, activityErr)
+			return 1
+		}
+		events = activity
+	}
+	stop, err := runManagedLoop(e, loopOut, maxRuns, false, events, nil, loopDisplayPlain, forceFirstRole, hideRunHeader)
 	if err != nil {
 		if errors.Is(err, errRunInterrupted) {
 			printInterruptHint(loopOut, e)
@@ -4481,7 +4529,12 @@ func runLoopOnce(out, errOut io.Writer, e env, state loopState) int {
 		fmt.Fprintf(out, "agent: not configured for %s\n", state.NextRole)
 		return 0
 	}
-	result, err := runConfiguredRole(e, state, out)
+	activity, err := newRunActivitySink(e)
+	if err != nil {
+		fmt.Fprintf(errOut, "agents: run: %v\n", err)
+		return 1
+	}
+	result, err := runConfiguredRoleWithOptions(e, state, roleRunOptions{ShowRunHeader: true, LiveOutput: out, Events: activity})
 	if err != nil {
 		if errors.Is(err, errRunInterrupted) {
 			printInterruptHint(out, e)

@@ -1,0 +1,3 @@
+# Next
+
+Reviewer should inspect run activity fragment coalescing heuristic and rerun go test ./...

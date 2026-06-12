@@ -204,6 +204,9 @@ agents run --max-iterations 8   # raise the role-run budget (default 6)
 agents run --once               # run exactly one role, then stop
 agents run --json               # inspect loop state without running anything
 agents run --json-events        # run the loop, streaming lifecycle events as JSONL
+agents watch                    # show cleaned activity for the active task
+agents runs                     # show recent cleaned run history
+agents runs --follow            # same cleaned activity view as watch
 agents dispatch implementer
 agents dispatch reviewer --json
 ```
@@ -218,18 +221,24 @@ agents dispatch reviewer --json
   same target with no findings or verification movement,
 - or the role-run budget is exhausted (exit code 1, rerun to continue).
 
+Agents also writes cleaned structured run activity under the active task in
+`.agents/tasks/<task>/runs/<run-id>.jsonl`. These records keep role starts,
+cleaned agent messages, failures, and finish times without duplicating
+findings, verification, decisions, status, or noisy heartbeat output. Use
+`agents watch` while work is active, or `agents runs` to review recent cleaned
+history.
+
 With `--json-events` the loop runs the same way but stdout becomes a JSONL
 stream of lifecycle events for scripts and frontends: `state_changed` (loop
 state payload), `run_started` / `run_finished` (run id, role, agent), `output`
 (live provider output chunks), and `stopped` (reason, run count, final state).
 Exit codes match the plain loop.
 
-When the next role has a configured agent, `agents run` writes transient provider
-artifacts under `.agents/runs/`: prompts in `prompts/` and live logs in `logs/`.
-It prints a run id and log path before launch, writes an immediate launch marker
-to the log, streams provider output to the terminal, and writes the same output
-to the log so you can tail it from another terminal. The run log launch marker
-records the role, agent, model, and reasoning setting. Built-in agent names are
+When the next role has a configured agent, `agents run` still writes transient
+provider artifacts under `.agents/runs/`: prompts in `prompts/` and raw live
+logs in `logs/`. Those logs are for debugging provider behavior; the native
+watch path is the cleaned task run activity. The run log launch marker records
+the role, agent, model, and reasoning setting. Built-in agent names are
 `cursor`, `cursor-agent`, `agent`, `codex`, and `claude`. Custom commands can
 include `{prompt_file}`:
 

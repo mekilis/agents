@@ -234,6 +234,7 @@ func runLocalAIFirstPassReview(e env, state loopState, cfg config, options roleR
 		return false, roleRunResult{}, nil
 	}
 	if review.blocksReviewer() {
+		findings := review.normalizedFindings()
 		result := roleRunResult{
 			Role:         state.NextRole,
 			Agent:        localAIAgentName(settings),
@@ -242,14 +243,14 @@ func runLocalAIFirstPassReview(e env, state loopState, cfg config, options roleR
 			AgentSkipped: true,
 		}
 		var output strings.Builder
-		fmt.Fprintf(&output, "Local AI first-pass found %d finding(s); skipping configured reviewer until they are fixed.\n", len(review.Findings))
+		fmt.Fprintf(&output, "Local AI first-pass found %d finding(s); skipping configured reviewer until they are fixed.\n", len(findings))
 		if summary := strings.TrimSpace(review.Summary); summary != "" {
 			fmt.Fprintf(&output, "%s\n", summary)
 		}
 		localEnv := e
 		localEnv.actor = localAIAgentName(settings)
 		localEnv.agentDesc = agentDesc
-		for _, finding := range review.normalizedFindings() {
+		for _, finding := range findings {
 			text := "Local AI first-pass: " + finding.Text
 			if evidence := strings.TrimSpace(finding.Evidence); evidence != "" {
 				text += "\nEvidence: " + evidence
@@ -306,14 +307,15 @@ func runLocalAIReviewerItem(e env, state loopState, rc roleConfig, settings agen
 	}
 	var output strings.Builder
 	if review.blocksReviewer() {
-		fmt.Fprintf(&output, "Local reviewer %s found %d finding(s); stopping reviewer pipeline until they are fixed.\n", agent, len(review.Findings))
+		findings := review.normalizedFindings()
+		fmt.Fprintf(&output, "Local reviewer %s found %d finding(s); stopping reviewer pipeline until they are fixed.\n", agent, len(findings))
 		if summary := strings.TrimSpace(review.Summary); summary != "" {
 			fmt.Fprintf(&output, "%s\n", summary)
 		}
 		localEnv := e
 		localEnv.actor = agent
 		localEnv.agentDesc = agentDesc
-		for _, finding := range review.normalizedFindings() {
+		for _, finding := range findings {
 			text := "Local reviewer " + agent + ": " + finding.Text
 			if evidence := strings.TrimSpace(finding.Evidence); evidence != "" {
 				text += "\nEvidence: " + evidence
@@ -539,7 +541,7 @@ func (r localAIReviewResult) valid() bool {
 }
 
 func (r localAIReviewResult) blocksReviewer() bool {
-	return strings.EqualFold(strings.TrimSpace(r.Result), "fail") || len(r.Findings) > 0
+	return len(r.normalizedFindings()) > 0
 }
 
 func (r localAIReviewResult) normalizedFindings() []localAIReviewFinding {
@@ -549,13 +551,39 @@ func (r localAIReviewResult) normalizedFindings() []localAIReviewFinding {
 		if severity == "" {
 			severity = "medium"
 		}
-		findings = append(findings, localAIReviewFinding{
+		normalized := localAIReviewFinding{
 			Severity: severity,
 			Text:     strings.TrimSpace(finding.Text),
 			Evidence: strings.TrimSpace(finding.Evidence),
-		})
+		}
+		if localAIReviewFindingIsClean(normalized) {
+			continue
+		}
+		findings = append(findings, normalized)
 	}
 	return findings
+}
+
+func localAIReviewFindingIsClean(finding localAIReviewFinding) bool {
+	text := strings.ToLower(strings.TrimSpace(finding.Text))
+	if text == "" {
+		return false
+	}
+	cleanMarkers := []string{
+		"no problems found",
+		"no issues found",
+		"no findings",
+		"no blocking findings",
+		"no blocking issues",
+		"looks good",
+		"all tests passed",
+	}
+	for _, marker := range cleanMarkers {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func localAIAgentDescriptor(settings agentSettings) string {

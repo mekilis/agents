@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -3649,6 +3651,38 @@ func TestReadConfigParsesReviewerBlockListWithMapItems(t *testing.T) {
 	}
 }
 
+func TestReadConfigParsesReviewerBlockListForConfiguredAgent(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".agents"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfgText := strings.Join([]string{
+		"roles:",
+		"  reviewer:",
+		"    - lmstudio",
+		"    - codex",
+		"",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(dir, ".agents", "config.yml"), []byte(cfgText), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := readConfig(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reviewers := cfg.reviewerRoles()
+	if len(reviewers) != 2 || reviewers[0].Provider != "lmstudio" || reviewers[1].Provider != "codex" {
+		t.Fatalf("unexpected reviewer pipeline: %+v", reviewers)
+	}
+	agent, err := configuredAgent(dir, "reviewer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if agent != "lmstudio" {
+		t.Fatalf("configured reviewer should expose first pipeline entry, got %q", agent)
+	}
+}
+
 func TestReviewerPromptDoesNotIncludeLocalAIReviewNotes(t *testing.T) {
 	code := withTempProcessEnv(t, func(home, cwd string) int {
 		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
@@ -4026,6 +4060,78 @@ func TestReviewerPipelineLocalFindingStopsNextReviewer(t *testing.T) {
 		}
 		if !strings.Contains(live.String(), "Local reviewer lmstudio found 1 finding") {
 			t.Fatalf("missing local reviewer output:\n%s", live.String())
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
+func TestReviewerPipelineLocalCleanFindingContinuesToNextReviewer(t *testing.T) {
+	old := runFirstPassReviewWithLocalAI
+	defer func() { runFirstPassReviewWithLocalAI = old }()
+	runFirstPassReviewWithLocalAI = func(settings agentSettings, input string) (localAIReviewResult, error) {
+		return localAIReviewResult{
+			Result:  "fail",
+			Summary: "clean local review",
+			Findings: []localAIReviewFinding{{
+				Severity: "low",
+				Text:     "No problems found in the diff or test results.",
+				Evidence: "All tests passed and code changes are consistent with task description.",
+			}},
+		}, nil
+	}
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Reviewer Pipeline Clean Local Finding"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addHandoff(e, []string{"--to", "reviewer", "Ready for review."}, time.Date(2026, 6, 5, 10, 1, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		marker := filepath.Join(cwd, "next-reviewer-ran")
+		nextReviewer := filepath.Join(cwd, "next-reviewer.sh")
+		reviewerBody := "#!/bin/sh\nset -eu\ntouch " + shellQuote(marker) + "\necho '```agents-verify'\necho '{\"text\":\"pipeline reviewers passed\",\"cmd\":\"echo ok\"}'\necho '```'\n"
+		if err := os.WriteFile(nextReviewer, []byte(reviewerBody), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cfg := strings.Join([]string{
+			"providers:",
+			"  lmstudio:",
+			"    type: openai_compatible",
+			"    base_url: http://127.0.0.1:1234/v1",
+			"    model: google/gemma-3-4b",
+			"roles:",
+			"  reviewer:",
+			"    - lmstudio",
+			"    - " + nextReviewer + " {prompt_file}",
+			"",
+		}, "\n")
+		if err := os.WriteFile(filepath.Join(cwd, ".agents", "config.yml"), []byte(cfg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		state, err := analyzeLoopState(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var live bytes.Buffer
+		result, err := runConfiguredRole(e, state, &live)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(marker); err != nil {
+			t.Fatalf("next reviewer did not run after clean local finding: %v", err)
+		}
+		if result.After.NextRole != "human" || result.After.Stats.FindingsOpen != 0 || result.After.Stats.Verification != 1 {
+			t.Fatalf("expected clean local finding to reach human boundary: %+v", result.After)
+		}
+		if !strings.Contains(live.String(), "Local reviewer lmstudio found no blocking findings") {
+			t.Fatalf("missing clean local reviewer output:\n%s", live.String())
+		}
+		findings, err := filepath.Glob(filepath.Join(cwd, ".agents", "tasks", "*", "findings", "*.md"))
+		if err != nil || len(findings) != 0 {
+			t.Fatalf("expected no finding files, got %v err=%v", findings, err)
 		}
 		return 0
 	})
@@ -5276,7 +5382,7 @@ func TestInteractiveLoopSimulatesAllRolesAndFiltersProgress(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		stop, err := runManagedLoop(e, &out, 3, false, nil, nil, loopDisplayInteractive, "")
+		stop, err := runManagedLoop(e, &out, 3, false, nil, nil, loopDisplayInteractive, "", false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -5486,6 +5592,462 @@ func TestRunLoopJSONEventsClosesFailedRun(t *testing.T) {
 	}
 }
 
+func TestRunPersistsCleanedTaskRunActivity(t *testing.T) {
+	var out, errOut bytes.Buffer
+	var cwdSeen string
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		cwdSeen = cwd
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := trustWorkspace(e); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := openTask(e, []string{"Clean Run Activity"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		implementer := filepath.Join(cwd, "implementer.sh")
+		body := strings.Join([]string{
+			"#!/bin/sh",
+			"set -eu",
+			"echo 'run id: raw-provider-id'",
+			"echo 'run log: .agents/runs/logs/raw.log'",
+			"echo 'Still running... 20s'",
+			"echo 'implemented clean watch output'",
+			"mkdir -p .agents/tasks/2026-06-05-001-clean-run-activity/handoffs",
+			"cat > .agents/tasks/2026-06-05-001-clean-run-activity/handoffs/2026-06-05T100100Z-handoff-to-reviewer.md <<'EOF'",
+			"# Handoff: reviewer",
+			"",
+			"To: reviewer",
+			"From: implementer",
+			"",
+			"Ready.",
+			"EOF",
+			"",
+		}, "\n")
+		if err := os.WriteFile(implementer, []byte(body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cfg := "roles:\n  implementer: " + implementer + " {prompt_file}\n  reviewer: \n  coordinator: codex\n"
+		if err := os.WriteFile(filepath.Join(cwd, ".agents", "config.yml"), []byte(cfg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return Run([]string{"run", "--max-iterations", "1"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code == 0 || !strings.Contains(out.String(), "Loop paused after 1 role runs") {
+		t.Fatalf("expected run to pause at max-runs after one role, code=%d stdout=%s stderr=%s", code, out.String(), errOut.String())
+	}
+	records := readTestRunActivity(t, filepath.Join(cwdSeen, ".agents", "tasks", "2026-06-05-001-clean-run-activity", "runs"))
+	if len(records) == 0 {
+		t.Fatal("expected run activity records")
+	}
+	var sawStart, sawMessage, sawFinish bool
+	var allText strings.Builder
+	for _, rec := range records {
+		allText.WriteString(rec.Text)
+		switch rec.Event {
+		case "run_started":
+			sawStart = true
+		case "message":
+			sawMessage = sawMessage || strings.Contains(rec.Text, "implemented clean watch output")
+		case "run_finished":
+			sawFinish = rec.Elapsed != ""
+		}
+	}
+	if !sawStart || !sawMessage || !sawFinish {
+		t.Fatalf("expected start/message/finished records with elapsed, got %+v", records)
+	}
+	if text := allText.String(); strings.Contains(text, "raw-provider-id") || strings.Contains(text, "raw.log") || strings.Contains(text, "Still running") {
+		t.Fatalf("activity leaked raw/noisy output: %q", text)
+	}
+}
+
+func TestRunActivityCoalescesTokenStreamFragments(t *testing.T) {
+	dir := t.TempDir()
+	sink := &runActivitySink{
+		dir:     dir,
+		starts:  make(map[string]time.Time),
+		agents:  make(map[string]string),
+		pending: make(map[string][]string),
+	}
+	sink.handle(loopEvent{Event: "run_started", RunID: "r1", Role: "implementer", Agent: "agent"})
+	for _, chunk := range []string{
+		"Watching\n",
+		"the\n",
+		"run\n",
+		"activity\n",
+		"Watching the run activity render clean progress lines.\n",
+		"Running: go test ./...\n",
+	} {
+		sink.handle(loopEvent{Event: "output", RunID: "r1", Role: "implementer", Chunk: chunk})
+	}
+	sink.handle(loopEvent{Event: "run_finished", RunID: "r1", Role: "implementer", Agent: "agent"})
+
+	records := readTestRunActivity(t, dir)
+	var messages []string
+	for _, rec := range records {
+		if rec.Event == "message" {
+			messages = append(messages, rec.Text)
+		}
+	}
+	got := strings.Join(messages, "\n")
+	for _, fragment := range []string{"\nWatching\n", "\nthe\n", "\nrun\n", "\nactivity\n"} {
+		if strings.Contains("\n"+got+"\n", fragment) {
+			t.Fatalf("activity persisted token fragment %q:\n%s", fragment, got)
+		}
+	}
+	for _, want := range []string{"Watching the run activity render clean progress lines.", "Running: go test ./..."} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("activity missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestRunActivityPreservesShortProgressLines(t *testing.T) {
+	dir := t.TempDir()
+	sink := &runActivitySink{
+		dir:     dir,
+		starts:  make(map[string]time.Time),
+		agents:  make(map[string]string),
+		pending: make(map[string][]string),
+	}
+	sink.handle(loopEvent{Event: "run_started", RunID: "r1", Role: "implementer", Agent: "agent"})
+	for _, chunk := range []string{
+		"Reading files\n",
+		"Running checks\n",
+		"Watching\n",
+		"the\n",
+		"run\n",
+		"activity\n",
+		"Watching the run activity render clean progress lines.\n",
+	} {
+		sink.handle(loopEvent{Event: "output", RunID: "r1", Role: "implementer", Chunk: chunk})
+	}
+	sink.handle(loopEvent{Event: "run_finished", RunID: "r1", Role: "implementer", Agent: "agent"})
+
+	records := readTestRunActivity(t, dir)
+	var messages []string
+	for _, rec := range records {
+		if rec.Event == "message" {
+			messages = append(messages, rec.Text)
+		}
+	}
+	if len(messages) != 3 {
+		t.Fatalf("expected short progress lines plus coalesced full sentence, got %#v", messages)
+	}
+	for i, want := range []string{
+		"Reading files",
+		"Running checks",
+		"Watching the run activity render clean progress lines.",
+	} {
+		if messages[i] != want {
+			t.Fatalf("message %d = %q, want %q (all messages: %#v)", i, messages[i], want, messages)
+		}
+	}
+}
+
+func TestRunPersistsFailedRunFinishedActivity(t *testing.T) {
+	var out, errOut bytes.Buffer
+	var cwdSeen string
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		cwdSeen = cwd
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := trustWorkspace(e); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := openTask(e, []string{"Failed Activity"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		implementer := filepath.Join(cwd, "implementer.sh")
+		if err := os.WriteFile(implementer, []byte("#!/bin/sh\necho failing\nexit 1\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cfg := "roles:\n  implementer: " + implementer + " {prompt_file}\n  reviewer: " + implementer + " {prompt_file}\n  coordinator: codex\n"
+		if err := os.WriteFile(filepath.Join(cwd, ".agents", "config.yml"), []byte(cfg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return Run([]string{"run"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code == 0 {
+		t.Fatalf("expected failing run to exit non-zero")
+	}
+	records := readTestRunActivity(t, filepath.Join(cwdSeen, ".agents", "tasks", "2026-06-05-001-failed-activity", "runs"))
+	var failed *runActivityRecord
+	for i := range records {
+		if records[i].Event == "run_finished" {
+			failed = &records[i]
+		}
+	}
+	if failed == nil || failed.Status != "failed" || !strings.Contains(failed.Error, "implementer command failed") {
+		t.Fatalf("expected failed run_finished activity, got %+v", records)
+	}
+}
+
+func TestRunOncePersistsReviewerRunActivity(t *testing.T) {
+	var out, errOut bytes.Buffer
+	var cwdSeen string
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		cwdSeen = cwd
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := trustWorkspace(e); err != nil {
+			t.Fatal(err)
+		}
+		task, err := openTask(e, []string{"One Shot Reviewer Activity"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		handoffDir := filepath.Join(cwd, ".agents", task.Path, "handoffs")
+		if err := os.MkdirAll(handoffDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		handoff := strings.Join([]string{
+			"# Handoff: reviewer",
+			"",
+			"To: reviewer",
+			"From: implementer",
+			"",
+			"Review the one-shot run.",
+			"",
+		}, "\n")
+		if err := os.WriteFile(filepath.Join(handoffDir, "2026-06-05T100100Z-handoff-to-reviewer.md"), []byte(handoff), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		reviewer := filepath.Join(cwd, "reviewer.sh")
+		if err := os.WriteFile(reviewer, []byte("#!/bin/sh\necho reviewed one-shot activity\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cfg := "roles:\n  implementer: \n  reviewer: " + reviewer + " {prompt_file}\n  coordinator: codex\n"
+		if err := os.WriteFile(filepath.Join(cwd, ".agents", "config.yml"), []byte(cfg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		code := Run([]string{"run", "--once"}, bytes.NewBuffer(nil), &out, &errOut)
+		if code != 0 {
+			return code
+		}
+		out.Reset()
+		errOut.Reset()
+		code = Run([]string{"runs"}, bytes.NewBuffer(nil), &out, &errOut)
+		if code != 0 {
+			return code
+		}
+		if got := out.String(); !strings.Contains(got, "Reviewer started") || !strings.Contains(got, "reviewed one-shot activity") || !strings.Contains(got, "finished") {
+			t.Fatalf("unexpected runs output:\n%s", got)
+		}
+		out.Reset()
+		errOut.Reset()
+		code = Run([]string{"watch"}, bytes.NewBuffer(nil), &out, &errOut)
+		if code != 0 {
+			return code
+		}
+		if got := out.String(); !strings.Contains(got, "Reviewer started") || !strings.Contains(got, "reviewed one-shot activity") {
+			t.Fatalf("unexpected watch output:\n%s", got)
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("run --once failed: stdout=%s stderr=%s", out.String(), errOut.String())
+	}
+	records := readTestRunActivity(t, filepath.Join(cwdSeen, ".agents", "tasks", "2026-06-05-001-one-shot-reviewer-activity", "runs"))
+	var sawStart, sawMessage, sawFinish bool
+	for _, rec := range records {
+		switch rec.Event {
+		case "run_started":
+			sawStart = rec.Role == "reviewer"
+		case "message":
+			sawMessage = strings.Contains(rec.Text, "reviewed one-shot activity")
+		case "run_finished":
+			sawFinish = rec.Status == "finished"
+		}
+	}
+	if !sawStart || !sawMessage || !sawFinish {
+		t.Fatalf("expected reviewer start/message/finished activity, got %+v", records)
+	}
+}
+
+func TestRunsAndWatchDisplayRunActivity(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		task, err := openTask(e, []string{"Display Activity"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		dir := filepath.Join(cwd, ".agents", task.Path, "runs")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := appendRunActivityRecord(filepath.Join(dir, "r1.jsonl"), runActivityRecord{Event: "run_started", Time: "2026-06-05T10:01:00Z", RunID: "r1", Role: "implementer", Agent: "codex"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := appendRunActivityRecord(filepath.Join(dir, "r1.jsonl"), runActivityRecord{Event: "message", Time: "2026-06-05T10:01:01Z", RunID: "r1", Text: "edited files"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := appendRunActivityRecord(filepath.Join(dir, "r1.jsonl"), runActivityRecord{Event: "run_finished", Time: "2026-06-05T10:01:02Z", RunID: "r1", Status: "finished", Elapsed: "2s"}); err != nil {
+			t.Fatal(err)
+		}
+		code := Run([]string{"runs"}, bytes.NewBuffer(nil), &out, &errOut)
+		if code != 0 {
+			return code
+		}
+		if got := out.String(); !strings.Contains(got, "Task: Display Activity") || !strings.Contains(got, "Implementer started with codex") || !strings.Contains(got, "edited files") || !strings.Contains(got, "finished after 2s") {
+			t.Fatalf("unexpected runs output:\n%s", got)
+		}
+		out.Reset()
+		return Run([]string{"watch"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code != 0 {
+		t.Fatalf("watch failed: %s", errOut.String())
+	}
+	if got := out.String(); !strings.Contains(got, "Task: Display Activity") || !strings.Contains(got, "Follow mode shows persisted activity") {
+		t.Fatalf("unexpected watch output:\n%s", got)
+	}
+}
+
+func TestWatchFollowStartingEmptyKeepsPolling(t *testing.T) {
+	var out bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json"), isTTY: true}
+		if _, err := openTask(e, []string{"Empty Follow Activity"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		oldFollow := followRunActivityFunc
+		defer func() { followRunActivityFunc = oldFollow }()
+		followRunActivityFunc = func(out io.Writer, dir string, printed int) error {
+			if printed != 0 {
+				t.Fatalf("expected empty follow to start at printed=0, got %d", printed)
+			}
+			fmt.Fprintln(out, "follow started")
+			return nil
+		}
+		if err := printRunActivity(&out, e, true); err != nil {
+			t.Fatal(err)
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("watch follow setup failed")
+	}
+	if got := out.String(); !strings.Contains(got, "No run activity for Empty Follow Activity yet.") || !strings.Contains(got, "follow started") {
+		t.Fatalf("unexpected empty follow output:\n%s", got)
+	}
+}
+
+func TestFollowRunActivityPollsAfterStartingEmpty(t *testing.T) {
+	var out lockedTestBuffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		task, err := openTask(e, []string{"Empty Follow Activity"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		dir := filepath.Join(cwd, ".agents", task.Path, "runs")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		ticks := make(chan time.Time)
+		interrupts := make(chan os.Signal, 1)
+		errs := make(chan error, 1)
+		go func() {
+			errs <- followRunActivityUntilInterrupted(&out, dir, 0, ticks, interrupts)
+		}()
+
+		if err := appendRunActivityRecord(filepath.Join(dir, "r1.jsonl"), runActivityRecord{Event: "run_started", Time: "2026-06-05T10:01:00Z", RunID: "r1", Role: "implementer", Agent: "codex"}); err != nil {
+			t.Fatal(err)
+		}
+		ticks <- time.Now()
+		waitForTestCondition(t, func() bool {
+			return strings.Contains(out.String(), "[r1] Implementer started with codex")
+		}, "watch follow output")
+
+		interrupts <- os.Interrupt
+		select {
+		case err := <-errs:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("watch follow did not stop after interrupt")
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("watch follow setup failed")
+	}
+	if got := out.String(); !strings.Contains(got, "[r1] Implementer started with codex") || !strings.Contains(got, "Stopped watching.") {
+		t.Fatalf("unexpected follow output:\n%s", got)
+	}
+}
+
+type lockedTestBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (b *lockedTestBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.Write(p)
+}
+
+func (b *lockedTestBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.b.String()
+}
+
+func waitForTestCondition(t *testing.T, condition func() bool, name string) {
+	t.Helper()
+	deadline := time.After(time.Second)
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		if condition() {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for %s", name)
+		case <-tick.C:
+		}
+	}
+}
+
+func TestArchiveSummaryCountsRunActivity(t *testing.T) {
+	var cwdSeen string
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		cwdSeen = cwd
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		task, err := openTask(e, []string{"Archive Runs"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		dir := filepath.Join(cwd, ".agents", task.Path, "runs")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := appendRunActivityRecord(filepath.Join(dir, "r1.jsonl"), runActivityRecord{Event: "run_started", Time: "2026-06-05T10:01:00Z", RunID: "r1"}); err != nil {
+			t.Fatal(err)
+		}
+		record, err := archiveActiveTask(e, time.Date(2026, 6, 5, 11, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if record.Path != filepath.Join("archive", "2026-06-05-001-archive-runs") {
+			t.Fatalf("unexpected archive path: %s", record.Path)
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("archive setup failed")
+	}
+	summary, err := os.ReadFile(filepath.Join(cwdSeen, ".agents", "archive", "2026-06-05-001-archive-runs", "summary.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(summary), "- run activity records: 1") {
+		t.Fatalf("archive summary missing run activity count:\n%s", string(summary))
+	}
+}
+
 func TestRunRejectsJSONEventsCombinations(t *testing.T) {
 	for _, args := range [][]string{
 		{"run", "--json-events", "--json"},
@@ -5502,6 +6064,15 @@ func TestRunRejectsJSONEventsCombinations(t *testing.T) {
 			t.Fatalf("%v: expected combination error, got: %s", args, errOut.String())
 		}
 	}
+}
+
+func readTestRunActivity(t *testing.T, dir string) []runActivityRecord {
+	t.Helper()
+	records, err := readRunActivityRecords(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return records
 }
 
 // handoffPingPongScript writes a handoff to the given target with a fresh
