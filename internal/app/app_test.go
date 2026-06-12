@@ -2934,6 +2934,132 @@ func TestArchiveRequiresActiveTask(t *testing.T) {
 	}
 }
 
+func TestArchiveScopePlaceholderIgnoresMarkdownListMarkers(t *testing.T) {
+	tests := []struct {
+		name        string
+		body        string
+		placeholder bool
+	}{
+		{name: "plain placeholder", body: "define scope", placeholder: true},
+		{name: "unordered bullet placeholder", body: "- define scope", placeholder: true},
+		{name: "ordered list placeholder", body: "1. define scope", placeholder: true},
+		{name: "task list placeholder", body: "- [ ] define scope", placeholder: true},
+		{name: "meaningful bullet", body: "- preserve archive summary fallback behavior", placeholder: false},
+		{name: "mixed meaningful list", body: "- define scope\n- preserve archive summaries", placeholder: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := archiveScopePlaceholder(tt.body); got != tt.placeholder {
+				t.Fatalf("archiveScopePlaceholder(%q) = %v, want %v", tt.body, got, tt.placeholder)
+			}
+		})
+	}
+}
+
+func TestArchiveSummaryFallsBackFromPlaceholderScopeToDurableChunks(t *testing.T) {
+	var cwdSeen string
+	var taskPath string
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		cwdSeen = cwd
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		task, err := openTask(e, []string{"Archive Placeholder Scope"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		taskPath = task.Path
+		taskDir := filepath.Join(cwd, ".agents", task.Path)
+		if err := os.WriteFile(filepath.Join(taskDir, "scope.md"), []byte("# Scope\n\n- define scope\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addHandoff(e, []string{"--to", "implementer", "Implement archive summaries from durable task records"}, time.Date(2026, 6, 5, 10, 1, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addDecision(e, []string{"Archive summaries should prefer durable task chunks over run logs"}, time.Date(2026, 6, 5, 10, 2, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := addVerification(e, []string{"reviewer checked archive summary behavior", "--by", "reviewer"}, time.Date(2026, 6, 5, 10, 3, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := archiveActiveTask(e, time.Date(2026, 6, 5, 11, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatal("archive setup failed")
+	}
+	summary, err := os.ReadFile(filepath.Join(cwdSeen, ".agents", "archive", filepath.Base(taskPath), "summary.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(summary)
+	for _, want := range []string{
+		"## Scope",
+		"Recent handoffs:",
+		"Implement archive summaries from durable task records",
+		"Decisions:",
+		"Archive summaries should prefer durable task chunks over run logs",
+		"## Reviewer Verification",
+		"reviewer checked archive summary behavior",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("archive summary missing %q, got:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "define scope") {
+		t.Fatalf("archive summary should omit placeholder scope, got:\n%s", got)
+	}
+}
+
+func TestArchiveSummarySanitizesLocalPathsAndCacheCommands(t *testing.T) {
+	var cwdSeen string
+	var taskPath string
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		cwdSeen = cwd
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		task, err := openTask(e, []string{"Archive Sanitized"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		taskPath = task.Path
+		taskDir := filepath.Join(cwd, ".agents", task.Path)
+		scope := "# Scope\n\n- Update archive code in /Users/alice/src/private/agents/internal/app/app.go\n"
+		if err := os.WriteFile(filepath.Join(taskDir, "scope.md"), []byte(scope), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		status := "# Status\n\nRan GOCACHE=/private/var/folders/xx/agents-cache go test ./... and inspected /private/tmp/agents-scratch/log.txt\n"
+		if err := os.WriteFile(filepath.Join(taskDir, "status.md"), []byte(status), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := addVerification(e, []string{"checked /home/bob/work/private-repo with GOBIN=/Users/bob/go/bin", "--by", "reviewer"}, time.Date(2026, 6, 5, 10, 1, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := archiveActiveTask(e, time.Date(2026, 6, 5, 11, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatal("archive setup failed")
+	}
+	summary, err := os.ReadFile(filepath.Join(cwdSeen, ".agents", "archive", filepath.Base(taskPath), "summary.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(summary)
+	for _, forbidden := range []string{"/Users/alice", "/Users/bob", "/home/bob", "/private/tmp", "/private/var/folders", "/private[temp path]", "/tmp/agents-scratch", "/var/folders/xx", "GOCACHE=/", "GOBIN=/"} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("archive summary leaked %q:\n%s", forbidden, got)
+		}
+	}
+	for _, want := range []string{"[local path]", "[temp path]", "[cache env]"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("archive summary missing sanitized marker %q:\n%s", want, got)
+		}
+	}
+}
+
 func TestRunRoutesOpenFindingsToImplementer(t *testing.T) {
 	var out, errOut bytes.Buffer
 	code := withTempProcessEnv(t, func(home, cwd string) int {

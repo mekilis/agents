@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -4106,8 +4107,18 @@ func writeArchiveSummary(taskDir, archiveDir string, active activeTask, now time
 	fmt.Fprintf(&b, "- findings fixed: %d\n", fixedFindings)
 	fmt.Fprintf(&b, "- findings verified: %d\n", verifiedFindings)
 	fmt.Fprintln(&b)
-	appendArchiveSection(&b, "Scope", filepath.Join(taskDir, "scope.md"))
-	appendArchiveSection(&b, "Final Status", filepath.Join(taskDir, "status.md"))
+	if err := appendArchiveScopeSection(&b, taskDir); err != nil {
+		return archiveStats{}, err
+	}
+	if err := appendArchiveSection(&b, "Final Status", filepath.Join(taskDir, "status.md")); err != nil {
+		return archiveStats{}, err
+	}
+	if err := appendArchiveRecentSection(&b, "Reviewer Verification", filepath.Join(taskDir, "verification"), 2, nil); err != nil {
+		return archiveStats{}, err
+	}
+	if err := appendArchiveRecentSection(&b, "Unresolved Findings", filepath.Join(taskDir, "findings"), 3, shouldKeepArchivedFinding); err != nil {
+		return archiveStats{}, err
+	}
 	fmt.Fprintln(&b, "Detailed transient chunks remain available in git history.")
 	if err := os.WriteFile(filepath.Join(archiveDir, "summary.md"), []byte(b.String()), 0o644); err != nil {
 		return archiveStats{}, err
@@ -4115,18 +4126,234 @@ func writeArchiveSummary(taskDir, archiveDir string, active activeTask, now time
 	return stats, nil
 }
 
-func appendArchiveSection(b *strings.Builder, title, path string) {
+func appendArchiveSection(b *strings.Builder, title, path string) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
 	}
-	body := strings.TrimSpace(stripFirstMarkdownHeading(string(data)))
+	body := archiveSectionBody(string(data))
 	if body == "" {
-		return
+		return nil
 	}
 	fmt.Fprintf(b, "## %s\n\n", title)
 	fmt.Fprintln(b, body)
 	fmt.Fprintln(b)
+	return nil
+}
+
+func appendArchiveScopeSection(b *strings.Builder, taskDir string) error {
+	body, err := archiveScopeBody(taskDir)
+	if err != nil {
+		return err
+	}
+	if body == "" {
+		return nil
+	}
+	fmt.Fprintln(b, "## Scope")
+	fmt.Fprintln(b)
+	fmt.Fprintln(b, body)
+	fmt.Fprintln(b)
+	return nil
+}
+
+func archiveScopeBody(taskDir string) (string, error) {
+	data, err := os.ReadFile(filepath.Join(taskDir, "scope.md"))
+	if err != nil && !os.IsNotExist(err) {
+		return "", err
+	}
+	if err == nil {
+		body := archiveSectionBody(string(data))
+		if !archiveScopePlaceholder(body) {
+			return body, nil
+		}
+	}
+	return archiveScopeFallback(taskDir)
+}
+
+func archiveScopeFallback(taskDir string) (string, error) {
+	candidates := []struct {
+		title string
+		dir   string
+		limit int
+		keep  func(string) bool
+	}{
+		{title: "Recent handoffs", dir: "handoffs", limit: 2},
+		{title: "Decisions", dir: "decisions", limit: 2},
+		{title: "Unresolved findings", dir: "findings", limit: 3, keep: shouldKeepArchivedFinding},
+		{title: "Verification", dir: "verification", limit: 2},
+	}
+	var b strings.Builder
+	for _, candidate := range candidates {
+		items, err := archiveRecentMarkdownBodies(filepath.Join(taskDir, candidate.dir), candidate.limit, candidate.keep)
+		if err != nil {
+			return "", err
+		}
+		if len(items) == 0 {
+			continue
+		}
+		fmt.Fprintf(&b, "%s:\n", candidate.title)
+		for _, item := range items {
+			fmt.Fprintf(&b, "- %s\n", singleLineArchiveText(item))
+		}
+		fmt.Fprintln(&b)
+	}
+	return strings.TrimSpace(b.String()), nil
+}
+
+func archiveScopePlaceholder(body string) bool {
+	normalized := strings.ToLower(normalizeArchivePlaceholderText(body))
+	switch normalized {
+	case "", "define scope", "scope", "todo", "tbd", "decide scope", "starting task":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeArchivePlaceholderText(markdown string) string {
+	var lines []string
+	for _, line := range strings.Split(markdown, "\n") {
+		line = strings.TrimSpace(line)
+		line = stripArchiveListMarker(line)
+		line = strings.TrimSpace(strings.TrimPrefix(line, "[ ]"))
+		line = strings.TrimSpace(strings.TrimPrefix(line, "[x]"))
+		line = strings.TrimSpace(strings.TrimPrefix(line, "[X]"))
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+func stripArchiveListMarker(line string) string {
+	if line == "" {
+		return line
+	}
+	if strings.HasPrefix(line, "- ") || strings.HasPrefix(line, "* ") || strings.HasPrefix(line, "+ ") {
+		return strings.TrimSpace(line[2:])
+	}
+	for i, r := range line {
+		if r >= '0' && r <= '9' {
+			continue
+		}
+		if i > 0 && (r == '.' || r == ')') {
+			rest := line[i+1:]
+			if rest == "" || rest[0] == ' ' || rest[0] == '\t' {
+				return strings.TrimSpace(rest)
+			}
+		}
+		break
+	}
+	return line
+}
+
+func appendArchiveRecentSection(b *strings.Builder, title, dir string, limit int, keep func(string) bool) error {
+	items, err := archiveRecentMarkdownBodies(dir, limit, keep)
+	if err != nil {
+		return err
+	}
+	if len(items) == 0 {
+		return nil
+	}
+	fmt.Fprintf(b, "## %s\n\n", title)
+	for _, item := range items {
+		fmt.Fprintf(b, "- %s\n", singleLineArchiveText(item))
+	}
+	fmt.Fprintln(b)
+	return nil
+}
+
+func archiveRecentMarkdownBodies(dir string, limit int, keep func(string) bool) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var names []string
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".md") {
+			names = append(names, entry.Name())
+		}
+	}
+	sortStringsDesc(names)
+	var bodies []string
+	for _, name := range names {
+		data, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			return nil, err
+		}
+		markdown := string(data)
+		if keep != nil && !keep(markdown) {
+			continue
+		}
+		if body := archiveSectionBody(markdown); body != "" {
+			bodies = append(bodies, body)
+		}
+		if len(bodies) >= limit {
+			break
+		}
+	}
+	return bodies, nil
+}
+
+func sortStringsDesc(values []string) {
+	for i := 1; i < len(values); i++ {
+		for j := i; j > 0 && values[j] > values[j-1]; j-- {
+			values[j], values[j-1] = values[j-1], values[j]
+		}
+	}
+}
+
+func archiveSectionBody(markdown string) string {
+	return strings.TrimSpace(sanitizeArchiveSummaryText(stripArchiveRecordMetadata(stripFirstMarkdownHeading(markdown))))
+}
+
+func stripArchiveRecordMetadata(markdown string) string {
+	var kept []string
+	for _, line := range strings.Split(markdown, "\n") {
+		trimmed := strings.TrimSpace(line)
+		lower := strings.ToLower(trimmed)
+		if strings.HasPrefix(lower, "status:") ||
+			strings.HasPrefix(lower, "result:") ||
+			strings.HasPrefix(lower, "by:") ||
+			strings.HasPrefix(lower, "from:") ||
+			strings.HasPrefix(lower, "to:") ||
+			strings.HasPrefix(lower, "agent:") ||
+			strings.HasPrefix(lower, "recorded at:") ||
+			strings.HasPrefix(lower, "fixed by:") ||
+			strings.HasPrefix(lower, "verified by:") {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return strings.Join(kept, "\n")
+}
+
+var (
+	archiveHomePathPattern  = regexp.MustCompile(`(/Users|/home)/[A-Za-z0-9._-]+/[^\s` + "`" + `)'"]*`)
+	archiveTmpPathPattern   = regexp.MustCompile(`(?:/private)?/tmp/[^\s` + "`" + `)'"]*|(?:/private)?/var/folders/[^\s` + "`" + `)'"]*`)
+	archiveCacheFlagPattern = regexp.MustCompile(`GOCACHE=[^\s]+|GOBIN=[^\s]+`)
+)
+
+func sanitizeArchiveSummaryText(text string) string {
+	text = archiveCacheFlagPattern.ReplaceAllString(text, "[cache env]")
+	text = archiveHomePathPattern.ReplaceAllString(text, "[local path]")
+	text = archiveTmpPathPattern.ReplaceAllString(text, "[temp path]")
+	return text
+}
+
+func singleLineArchiveText(text string) string {
+	fields := strings.Fields(strings.ReplaceAll(text, "\n", " "))
+	const maxWords = 32
+	if len(fields) > maxWords {
+		fields = append(fields[:maxWords], "...")
+	}
+	return strings.Join(fields, " ")
 }
 
 func stripFirstMarkdownHeading(markdown string) string {

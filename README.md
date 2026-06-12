@@ -362,6 +362,13 @@ commands below in the current build. `agents archive` is the local cleanup
 boundary for completed task state: it writes a summary and prunes the active
 task chunks from `.agents/tasks/`.
 
+Archive summaries are the durable record for completed tasks. They preserve the
+final scope/status, coordination counts, unresolved findings, and recent
+reviewer verification from task chunks, while avoiding transient run-log detail,
+machine-local paths, and scratch cache commands. Raw provider logs under
+`.agents/runs/` and cleaned run activity under task `runs/` are for active
+debugging and counting, not for copied archive prose.
+
 Interactive input model:
 
 - Type plain text to chat with the coordinator and build up task context.
