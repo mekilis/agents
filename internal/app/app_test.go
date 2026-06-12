@@ -6417,6 +6417,7 @@ func TestMCPInitializeListsRequestedTools(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("Run mcp code=%d stderr=%s", code, errOut.String())
 	}
+	assertMCPTestResponseFraming(t, out.String(), "content-length")
 	responses := decodeMCPTestResponses(t, out.String())
 	if len(responses) != 2 {
 		t.Fatalf("expected two responses, got %d: %s", len(responses), out.String())
@@ -6424,16 +6425,7 @@ func TestMCPInitializeListsRequestedTools(t *testing.T) {
 	if got := responses[0]["result"].(map[string]any)["serverInfo"].(map[string]any)["name"]; got != "agents" {
 		t.Fatalf("unexpected server name: %v", got)
 	}
-	tools := responses[1]["result"].(map[string]any)["tools"].([]any)
-	names := map[string]bool{}
-	for _, tool := range tools {
-		names[tool.(map[string]any)["name"].(string)] = true
-	}
-	for _, want := range []string{"status", "run_once", "recent_runs", "watch_activity", "add_handoff", "add_finding", "fix_finding", "verify_finding", "add_decision", "archive"} {
-		if !names[want] {
-			t.Fatalf("tools/list missing %s: %+v", want, names)
-		}
-	}
+	assertMCPToolsListResponse(t, responses[1])
 }
 
 func TestMCPAcceptsLineDelimitedJSONInput(t *testing.T) {
@@ -6449,6 +6441,7 @@ func TestMCPAcceptsLineDelimitedJSONInput(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("Run mcp code=%d stdout=%s stderr=%s", code, out.String(), errOut.String())
 	}
+	assertMCPTestResponseFraming(t, out.String(), "line")
 	responses := decodeMCPTestResponses(t, out.String())
 	if len(responses) != 2 {
 		t.Fatalf("expected initialize and tools/list responses, got %d: %s", len(responses), out.String())
@@ -6456,6 +6449,7 @@ func TestMCPAcceptsLineDelimitedJSONInput(t *testing.T) {
 	if got := responses[0]["result"].(map[string]any)["serverInfo"].(map[string]any)["name"]; got != "agents" {
 		t.Fatalf("unexpected server name: %v", got)
 	}
+	assertMCPToolsListResponse(t, responses[1])
 }
 
 func TestMCPToolsWrapTaskStateCommands(t *testing.T) {
@@ -6611,6 +6605,42 @@ func decodeMCPTestResponses(t *testing.T, output string) []map[string]any {
 		responses = append(responses, response)
 	}
 	return responses
+}
+
+func assertMCPTestResponseFraming(t *testing.T, output, wantFraming string) {
+	t.Helper()
+	reader := bufio.NewReader(strings.NewReader(output))
+	count := 0
+	for {
+		_, framing, err := readMCPMessage(reader)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("MCP response frame should decode: %v\n%s", err, output)
+		}
+		if framing != wantFraming {
+			t.Fatalf("expected %s response framing, got %s in %q", wantFraming, framing, output)
+		}
+		count++
+	}
+	if count == 0 {
+		t.Fatalf("expected at least one MCP response frame in %q", output)
+	}
+}
+
+func assertMCPToolsListResponse(t *testing.T, response map[string]any) {
+	t.Helper()
+	tools := response["result"].(map[string]any)["tools"].([]any)
+	names := map[string]bool{}
+	for _, tool := range tools {
+		names[tool.(map[string]any)["name"].(string)] = true
+	}
+	for _, want := range []string{"status", "run_once", "recent_runs", "watch_activity", "add_handoff", "add_finding", "fix_finding", "verify_finding", "add_decision", "archive"} {
+		if !names[want] {
+			t.Fatalf("tools/list missing %s: %+v", want, names)
+		}
+	}
 }
 
 func decodeMCPToolText(t *testing.T, response map[string]any) map[string]any {
