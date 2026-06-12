@@ -116,18 +116,19 @@ func (rc roleConfig) configured() bool {
 }
 
 type agentSettings struct {
-	Model           string
-	Reasoning       string
-	CodexModel      string
-	CodexReasoning  string
-	ClaudeModel     string
-	ClaudeEffort    string
-	CursorModel     string
-	LocalAIEnabled  bool
-	LocalAIProvider string
-	LocalAIBaseURL  string
-	LocalAIModel    string
-	LocalAITimeout  int
+	Model                  string
+	Reasoning              string
+	CodexModel             string
+	CodexReasoning         string
+	ClaudeModel            string
+	ClaudeEffort           string
+	CursorModel            string
+	LocalAIEnabled         bool
+	LocalAIReviewFirstPass bool
+	LocalAIProvider        string
+	LocalAIBaseURL         string
+	LocalAIModel           string
+	LocalAITimeout         int
 }
 
 const promptFileMarker = "{prompt_file}"
@@ -496,6 +497,8 @@ func readConfig(cwd string) (config, error) {
 				cfg.Settings.CursorModel = value
 			case "local_ai_enabled":
 				cfg.Settings.LocalAIEnabled = strings.EqualFold(value, "true")
+			case "local_ai_review_first_pass":
+				cfg.Settings.LocalAIReviewFirstPass = strings.EqualFold(value, "true")
 			case "local_ai_provider":
 				cfg.Settings.LocalAIProvider = value
 			case "local_ai_base_url":
@@ -2445,10 +2448,14 @@ settings:
   # Cursor Agent: run 'agent models' or 'cursor-agent --list-models' for account-specific choices
   # Common examples from CLI help: gpt-5, claude-4.6-sonnet-medium, claude-4.6-sonnet-medium-thinking
   cursor_model: ""
-  # Optional local AI classifier for ambiguous coordinator chat routing.
+  # Optional local AI for ambiguous coordinator chat routing and reviewer preflight.
   # LM Studio: base URL http://127.0.0.1:1234/v1, provider lmstudio.
   # Ollama: base URL http://127.0.0.1:11434/v1, provider ollama.
   local_ai_enabled: false
+  # When true, local AI reviews before the configured reviewer. Findings skip
+  # the remote reviewer and route back to implementer; clean local review still
+  # continues to the configured reviewer as the final gate.
+  local_ai_review_first_pass: false
   local_ai_provider: lmstudio
   local_ai_base_url: http://127.0.0.1:1234/v1
   local_ai_model: google/gemma-3-4b
@@ -4379,6 +4386,9 @@ func runConfiguredRoleWithOptions(e env, state loopState, options roleRunOptions
 	if !rc.configured() {
 		return roleRunResult{}, fmt.Errorf("no agent configured for %s", state.NextRole)
 	}
+	if handled, result, err := runLocalAIFirstPassReview(e, state, config.Settings, options); handled || err != nil {
+		return result, err
+	}
 	commandTemplate, agent, effectiveSettings, err := resolveRoleCommand(rc, config.Settings)
 	if err != nil {
 		return roleRunResult{}, err
@@ -5505,8 +5515,15 @@ func printRoleRunSummary(w io.Writer, result roleRunResult, includeOutput bool) 
 		agent = result.Agent
 	}
 	fmt.Fprintf(w, "agent: %s\n", agent)
-	fmt.Fprintf(w, "prompt: %s\n", relPathOrSelf(result.PromptPath, result.Before.Task.Path))
-	fmt.Fprintf(w, "log: %s\n", relPathOrSelf(result.LogPath, result.Before.Task.Path))
+	if result.AgentSkipped {
+		fmt.Fprintln(w, "configured reviewer: skipped")
+	}
+	if result.PromptPath != "" {
+		fmt.Fprintf(w, "prompt: %s\n", relPathOrSelf(result.PromptPath, result.Before.Task.Path))
+	}
+	if result.LogPath != "" {
+		fmt.Fprintf(w, "log: %s\n", relPathOrSelf(result.LogPath, result.Before.Task.Path))
+	}
 	if includeOutput && strings.TrimSpace(result.AgentOutput) != "" {
 		fmt.Fprintln(w)
 		fmt.Fprintln(w, "agent output:")

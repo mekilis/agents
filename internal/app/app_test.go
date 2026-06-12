@@ -3460,6 +3460,7 @@ func TestReadConfigParsesModelSettings(t *testing.T) {
 		"  claude_effort: high",
 		"  cursor_model: claude-4.6-sonnet-medium-thinking",
 		"  local_ai_enabled: true",
+		"  local_ai_review_first_pass: true",
 		"  local_ai_provider: lmstudio",
 		"  local_ai_base_url: http://127.0.0.1:1234/v1",
 		"  local_ai_model: google/gemma-3-4b",
@@ -3483,7 +3484,7 @@ func TestReadConfigParsesModelSettings(t *testing.T) {
 	if cfg.Settings.ClaudeModel != "opus" || cfg.Settings.ClaudeEffort != "high" || cfg.Settings.CursorModel != "claude-4.6-sonnet-medium-thinking" {
 		t.Fatalf("unexpected settings: %+v", cfg.Settings)
 	}
-	if !cfg.Settings.LocalAIEnabled || cfg.Settings.LocalAIProvider != "lmstudio" ||
+	if !cfg.Settings.LocalAIEnabled || !cfg.Settings.LocalAIReviewFirstPass || cfg.Settings.LocalAIProvider != "lmstudio" ||
 		cfg.Settings.LocalAIBaseURL != "http://127.0.0.1:1234/v1" ||
 		cfg.Settings.LocalAIModel != "google/gemma-3-4b" ||
 		cfg.Settings.LocalAITimeout != 700 {
@@ -3522,6 +3523,239 @@ func TestLocalAISettingsDoNotReplaceCoordinatorRole(t *testing.T) {
 	}
 	if agent != "codex" || !strings.Contains(command, "codex exec") {
 		t.Fatalf("local AI settings must not replace coordinator role, agent=%q command=%q", agent, command)
+	}
+}
+
+func TestReviewerPromptDoesNotIncludeLocalAIReviewNotes(t *testing.T) {
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		task, err := openTask(e, []string{"Review Notes"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addHandoff(e, []string{"--to", "reviewer", "Review the changed CLI behavior."}, time.Date(2026, 6, 5, 10, 1, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		cfgText := strings.Join([]string{
+			"settings:",
+			"  local_ai_enabled: true",
+			"  local_ai_base_url: http://127.0.0.1:1234/v1",
+			"  local_ai_model: google/gemma-3-4b",
+			"roles:",
+			"  reviewer: codex",
+			"",
+		}, "\n")
+		if err := os.WriteFile(filepath.Join(cwd, ".agents", "config.yml"), []byte(cfgText), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		prompt, err := buildRolePrompt(e, loopState{
+			Task:       task,
+			NextRole:   "reviewer",
+			NextAction: "review latest handoff",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, want := range []string{"Review the changed CLI behavior.", "Working agreement:"} {
+			if !strings.Contains(prompt, want) {
+				t.Fatalf("reviewer prompt missing %q:\n%s", want, prompt)
+			}
+		}
+		for _, forbidden := range []string{
+			"## Local AI pre-review notes",
+			"advisory, verify independently",
+		} {
+			if strings.Contains(prompt, forbidden) {
+				t.Fatalf("reviewer prompt should not include local AI notes %q:\n%s", forbidden, prompt)
+			}
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
+func TestLocalAIFirstPassFindingsSkipConfiguredReviewer(t *testing.T) {
+	old := runFirstPassReviewWithLocalAI
+	defer func() { runFirstPassReviewWithLocalAI = old }()
+	runFirstPassReviewWithLocalAI = func(settings agentSettings, input string) (localAIReviewResult, error) {
+		if !strings.Contains(input, "Ready for review") {
+			t.Fatalf("review input missing handoff:\n%s", input)
+		}
+		return localAIReviewResult{
+			Result:  "fail",
+			Summary: "local reviewer found a concrete issue",
+			Findings: []localAIReviewFinding{{
+				Severity: "high",
+				Text:     "reviewer marker should not be written before fixing the bug",
+				Evidence: "latest handoff says ready but diff is incomplete",
+			}},
+		}, nil
+	}
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Local Review"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addHandoff(e, []string{"--to", "reviewer", "Ready for review."}, time.Date(2026, 6, 5, 10, 1, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		marker := filepath.Join(cwd, "remote-reviewer-ran")
+		reviewer := filepath.Join(cwd, "reviewer.sh")
+		if err := os.WriteFile(reviewer, []byte("#!/bin/sh\ntouch "+shellQuote(marker)+"\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cfg := strings.Join([]string{
+			"settings:",
+			"  local_ai_enabled: true",
+			"  local_ai_review_first_pass: true",
+			"  local_ai_provider: lmstudio",
+			"  local_ai_base_url: http://127.0.0.1:1234/v1",
+			"  local_ai_model: google/gemma-3-4b",
+			"roles:",
+			"  reviewer: " + reviewer + " {prompt_file}",
+			"",
+		}, "\n")
+		if err := os.WriteFile(filepath.Join(cwd, ".agents", "config.yml"), []byte(cfg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		state, err := analyzeLoopState(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var live bytes.Buffer
+		result, err := runConfiguredRole(e, state, &live)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !result.AgentSkipped || result.Agent != "local-ai" || result.After.NextRole != "implementer" || result.After.Stats.FindingsOpen != 1 {
+			t.Fatalf("unexpected local first-pass result: %+v", result)
+		}
+		if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("configured reviewer should not run, stat err=%v", err)
+		}
+		if !strings.Contains(live.String(), "Local AI first-pass found 1 finding") {
+			t.Fatalf("missing local first-pass output:\n%s", live.String())
+		}
+		findings, err := filepath.Glob(filepath.Join(cwd, ".agents", "tasks", "*", "findings", "*.md"))
+		if err != nil || len(findings) != 1 {
+			t.Fatalf("expected one finding, got %v err=%v", findings, err)
+		}
+		data, err := os.ReadFile(findings[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, want := range []string{"Created by: local-ai", "Agent: lmstudio (model google/gemma-3-4b)", "Severity: high", "Evidence:"} {
+			if !strings.Contains(string(data), want) {
+				t.Fatalf("finding missing %q:\n%s", want, string(data))
+			}
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
+func TestLocalAIFirstPassPassContinuesToConfiguredReviewer(t *testing.T) {
+	old := runFirstPassReviewWithLocalAI
+	defer func() { runFirstPassReviewWithLocalAI = old }()
+	runFirstPassReviewWithLocalAI = func(settings agentSettings, input string) (localAIReviewResult, error) {
+		return localAIReviewResult{Result: "pass", Summary: "clean"}, nil
+	}
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Local Review"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addHandoff(e, []string{"--to", "reviewer", "Ready for review."}, time.Date(2026, 6, 5, 10, 1, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		marker := filepath.Join(cwd, "remote-reviewer-ran")
+		reviewer := filepath.Join(cwd, "reviewer.sh")
+		if err := os.WriteFile(reviewer, []byte("#!/bin/sh\ntouch "+shellQuote(marker)+"\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cfg := strings.Join([]string{
+			"settings:",
+			"  local_ai_enabled: true",
+			"  local_ai_review_first_pass: true",
+			"  local_ai_base_url: http://127.0.0.1:1234/v1",
+			"  local_ai_model: google/gemma-3-4b",
+			"roles:",
+			"  reviewer: " + reviewer + " {prompt_file}",
+			"",
+		}, "\n")
+		if err := os.WriteFile(filepath.Join(cwd, ".agents", "config.yml"), []byte(cfg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		state, err := analyzeLoopState(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var live bytes.Buffer
+		result, err := runConfiguredRole(e, state, &live)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Agent == "local-ai" || result.AgentSkipped {
+			t.Fatalf("configured reviewer should run after clean local pass: %+v", result)
+		}
+		if _, err := os.Stat(marker); err != nil {
+			t.Fatalf("configured reviewer did not run: %v", err)
+		}
+		if !strings.Contains(live.String(), "continuing to configured reviewer") {
+			t.Fatalf("missing local pass output:\n%s", live.String())
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
+func TestLocalAIFirstPassMalformedResultContinuesToConfiguredReviewer(t *testing.T) {
+	old := runFirstPassReviewWithLocalAI
+	defer func() { runFirstPassReviewWithLocalAI = old }()
+	runFirstPassReviewWithLocalAI = func(settings agentSettings, input string) (localAIReviewResult, error) {
+		return localAIReviewResult{Result: "maybe"}, nil
+	}
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Local Review"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addHandoff(e, []string{"--to", "reviewer", "Ready for review."}, time.Date(2026, 6, 5, 10, 1, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		marker := filepath.Join(cwd, "remote-reviewer-ran")
+		reviewer := filepath.Join(cwd, "reviewer.sh")
+		if err := os.WriteFile(reviewer, []byte("#!/bin/sh\ntouch "+shellQuote(marker)+"\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cfg := "settings:\n  local_ai_enabled: true\n  local_ai_review_first_pass: true\n  local_ai_base_url: http://127.0.0.1:1234/v1\n  local_ai_model: google/gemma-3-4b\nroles:\n  reviewer: " + reviewer + " {prompt_file}\n"
+		if err := os.WriteFile(filepath.Join(cwd, ".agents", "config.yml"), []byte(cfg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		state, err := analyzeLoopState(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var live bytes.Buffer
+		if _, err := runConfiguredRole(e, state, &live); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(marker); err != nil {
+			t.Fatalf("configured reviewer did not run after malformed local result: %v", err)
+		}
+		if !strings.Contains(live.String(), "Local AI first-pass unavailable") {
+			t.Fatalf("missing local unavailable output:\n%s", live.String())
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
 	}
 }
 

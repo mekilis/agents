@@ -60,6 +60,10 @@ func appendCoordinatorWorkingAgreement(b *strings.Builder) {
 }
 
 func latestCoordinatorHandoffText(cwd, taskPath string) (string, error) {
+	return latestHandoffTextToRole(cwd, taskPath, "coordinator")
+}
+
+func latestHandoffTextToRole(cwd, taskPath, role string) (string, error) {
 	dir := filepath.Join(cwd, stateDir, taskPath, "handoffs")
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -77,7 +81,7 @@ func latestCoordinatorHandoffText(cwd, taskPath string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		if !handoffToRole(string(data), "coordinator") {
+		if !handoffToRole(string(data), role) {
 			continue
 		}
 		return handoffBodyText(string(data)), nil
