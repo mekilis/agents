@@ -1,0 +1,3 @@
+# Status
+
+Fixed the open refine finding by removing ad hoc plan text cleanup/appending. /plan refine now refuses automatic synthesis for free-form plan.md and leaves the plan unchanged; /plan revise remains rejected. Checks passed: GOCACHE=/tmp/agents-gocache-refine go test ./internal/app and go test ./...

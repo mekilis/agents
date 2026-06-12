@@ -191,7 +191,7 @@ planning boundary:
 
 ```bash
 agents plan draft "Add a checkout discount flag without changing schema"
-agents plan revise "1. Add the CLI flag\n2. Update tests\n3. Refresh docs"
+agents plan refine "Include docs updates and a focused regression test" # refuses automatic free-form rewrites
 agents plan show
 agents plan approve
 agents plan clear
@@ -199,11 +199,17 @@ agents plan clear
 
 The canonical plan lives at `.agents/tasks/<task>/plan.md`. Runs may mention
 plan updates, but durable plan content belongs to the task. A draft or stale
-plan routes the loop to the coordinator for approval or revision before Agents
+plan routes the loop to the coordinator for approval or refinement before Agents
 runs the implementer. Reviewers inspect the current task plan as part of review
 and should record findings when the implementation does not match the plan, or
 when the plan is stale, missing, shallow, or incorrect for the work under
 review.
+
+`agents plan refine` accepts refinement feedback only when it can be handled
+honestly. Because current plans are free-form Markdown, the command refuses
+automatic text surgery instead of appending feedback notes or pretending to
+synthesize a rewrite; edit `plan.md` directly or replace it with
+`agents plan draft "<full refined plan>"`.
 
 Substantive plans should stay compact and may use whatever Markdown shape fits
 the work. They should naturally cover the objective, brief repo-relative
@@ -415,7 +421,7 @@ Interactive slash commands available today:
 /task open "title" [--ref REF]
 /task use <task>
 /task scope|status|next "text"
-/plan draft|show|revise|approve|clear ...
+/plan draft|show|refine|approve|clear ...
 /decision add "text"
 /handoff --to ROLE "text"
 /finding add|fix|verify ...

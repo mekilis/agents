@@ -1771,7 +1771,7 @@ func TestCoordinatorPromptAvoidsCannedProgressAndAllowsReadOnlyRepoInspection(t 
 			"do not inspect the repository, summarize files, recommend code work, or emit progress",
 			"Inspect the repository only when the user explicitly asks",
 			"use read-only commands such as listing files, reading docs, and searching source",
-			"produce or revise the task plan as compact, free-form Markdown",
+			"produce or refine the task plan as compact, free-form Markdown",
 			"do not require rigid section headings",
 			"objective, repo-relative evidence, assumptions or open questions, implementation shape, validation, risks, and constraints",
 			"If the plan is not ready for implementation",
@@ -3213,15 +3213,22 @@ func TestRunRoutesHandoffToImplementerToImplementer(t *testing.T) {
 	}
 }
 
-func TestPlanReviseShowApproveAndClear(t *testing.T) {
+func TestPlanShowApproveAndClear(t *testing.T) {
 	var out, errOut bytes.Buffer
 	code := withTempProcessEnv(t, func(home, cwd string) int {
 		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
 		if _, err := openTask(e, []string{"Plan Task"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
 			t.Fatal(err)
 		}
-		if code := Run([]string{"plan", "revise", "1. Update CLI\n2. Add tests"}, bytes.NewBuffer(nil), &out, &errOut); code != 0 {
-			t.Fatalf("plan revise code=%d stderr=%s", code, errOut.String())
+		if code := Run([]string{"plan", "draft", "Replace plan revise with refine"}, bytes.NewBuffer(nil), &out, &errOut); code != 0 {
+			t.Fatalf("plan draft code=%d stderr=%s", code, errOut.String())
+		}
+		plan, err := readActiveTaskPlan(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(plan.Text, "Replace plan revise with refine") {
+			t.Fatalf("plan missing objective:\n%s", plan.Text)
 		}
 		if code := Run([]string{"plan", "show"}, bytes.NewBuffer(nil), &out, &errOut); code != 0 {
 			t.Fatalf("plan show code=%d stderr=%s", code, errOut.String())
@@ -3239,7 +3246,7 @@ func TestPlanReviseShowApproveAndClear(t *testing.T) {
 		if code := Run([]string{"plan", "clear"}, bytes.NewBuffer(nil), &out, &errOut); code != 0 {
 			t.Fatalf("plan clear code=%d stderr=%s", code, errOut.String())
 		}
-		plan, err := readActiveTaskPlan(e)
+		plan, err = readActiveTaskPlan(e)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -3256,6 +3263,68 @@ func TestPlanReviseShowApproveAndClear(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("plan output missing %q, got:\n%s", want, got)
 		}
+	}
+}
+
+func TestPlanRefineRefusesAutomaticSynthesisAndPreservesPlan(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Plan Task"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if code := Run([]string{"plan", "draft", "Replace plan revise with refine"}, bytes.NewBuffer(nil), &out, &errOut); code != 0 {
+			t.Fatalf("plan draft code=%d stderr=%s", code, errOut.String())
+		}
+		before, err := readActiveTaskPlan(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		code := Run([]string{"plan", "refine", "Rename the command everywhere and reject the old revise subcommand."}, bytes.NewBuffer(nil), &out, &errOut)
+		if code != 1 {
+			t.Fatalf("plan refine code=%d, want 1; stdout=%s stderr=%s", code, out.String(), errOut.String())
+		}
+		after, err := readActiveTaskPlan(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if after.Text != before.Text || after.State != before.State {
+			t.Fatalf("plan refine should not mutate free-form plan\nbefore=%+v\nafter=%+v", before, after)
+		}
+		if strings.Contains(after.Text, "Rename the command everywhere") {
+			t.Fatalf("plan refine persisted feedback instead of refusing synthesis:\n%s", after.Text)
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+	gotErr := errOut.String()
+	for _, want := range []string{
+		"agents: plan refine: automatic refinement of free-form plans is not supported",
+		".agents/tasks/",
+		"agents plan draft \"<full refined plan>\"",
+	} {
+		if !strings.Contains(gotErr, want) {
+			t.Fatalf("plan refine stderr missing %q, got:\n%s", want, gotErr)
+		}
+	}
+}
+
+func TestPlanReviseIsNotAccepted(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Plan Task"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		return Run([]string{"plan", "revise", "old spelling"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code != 2 {
+		t.Fatalf("plan revise code=%d, want 2; stdout=%s stderr=%s", code, out.String(), errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "unknown plan command: revise") {
+		t.Fatalf("unexpected stderr for revise:\n%s", errOut.String())
 	}
 }
 
@@ -3385,7 +3454,7 @@ func TestDraftPlanRoutesImplementerHandoffToCoordinator(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
 		t.Fatalf("run JSON should decode: %v\n%s", err, out.String())
 	}
-	if got.NextRole != "coordinator" || got.NextAction != "approve or revise plan before implementation" || got.Boundary != "plan approval required" {
+	if got.NextRole != "coordinator" || got.NextAction != "approve or refine plan before implementation" || got.Boundary != "plan approval required" {
 		t.Fatalf("unexpected loop state: %+v", got)
 	}
 	if got.Task == nil || got.Task.Plan != "draft" {

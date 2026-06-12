@@ -61,7 +61,7 @@ var interactiveSlashCommands = []slashCommandSpec{
 	{Name: "/trust", Usage: "/trust", Description: "Trust this workspace"},
 	{Name: "/init", Usage: "/init [--share|--local]", Description: "Initialize Agents task state"},
 	{Name: "/task", Usage: `/task open|use|scope|status|next ...`, Description: "Open, switch, or update the active task"},
-	{Name: "/plan", Usage: `/plan draft|show|revise|approve|clear ...`, Description: "Manage the active task plan"},
+	{Name: "/plan", Usage: `/plan draft|show|refine|approve|clear ...`, Description: "Manage the active task plan"},
 	{Name: "/decision", Usage: `/decision add "text"`, Description: "Record a planning decision"},
 	{Name: "/handoff", Usage: `/handoff --to ROLE "text"`, Description: "Route context to another role"},
 	{Name: "/finding", Usage: "/finding add|fix|verify ...", Description: "Track review findings"},
@@ -902,7 +902,7 @@ func printHelp(w io.Writer) {
 	fmt.Fprintln(w, "  agents task open \"title\" [--ref REF]")
 	fmt.Fprintln(w, "  agents task use <task>")
 	fmt.Fprintln(w, "  agents task scope|status|next \"text\"")
-	fmt.Fprintln(w, "  agents plan draft|show|revise|approve|clear ...")
+	fmt.Fprintln(w, "  agents plan draft|show|refine|approve|clear ...")
 	fmt.Fprintln(w, "  agents decision add \"text\" [--by ACTOR]")
 	fmt.Fprintln(w, "  agents handoff --to ROLE \"text\" [--by ACTOR]")
 	fmt.Fprintln(w, "  agents finding add \"text\" [--severity low|medium|high] [--by ACTOR]")
@@ -4999,7 +4999,7 @@ func analyzeLoopState(e env) (loopState, error) {
 	}
 	if state.NextRole == "implementer" && planRequiresApproval(stats.PlanState) {
 		state.NextRole = "coordinator"
-		state.NextAction = "approve or revise plan before implementation"
+		state.NextAction = "approve or refine plan before implementation"
 		state.Boundary = "plan approval required"
 	}
 	return state, nil

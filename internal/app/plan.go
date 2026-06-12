@@ -56,10 +56,10 @@ func runPlanCommand(args []string, out, errOut io.Writer, e env) int {
 		fmt.Fprintln(out)
 		fmt.Fprintln(out, strings.TrimRight(plan.Text, "\n"))
 		return 0
-	case "revise":
-		relPath, err := writeActiveTaskPlan(e, args[1:], planStateDraft)
+	case "refine":
+		relPath, err := refineActiveTaskPlan(e, args[1:])
 		if err != nil {
-			fmt.Fprintf(errOut, "agents: plan revise: %v\n", err)
+			fmt.Fprintf(errOut, "agents: plan refine: %v\n", err)
 			return 1
 		}
 		fmt.Fprintf(out, "plan: %s\n", planStateDraft)
@@ -146,6 +146,28 @@ func draftActiveTaskPlan(e env, args []string) (string, error) {
 		objective = strings.TrimSpace(args[0])
 	}
 	return writeActiveTaskPlanText(e, compactPlanTemplate(objective), planStateDraft)
+}
+
+func refineActiveTaskPlan(e env, args []string) (string, error) {
+	feedback, err := parseSingleTextArg(args, "refinement feedback")
+	if err != nil {
+		return "", err
+	}
+	feedback = strings.TrimSpace(feedback)
+	if feedback == "" {
+		return "", fmt.Errorf("refinement feedback must not be empty")
+	}
+	plan, err := readActiveTaskPlan(e)
+	if err != nil {
+		return "", err
+	}
+	if plan.State == planStateMissing {
+		return "", fmt.Errorf("no plan to refine")
+	}
+	if strings.TrimSpace(plan.Text) == "" {
+		return "", fmt.Errorf("existing plan has no durable content to refine")
+	}
+	return "", fmt.Errorf("automatic refinement of free-form plans is not supported; edit %s or replace it with agents plan draft \"<full refined plan>\"", filepath.Join(stateDir, plan.Path))
 }
 
 func writeActiveTaskPlanText(e env, text string, state string) (string, error) {

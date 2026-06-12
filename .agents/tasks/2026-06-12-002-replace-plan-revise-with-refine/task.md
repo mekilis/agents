@@ -1,0 +1,4 @@
+# Replace plan revise with refine
+
+date: 2026-06-12
+status: active

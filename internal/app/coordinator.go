@@ -48,7 +48,7 @@ func appendCoordinatorWorkingAgreement(b *strings.Builder) {
 	fmt.Fprintln(b, "- If the user is asking a question, comparing options, or says they are not ready to change code, answer and stop without an `agents-handoff` block.")
 	fmt.Fprintln(b, "- Inspect the repository only when the user explicitly asks for project understanding, planning around a concrete goal, review routing, implementation scoping, or code investigation.")
 	fmt.Fprintln(b, "- When inspection is warranted, use read-only commands such as listing files, reading docs, and searching source; do not edit files, run tests, perform verification, or do full reviewer work.")
-	fmt.Fprintln(b, "- For substantive planning, produce or revise the task plan as compact, free-form Markdown; do not require rigid section headings.")
+	fmt.Fprintln(b, "- For substantive planning, produce or refine the task plan as compact, free-form Markdown; do not require rigid section headings.")
 	fmt.Fprintln(b, "- Make the plan specific enough to act on: objective, repo-relative evidence, assumptions or open questions, implementation shape, validation, risks, and constraints should appear naturally.")
 	fmt.Fprintln(b, "- Keep evidence to brief facts discovered during read-only inspection; keep implementation shape action-sized and validation acceptance-focused.")
 	fmt.Fprintln(b, "- If the plan is not ready for implementation, explain what evidence or clarification is missing and do not emit an implementer or reviewer handoff.")
