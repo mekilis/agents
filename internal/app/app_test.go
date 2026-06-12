@@ -236,6 +236,43 @@ func TestRunStatusDoesNotPrintBanner(t *testing.T) {
 	}
 }
 
+func TestRunStatusShowsHumanApprovalBoundary(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		task, err := openTask(e, []string{"Human Boundary"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		verificationDir := filepath.Join(cwd, stateDir, task.Path, "verification")
+		if err := os.MkdirAll(verificationDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		verification := "# Verification: checks\n\nResult: pass\nBy: reviewer\n\nchecks passed\n"
+		if err := os.WriteFile(filepath.Join(verificationDir, "2026-06-05T100100Z-checks.md"), []byte(verification), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return Run([]string{"status"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code != 0 {
+		t.Fatalf("Run status code=%d stderr=%s", code, errOut.String())
+	}
+	got := out.String()
+	for _, want := range []string{
+		"active task: Human Boundary",
+		"next role: human",
+		"next action: approve archive, commit, or next task",
+		"boundary: human approval required",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("status missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "AGENTS") {
+		t.Fatalf("status should stay banner-free, got:\n%s", got)
+	}
+}
+
 func TestRunUnknownCommandUsesPublicCLIError(t *testing.T) {
 	var out, errOut bytes.Buffer
 	code := withTempProcessEnv(t, func(home, cwd string) int {
@@ -5975,6 +6012,96 @@ func TestRunsAndWatchDisplayRunActivity(t *testing.T) {
 	}
 }
 
+func TestWatchShowsHumanApprovalBoundary(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		task, err := openTask(e, []string{"Ready Activity"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		taskDir := filepath.Join(cwd, stateDir, task.Path)
+		verificationDir := filepath.Join(taskDir, "verification")
+		if err := os.MkdirAll(verificationDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		verification := "# Verification: checks\n\nResult: pass\nBy: reviewer\n\nchecks passed\n"
+		if err := os.WriteFile(filepath.Join(verificationDir, "2026-06-05T100100Z-checks.md"), []byte(verification), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		runsDir := filepath.Join(taskDir, "runs")
+		if err := os.MkdirAll(runsDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := appendRunActivityRecord(filepath.Join(runsDir, "r1.jsonl"), runActivityRecord{Event: "run_started", Time: "2026-06-05T10:00:00Z", RunID: "r1", Role: "reviewer", Agent: "codex"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := appendRunActivityRecord(filepath.Join(runsDir, "r1.jsonl"), runActivityRecord{Event: "run_finished", Time: "2026-06-05T10:00:01Z", RunID: "r1", Status: "finished"}); err != nil {
+			t.Fatal(err)
+		}
+		return Run([]string{"watch"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code != 0 {
+		t.Fatalf("watch failed: %s", errOut.String())
+	}
+	got := out.String()
+	for _, want := range []string{
+		"Task: Ready Activity",
+		"Ready for you: approve archive, commit, or next task.",
+		"Reviewer started",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("watch output missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestRunsSuppressesHumanApprovalBoundary(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		task, err := openTask(e, []string{"Ready Activity"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		taskDir := filepath.Join(cwd, stateDir, task.Path)
+		verificationDir := filepath.Join(taskDir, "verification")
+		if err := os.MkdirAll(verificationDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		verification := "# Verification: checks\n\nResult: pass\nBy: reviewer\n\nchecks passed\n"
+		if err := os.WriteFile(filepath.Join(verificationDir, "2026-06-05T100100Z-checks.md"), []byte(verification), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		runsDir := filepath.Join(taskDir, "runs")
+		if err := os.MkdirAll(runsDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := appendRunActivityRecord(filepath.Join(runsDir, "r1.jsonl"), runActivityRecord{Event: "run_started", Time: "2026-06-05T10:00:00Z", RunID: "r1", Role: "reviewer", Agent: "codex"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := appendRunActivityRecord(filepath.Join(runsDir, "r1.jsonl"), runActivityRecord{Event: "run_finished", Time: "2026-06-05T10:00:01Z", RunID: "r1", Status: "finished"}); err != nil {
+			t.Fatal(err)
+		}
+		return Run([]string{"runs"}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code != 0 {
+		t.Fatalf("runs failed: %s", errOut.String())
+	}
+	got := out.String()
+	if strings.Contains(got, "Ready for you: approve archive, commit, or next task.") {
+		t.Fatalf("runs should not show human boundary cue:\n%s", got)
+	}
+	for _, want := range []string{
+		"Task: Ready Activity",
+		"Reviewer started",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("runs output missing %q:\n%s", want, got)
+		}
+	}
+}
+
 func TestRunActivityRendersMarkdownOnlyForTTY(t *testing.T) {
 	text := "## Status\n\n- **Task** routing\n\n```sh\ngo test ./...\n```\n"
 
@@ -6021,7 +6148,7 @@ func TestWatchFollowStartingEmptyKeepsPolling(t *testing.T) {
 			fmt.Fprintln(out, "follow started")
 			return nil
 		}
-		if err := printRunActivity(&out, e, true); err != nil {
+		if err := printRunActivity(&out, e, true, true); err != nil {
 			t.Fatal(err)
 		}
 		return 0

@@ -312,7 +312,7 @@ func runWatchCommand(args []string, out, errOut io.Writer, e env) int {
 		fmt.Fprintln(errOut, "agents: watch does not accept arguments yet")
 		return 2
 	}
-	if err := printRunActivity(out, e, true); err != nil {
+	if err := printRunActivity(out, e, true, true); err != nil {
 		fmt.Fprintf(errOut, "agents: watch: %v\n", err)
 		return 1
 	}
@@ -332,14 +332,14 @@ func runRunsCommand(args []string, out, errOut io.Writer, e env) int {
 			return 2
 		}
 	}
-	if err := printRunActivity(out, e, follow); err != nil {
+	if err := printRunActivity(out, e, follow, false); err != nil {
 		fmt.Fprintf(errOut, "agents: runs: %v\n", err)
 		return 1
 	}
 	return 0
 }
 
-func printRunActivity(out io.Writer, e env, follow bool) error {
+func printRunActivity(out io.Writer, e env, follow, showHumanBoundary bool) error {
 	active := readActiveTask(e.cwd)
 	if active.Path == "" {
 		return fmt.Errorf("no active task")
@@ -360,6 +360,11 @@ func printRunActivity(out io.Writer, e env, follow bool) error {
 		return nil
 	}
 	fmt.Fprintf(out, "Task: %s\n", active.Title)
+	if showHumanBoundary {
+		if state, err := analyzeLoopState(e); err == nil && state.NextRole == "human" {
+			fmt.Fprintln(out, "Ready for you: approve archive, commit, or next task.")
+		}
+	}
 	for _, rec := range records {
 		printRunActivityRecord(out, rec, e.isTTY)
 	}

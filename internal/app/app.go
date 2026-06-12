@@ -2387,7 +2387,7 @@ func printStatus(w io.Writer, e env, jsonOut bool) error {
 			fmt.Fprintf(w, "task status: %s\n", active.Status)
 		}
 		fmt.Fprintf(w, "task path: %s\n", active.Path)
-		printTaskStats(w, taskStats{
+		stats := taskStats{
 			Next:             active.Next,
 			FindingsOpen:     active.Findings.Open,
 			FindingsFixed:    active.Findings.Fixed,
@@ -2396,7 +2396,17 @@ func printStatus(w io.Writer, e env, jsonOut bool) error {
 			Handoffs:         active.Records.Handoffs,
 			Verification:     active.Records.Verification,
 			VerificationFail: active.Records.VerificationFailed,
-		})
+		}
+		var humanState *loopState
+		if !active.Missing {
+			if state, err := analyzeLoopState(e); err == nil && state.NextRole == "human" {
+				humanState = &state
+			}
+		}
+		printTaskStatsWithOptions(w, stats, humanState == nil)
+		if humanState != nil {
+			printHumanBoundary(w, *humanState)
+		}
 	}
 	return nil
 }
@@ -5945,6 +5955,14 @@ func printLoopState(w io.Writer, state loopState) {
 		fmt.Fprintf(w, "boundary: %s\n", state.Boundary)
 	}
 	printTaskStatsWithOptions(w, state.Stats, state.NextRole != "human")
+}
+
+func printHumanBoundary(w io.Writer, state loopState) {
+	fmt.Fprintf(w, "next role: %s\n", state.NextRole)
+	fmt.Fprintf(w, "next action: %s\n", state.NextAction)
+	if state.Boundary != "" {
+		fmt.Fprintf(w, "boundary: %s\n", state.Boundary)
+	}
 }
 
 func printRoleRunResult(w io.Writer, result roleRunResult) {
