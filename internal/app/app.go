@@ -61,7 +61,7 @@ var interactiveSlashCommands = []slashCommandSpec{
 	{Name: "/trust", Usage: "/trust", Description: "Trust this workspace"},
 	{Name: "/init", Usage: "/init [--share|--local]", Description: "Initialize Agents task state"},
 	{Name: "/task", Usage: `/task open|use|scope|status|next ...`, Description: "Open, switch, or update the active task"},
-	{Name: "/plan", Usage: `/plan show|revise|approve|clear ...`, Description: "Manage the active task plan"},
+	{Name: "/plan", Usage: `/plan draft|show|revise|approve|clear ...`, Description: "Manage the active task plan"},
 	{Name: "/decision", Usage: `/decision add "text"`, Description: "Record a planning decision"},
 	{Name: "/handoff", Usage: `/handoff --to ROLE "text"`, Description: "Route context to another role"},
 	{Name: "/finding", Usage: "/finding add|fix|verify ...", Description: "Track review findings"},
@@ -902,7 +902,7 @@ func printHelp(w io.Writer) {
 	fmt.Fprintln(w, "  agents task open \"title\" [--ref REF]")
 	fmt.Fprintln(w, "  agents task use <task>")
 	fmt.Fprintln(w, "  agents task scope|status|next \"text\"")
-	fmt.Fprintln(w, "  agents plan show|revise|approve|clear ...")
+	fmt.Fprintln(w, "  agents plan draft|show|revise|approve|clear ...")
 	fmt.Fprintln(w, "  agents decision add \"text\" [--by ACTOR]")
 	fmt.Fprintln(w, "  agents handoff --to ROLE \"text\" [--by ACTOR]")
 	fmt.Fprintln(w, "  agents finding add \"text\" [--severity low|medium|high] [--by ACTOR]")
@@ -6083,7 +6083,7 @@ func buildRolePrompt(e env, state loopState) (string, error) {
 		appendPromptFile(&b, e.cwd, state.Task.Path, "scope.md", "Scope")
 		appendPromptFile(&b, e.cwd, state.Task.Path, "status.md", "Status")
 		appendPromptFile(&b, e.cwd, state.Task.Path, "next.md", "Next")
-		appendPromptFile(&b, e.cwd, state.Task.Path, "plan.md", "Plan")
+		appendPlanPrompt(&b, e.cwd, state.Task.Path)
 		appendPromptDir(&b, e.cwd, state.Task.Path, "handoffs", "Handoffs")
 		appendPromptDir(&b, e.cwd, state.Task.Path, "decisions", "Decisions")
 		appendPromptDir(&b, e.cwd, state.Task.Path, "findings", "Findings")
@@ -6109,13 +6109,14 @@ func buildRolePrompt(e env, state loopState) (string, error) {
 		fmt.Fprintf(&b, "Task: %s\nPath: %s\nNext action: %s\n\n", state.Task.Title, state.Task.Path, state.NextAction)
 		appendPromptFile(&b, e.cwd, state.Task.Path, "scope.md", "Scope")
 		appendPromptFile(&b, e.cwd, state.Task.Path, "status.md", "Status")
-		appendPromptFile(&b, e.cwd, state.Task.Path, "plan.md", "Plan")
+		appendPlanPrompt(&b, e.cwd, state.Task.Path)
 		appendPromptDir(&b, e.cwd, state.Task.Path, "handoffs", "Handoffs")
 		appendPromptDir(&b, e.cwd, state.Task.Path, "findings", "Findings")
 		appendPromptDir(&b, e.cwd, state.Task.Path, "verification", "Verification")
 		fmt.Fprintln(&b, "Working agreement:")
 		fmt.Fprintln(&b, "- Review the working tree, tests, and task chunks; verify claims against the code, not the handoff text.")
-		fmt.Fprintln(&b, "- Review the current task plan in `plan.md` when present. Check whether the implementation and review scope match the approved or draft plan, and record findings for stale, missing, or incorrect plans.")
+		fmt.Fprintln(&b, "- Review the current task plan in `plan.md` when present. Check whether it contains compact evidence, clarifications, slices, validation, risks, and execution constraints, then check whether the implementation and review scope match the approved or draft plan.")
+		fmt.Fprintln(&b, "- Record findings for stale, missing, shallow, incorrect, or ignored plans.")
 		fmt.Fprintln(&b, "- Emit brief JSON progress updates for the interactive UI when phases change:")
 		fmt.Fprintln(&b, "  ```agents-progress")
 		fmt.Fprintln(&b, `  {"status":"Running checks","detail":"Verifying tests and reviewing the diff"}`)
@@ -6204,6 +6205,137 @@ func appendPromptFile(b *strings.Builder, cwd, taskPath, name, heading string) {
 		return
 	}
 	fmt.Fprintf(b, "## %s\n\n%s\n\n", heading, strings.TrimSpace(string(data)))
+}
+
+func appendPlanPrompt(b *strings.Builder, cwd, taskPath string) {
+	plan, err := readTaskPlan(cwd, taskPath)
+	if err != nil || plan.State == planStateMissing || strings.TrimSpace(plan.Text) == "" {
+		return
+	}
+	text := boundedPlanText(plan.Text)
+	fmt.Fprintf(b, "## Plan\n\nState: %s\nPath: %s\n\n%s", plan.State, plan.Path, text)
+	if text != strings.TrimSpace(plan.Text) {
+		fmt.Fprintln(b)
+		fmt.Fprintln(b, "\n[Plan truncated for prompt budget; full canonical plan remains in `.agents` task state.]")
+	}
+	fmt.Fprintln(b)
+	fmt.Fprintln(b)
+}
+
+func boundedPlanText(text string) string {
+	const maxPlanPromptChars = 4000
+	trimmed := strings.TrimSpace(text)
+	if len(trimmed) <= maxPlanPromptChars {
+		return trimmed
+	}
+	sections := splitMarkdownSections(trimmed)
+	if len(sections) < 2 {
+		return truncatePlanHead(trimmed, maxPlanPromptChars)
+	}
+	critical := map[string]bool{
+		"risks":                 true,
+		"execution constraints": true,
+	}
+	var head, tail []planSection
+	for i, section := range sections {
+		if i == 0 || !critical[normalizePlanHeading(section.Heading)] {
+			head = append(head, section)
+			continue
+		}
+		tail = append(tail, section)
+	}
+	if len(tail) == 0 {
+		return truncatePlanHead(trimmed, maxPlanPromptChars)
+	}
+	const marker = "\n\n[Plan middle sections compacted for prompt budget; full canonical plan remains in `.agents` task state.]\n\n"
+	tailText := compactPlanSections(tail, maxPlanPromptChars/2)
+	headBudget := maxPlanPromptChars - len(tailText) - len(marker)
+	if headBudget < maxPlanPromptChars/4 {
+		headBudget = maxPlanPromptChars / 4
+	}
+	headText := truncatePlanHead(strings.TrimSpace(joinPlanSections(head)), headBudget)
+	return strings.TrimSpace(headText) + marker + tailText
+}
+
+type planSection struct {
+	Heading string
+	Text    string
+}
+
+func splitMarkdownSections(text string) []planSection {
+	lines := strings.Split(text, "\n")
+	var sections []planSection
+	var current strings.Builder
+	heading := ""
+	flush := func() {
+		if strings.TrimSpace(current.String()) == "" {
+			return
+		}
+		sections = append(sections, planSection{
+			Heading: heading,
+			Text:    strings.TrimSpace(current.String()),
+		})
+		current.Reset()
+	}
+	for _, line := range lines {
+		if strings.HasPrefix(line, "## ") {
+			flush()
+			heading = strings.TrimSpace(strings.TrimPrefix(line, "## "))
+		}
+		current.WriteString(line)
+		current.WriteByte('\n')
+	}
+	flush()
+	return sections
+}
+
+func joinPlanSections(sections []planSection) string {
+	var b strings.Builder
+	for _, section := range sections {
+		if strings.TrimSpace(section.Text) == "" {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteString("\n\n")
+		}
+		b.WriteString(strings.TrimSpace(section.Text))
+	}
+	return b.String()
+}
+
+func compactPlanSections(sections []planSection, limit int) string {
+	joined := strings.TrimSpace(joinPlanSections(sections))
+	if len(joined) <= limit {
+		return joined
+	}
+	perSection := limit / len(sections)
+	if perSection < 200 {
+		perSection = 200
+	}
+	compacted := make([]planSection, 0, len(sections))
+	for _, section := range sections {
+		compacted = append(compacted, planSection{
+			Heading: section.Heading,
+			Text:    truncatePlanHead(section.Text, perSection),
+		})
+	}
+	return strings.TrimSpace(joinPlanSections(compacted))
+}
+
+func normalizePlanHeading(heading string) string {
+	return strings.ToLower(strings.TrimSpace(heading))
+}
+
+func truncatePlanHead(text string, limit int) string {
+	trimmed := strings.TrimSpace(text)
+	if len(trimmed) <= limit {
+		return trimmed
+	}
+	cut := strings.LastIndex(trimmed[:limit], "\n")
+	if cut < limit/2 {
+		cut = limit
+	}
+	return strings.TrimSpace(trimmed[:cut])
 }
 
 func appendPromptDir(b *strings.Builder, cwd, taskPath, dir, heading string) {

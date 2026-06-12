@@ -1771,6 +1771,9 @@ func TestCoordinatorPromptAvoidsCannedProgressAndAllowsReadOnlyRepoInspection(t 
 			"do not inspect the repository, summarize files, recommend code work, or emit progress",
 			"Inspect the repository only when the user explicitly asks",
 			"use read-only commands such as listing files, reading docs, and searching source",
+			"produce or revise the task plan as compact Markdown",
+			"Objective, Evidence, Clarifications, Slices, Validation, Risks, Execution Constraints",
+			"If the plan is not ready for implementation",
 			"repo-relative paths such as `README.md` or `.agents/tasks/...`",
 			"do not print absolute machine-local paths",
 			"Task record paths shown as `.agents/tasks/...` are inside the Agents state directory",
@@ -3255,6 +3258,103 @@ func TestPlanReviseShowApproveAndClear(t *testing.T) {
 	}
 }
 
+func TestPlanDraftWritesCompactSubstantiveScaffold(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Plan Draft"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if code := Run([]string{"plan", "draft", "Make plan mode substantive"}, bytes.NewBuffer(nil), &out, &errOut); code != 0 {
+			t.Fatalf("plan draft code=%d stderr=%s", code, errOut.String())
+		}
+		plan, err := readActiveTaskPlan(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if plan.State != planStateDraft {
+			t.Fatalf("expected draft plan, got %+v", plan)
+		}
+		for _, want := range []string{
+			"## Objective",
+			"Make plan mode substantive",
+			"## Evidence",
+			"repo-relative paths",
+			"## Clarifications",
+			"## Slices",
+			"## Validation",
+			"## Risks",
+			"## Execution Constraints",
+		} {
+			if !strings.Contains(plan.Text, want) {
+				t.Fatalf("draft plan missing %q:\n%s", want, plan.Text)
+			}
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+	if !strings.Contains(out.String(), "plan: draft") || !strings.Contains(out.String(), "updated: tasks/") {
+		t.Fatalf("unexpected plan draft output:\n%s", out.String())
+	}
+}
+
+func TestRolePromptBoundsLongPlanContent(t *testing.T) {
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		task, err := openTask(e, []string{"Long Plan"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		longPlan := strings.Join([]string{
+			"## Objective",
+			"Keep the plan compact.",
+			"",
+			"## Evidence",
+			strings.Repeat("substantive detail\n", 400),
+			"## Risks",
+			"- Risk that must stay visible.",
+			"",
+			"## Execution Constraints",
+			"- Do not hide this required constraint.",
+		}, "\n")
+		if _, err := writeActiveTaskPlan(e, []string{longPlan}, planStateApproved); err != nil {
+			t.Fatal(err)
+		}
+		for _, role := range []string{"implementer", "reviewer"} {
+			prompt, err := buildRolePrompt(e, loopState{
+				Task:       task,
+				NextRole:   role,
+				NextAction: "act on latest handoff",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, want := range []string{
+				"State: approved",
+				"Plan middle sections compacted for prompt budget",
+				"Plan truncated for prompt budget",
+				"## Risks",
+				"Risk that must stay visible.",
+				"## Execution Constraints",
+				"Do not hide this required constraint.",
+			} {
+				if !strings.Contains(prompt, want) {
+					t.Fatalf("%s prompt missing %q:\n%s", role, want, prompt)
+				}
+			}
+			if strings.Count(prompt, "substantive detail") > 300 {
+				t.Fatalf("%s plan was not bounded enough, count=%d", role, strings.Count(prompt, "substantive detail"))
+			}
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
 func TestDraftPlanRoutesImplementerHandoffToCoordinator(t *testing.T) {
 	var out, errOut bytes.Buffer
 	code := withTempProcessEnv(t, func(home, cwd string) int {
@@ -3974,8 +4074,9 @@ func TestReviewerPromptIncludesPlanReviewInstructionsAndOmitsLocalAIReviewNotes(
 			"State: approved",
 			"Approved plan for the reviewer to inspect.",
 			"Review the current task plan in `plan.md` when present.",
+			"evidence, clarifications, slices, validation, risks, and execution constraints",
 			"implementation and review scope match the approved or draft plan",
-			"record findings for stale, missing, or incorrect plans",
+			"stale, missing, shallow, incorrect, or ignored plans",
 			"Working agreement:",
 		} {
 			if !strings.Contains(prompt, want) {

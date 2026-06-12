@@ -190,6 +190,7 @@ Keep an approved implementation plan with the task when the work needs a
 planning boundary:
 
 ```bash
+agents plan draft "Add a checkout discount flag without changing schema"
 agents plan revise "1. Add the CLI flag\n2. Update tests\n3. Refresh docs"
 agents plan show
 agents plan approve
@@ -201,7 +202,14 @@ plan updates, but durable plan content belongs to the task. A draft or stale
 plan routes the loop to the coordinator for approval or revision before Agents
 runs the implementer. Reviewers inspect the current task plan as part of review
 and should record findings when the implementation does not match the plan, or
-when the plan is stale, missing, or incorrect for the work under review.
+when the plan is stale, missing, shallow, or incorrect for the work under
+review.
+
+Substantive plans should stay compact: Objective, Evidence, Clarifications,
+Slices, Validation, Risks, and Execution Constraints. Evidence should cite
+brief repo-relative facts, Clarifications should combine assumptions and open
+questions, and Execution Constraints should name requested permissions or
+boundaries without long background notes.
 
 Record coordination state:
 
@@ -408,7 +416,7 @@ Interactive slash commands available today:
 /task open "title" [--ref REF]
 /task use <task>
 /task scope|status|next "text"
-/plan show|revise|approve|clear ...
+/plan draft|show|revise|approve|clear ...
 /decision add "text"
 /handoff --to ROLE "text"
 /finding add|fix|verify ...

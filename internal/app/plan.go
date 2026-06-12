@@ -28,6 +28,15 @@ func runPlanCommand(args []string, out, errOut io.Writer, e env) int {
 		return 2
 	}
 	switch args[0] {
+	case "draft", "create":
+		relPath, err := draftActiveTaskPlan(e, args[1:])
+		if err != nil {
+			fmt.Fprintf(errOut, "agents: plan %s: %v\n", args[0], err)
+			return 1
+		}
+		fmt.Fprintf(out, "plan: %s\n", planStateDraft)
+		fmt.Fprintf(out, "updated: %s\n", relPath)
+		return 0
 	case "show":
 		if len(args) != 1 {
 			fmt.Fprintln(errOut, "agents: plan show does not accept arguments")
@@ -122,6 +131,24 @@ func writeActiveTaskPlan(e env, args []string, state string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return writeActiveTaskPlanText(e, text, state)
+}
+
+func draftActiveTaskPlan(e env, args []string) (string, error) {
+	if len(args) > 1 {
+		return "", fmt.Errorf("plan draft accepts at most one objective")
+	}
+	objective := "State the user-facing outcome in one or two sentences."
+	if len(args) == 1 {
+		if strings.TrimSpace(args[0]) == "" {
+			return "", fmt.Errorf("objective must not be empty")
+		}
+		objective = strings.TrimSpace(args[0])
+	}
+	return writeActiveTaskPlanText(e, compactPlanTemplate(objective), planStateDraft)
+}
+
+func writeActiveTaskPlanText(e env, text string, state string) (string, error) {
 	active := readActiveTask(e.cwd)
 	if active.Path == "" {
 		return "", fmt.Errorf("no active task")
@@ -139,6 +166,29 @@ func writeActiveTaskPlan(e env, args []string, state string) (string, error) {
 		return "", err
 	}
 	return relPath, nil
+}
+
+func compactPlanTemplate(objective string) string {
+	return strings.TrimSpace(fmt.Sprintf(`## Objective
+%s
+
+## Evidence
+- TODO: repo/doc/task evidence, with repo-relative paths.
+
+## Clarifications
+- TODO: assumptions, open questions, and human decisions needed.
+
+## Slices
+1. TODO: implementation slice with expected files or behavior.
+
+## Validation
+- TODO: focused checks, tests, or manual acceptance criteria.
+
+## Risks
+- TODO: likely regressions, stale context, or trade-offs.
+
+## Execution Constraints
+- TODO: requested permissions, boundaries, and actions Agents must not take.`, strings.TrimSpace(objective)))
 }
 
 func approveActiveTaskPlan(e env) (string, error) {
