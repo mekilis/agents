@@ -107,7 +107,7 @@ func TestReadySummaryLinesRendersSections(t *testing.T) {
 	text := strings.Join(readySummaryLines(summary), "\n")
 	for _, want := range []string{
 		"Ready for you — History",
-		"Done and independently checked after 4 runs.",
+		"Paused for your inspection after 4 runs.",
 		"What was asked:",
 		"support /history in the terminal",
 		"What changed (git diff --stat):",
@@ -152,6 +152,9 @@ func TestRunReadyScreenActions(t *testing.T) {
 	if action != readyAccept {
 		t.Fatalf("expected accept, got %v", action)
 	}
+	if !strings.Contains(out.String(), "Accepted — archiving the task") {
+		t.Fatalf("expected accept acknowledgement, got:\n%s", out.String())
+	}
 
 	out.Reset()
 	action, feedback := runReadyScreen(&out, feedKeys("ialso cover redo\r"), summary)
@@ -160,6 +163,9 @@ func TestRunReadyScreenActions(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "What should change?") {
 		t.Fatalf("expected iterate prompt, got:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "routing your feedback to the implementer") {
+		t.Fatalf("expected iterate acknowledgement, got:\n%s", out.String())
 	}
 
 	// Backspace edits, empty feedback re-prompts, x abandons.
@@ -173,6 +179,9 @@ func TestRunReadyScreenActions(t *testing.T) {
 	action, _ = runReadyScreen(&out, feedKeys("q"), summary)
 	if action != readyAbandon {
 		t.Fatalf("expected abandon on q, got %v", action)
+	}
+	if !strings.Contains(out.String(), "leaving the task active") {
+		t.Fatalf("expected abandon acknowledgement, got:\n%s", out.String())
 	}
 
 	// Closed input without a decision abandons rather than hanging.

@@ -121,6 +121,8 @@ agents go "Add /history command"                       # text is title and scope
 agents go "History: support /history in the terminal"  # "title: instruction" splits
 agents go "Fix flaky test" --ref BUG-7 --max-iterations 8
 agents go "Add /history command" --plain               # force plain loop output
+agents go --continue "Review the current state"        # continue the active task
+agents go --reviewer "Inspect the latest changes"      # start with reviewer, then keep looping
 ```
 
 On a terminal, `go` renders the unified loop view: two lanes — Building and

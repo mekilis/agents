@@ -100,6 +100,9 @@ type viewLane struct {
 	note     string
 	lines    []string
 	partial  string
+	inBlock  bool
+	block    []string
+	skipRaw  bool
 }
 
 func (l *viewLane) appendChunk(chunk string) {
@@ -113,27 +116,287 @@ func (l *viewLane) appendChunk(chunk string) {
 		if idx := strings.LastIndex(line, "\r"); idx >= 0 {
 			line = line[idx+1:]
 		}
-		l.lines = append(l.lines, line)
+		l.appendLine(line)
 	}
 	if len(l.lines) > laneRingCapacity {
 		l.lines = l.lines[len(l.lines)-laneRingCapacity:]
 	}
 }
 
+func (l *viewLane) appendLine(line string) {
+	trimmed := strings.TrimSpace(line)
+	if shouldDropLaneLine(trimmed) {
+		return
+	}
+	if l.inBlock {
+		if trimmed == "```" {
+			if progress, ok := parseProgressDirectiveLines(l.block); ok {
+				l.lines = append(l.lines, formatProgressLine(progress))
+			}
+			l.inBlock = false
+			l.block = nil
+			return
+		}
+		l.block = append(l.block, line)
+		return
+	}
+	switch {
+	case trimmed == "```agents-progress":
+		l.skipRaw = false
+		l.inBlock = true
+		l.block = nil
+	case looksLikeBareProgressJSON(trimmed):
+		if progress, ok := parseProgressDirectiveLines([]string{trimmed}); ok {
+			l.skipRaw = false
+			l.lines = append(l.lines, formatProgressLine(progress))
+		}
+	case startsRawTranscript(trimmed):
+		l.skipRaw = true
+	case l.skipRaw:
+		if isUserFacingAgentLine(trimmed) {
+			l.skipRaw = false
+			l.lines = append(l.lines, line)
+		}
+	default:
+		l.lines = append(l.lines, line)
+	}
+}
+
+func startsRawTranscript(trimmed string) bool {
+	lower := strings.ToLower(trimmed)
+	switch {
+	case trimmed == "OpenAI Codex v0.137.0":
+		return true
+	case strings.HasPrefix(trimmed, "--------"):
+		return true
+	case strings.HasPrefix(trimmed, "workdir:"):
+		return true
+	case strings.HasPrefix(trimmed, "model:"):
+		return true
+	case strings.HasPrefix(trimmed, "provider:"):
+		return true
+	case strings.HasPrefix(trimmed, "approval:"):
+		return true
+	case strings.HasPrefix(trimmed, "sandbox:"):
+		return true
+	case strings.HasPrefix(trimmed, "reasoning effort:"):
+		return true
+	case strings.HasPrefix(trimmed, "exec /bin/"):
+		return true
+	case trimmed == "exec":
+		return true
+	case strings.HasPrefix(trimmed, "/bin/"):
+		return true
+	case trimmed == "evidence:":
+		return true
+	case strings.Contains(lower, "placeholder evidence"):
+		return true
+	case strings.HasPrefix(trimmed, "You are the "):
+		return true
+	case strings.HasPrefix(trimmed, "Task:"):
+		return true
+	case strings.HasPrefix(trimmed, "Path:"):
+		return true
+	case strings.HasPrefix(trimmed, "Next action:"):
+		return true
+	case strings.HasPrefix(trimmed, "Working agreement:"):
+		return true
+	case strings.HasPrefix(trimmed, "To:") || strings.HasPrefix(trimmed, "From:"):
+		return true
+	case strings.Contains(lower, "agents process records this verification"):
+		return true
+	case strings.Contains(lower, "recording passing verification reaches"):
+		return true
+	case strings.Contains(lower, "summarize the review in your response"):
+		return true
+	case strings.Contains(lower, "keep build caches"):
+		return true
+	case strings.Contains(lower, "do not edit implementation code"):
+		return true
+	default:
+		return false
+	}
+}
+
+func isUserFacingAgentLine(trimmed string) bool {
+	lower := strings.ToLower(trimmed)
+	switch {
+	case trimmed == "":
+		return false
+	case strings.HasPrefix(trimmed, "Issues"):
+		return true
+	case strings.HasPrefix(trimmed, "Findings"):
+		return true
+	case strings.HasPrefix(trimmed, "Verified"):
+		return true
+	case strings.HasPrefix(trimmed, "No findings"):
+		return true
+	case strings.HasPrefix(trimmed, "Review"):
+		return true
+	case strings.HasPrefix(trimmed, "Implemented"):
+		return true
+	case strings.Contains(lower, "recorded this as a finding"):
+		return true
+	default:
+		return false
+	}
+}
+
+func shouldDropLaneLine(trimmed string) bool {
+	lower := strings.ToLower(trimmed)
+	switch {
+	case trimmed == "":
+		return false
+	case trimmed == "Reading additional input from stdin...":
+		return true
+	case strings.Contains(trimmed, " WARN codex_"):
+		return true
+	case strings.Contains(trimmed, "codex_core_plugins::manifest"):
+		return true
+	case strings.Contains(trimmed, "ignoring interface.defaultPrompt[0]"):
+		return true
+	case strings.Contains(trimmed, "ignoring interface.icon_"):
+		return true
+	case strings.Contains(trimmed, "prompt must be at most 128 characters"):
+		return true
+	case strings.HasPrefix(trimmed, "path=/Users/") && strings.Contains(trimmed, "/.codex/"):
+		return true
+	case strings.Contains(trimmed, "failed to initialize MCP client during shutdown"):
+		return true
+	case strings.Contains(trimmed, "handshaking with MCP server failed"):
+		return true
+	case strings.Contains(lower, "initialize response") && strings.Contains(lower, "connection closed"):
+		return true
+	default:
+		return false
+	}
+}
+
+func looksLikeBareProgressJSON(trimmed string) bool {
+	return strings.HasPrefix(trimmed, "{") &&
+		strings.HasSuffix(trimmed, "}") &&
+		strings.Contains(trimmed, `"status"`) &&
+		strings.Contains(trimmed, `"detail"`)
+}
+
+func formatProgressLine(progress progressDirective) string {
+	status := strings.TrimSpace(progress.Status)
+	if status == "" {
+		return ""
+	}
+	detail := strings.TrimSpace(progress.Detail)
+	if detail == "" {
+		return "- " + sentenceCase(status)
+	}
+	return "- " + sentenceCase(status) + ": " + sentenceCase(singleLine(detail))
+}
+
 // visibleLines returns the lane content to render: the ring tail plus any
 // unterminated partial line.
-func (l *viewLane) visibleLines(height int) []string {
+func (l *viewLane) visibleLines(height, width int) []string {
 	lines := l.lines
 	if partial := strings.TrimRight(l.partial, "\r"); partial != "" {
 		if idx := strings.LastIndex(partial, "\r"); idx >= 0 {
 			partial = partial[idx+1:]
 		}
-		lines = append(append([]string{}, lines...), partial)
+		if l.shouldShowPartial(partial) {
+			lines = append(append([]string{}, lines...), partial)
+		}
 	}
+	lines = scrubLaneDisplayLines(lines)
+	lines = renderLaneMarkdown(lines, width)
 	if len(lines) > height {
 		lines = lines[len(lines)-height:]
 	}
 	return lines
+}
+
+func scrubLaneDisplayLines(lines []string) []string {
+	var out []string
+	skip := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case shouldDropLaneLine(trimmed):
+			continue
+		case startsRawTranscript(trimmed):
+			skip = true
+			continue
+		case skip && isUserFacingAgentLine(trimmed):
+			skip = false
+			out = append(out, line)
+		case skip:
+			continue
+		default:
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+func (l *viewLane) shouldShowPartial(partial string) bool {
+	trimmed := strings.TrimSpace(partial)
+	if shouldDropLaneLine(trimmed) || startsRawTranscript(trimmed) {
+		return false
+	}
+	if l.skipRaw && !isUserFacingAgentLine(trimmed) && !looksLikeBareProgressJSON(trimmed) {
+		return false
+	}
+	return true
+}
+
+func renderLaneMarkdown(lines []string, width int) []string {
+	text := strings.TrimRight(strings.Join(lines, "\n"), "\n")
+	if text == "" || !looksLikeMarkdown(text) {
+		return lines
+	}
+	rendered, err := renderTerminalMarkdown(text, width)
+	if err != nil {
+		return lines
+	}
+	rendered = ansiEscapes.ReplaceAllString(rendered, "")
+	rendered = strings.TrimRight(rendered, "\n")
+	if rendered == "" {
+		return nil
+	}
+	return cleanRenderedLaneMarkdown(scrubLaneDisplayLines(strings.Split(rendered, "\n")))
+}
+
+func looksLikeMarkdown(text string) bool {
+	for _, line := range strings.Split(text, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, "- ") || strings.HasPrefix(trimmed, "* ") || strings.HasPrefix(trimmed, "> ") || strings.HasPrefix(trimmed, "```") {
+			return true
+		}
+		if strings.Contains(trimmed, "|") && strings.Count(trimmed, "|") >= 2 {
+			return true
+		}
+	}
+	return false
+}
+
+func cleanRenderedLaneMarkdown(lines []string) []string {
+	cleaned := make([]string, 0, len(lines))
+	for _, line := range lines {
+		prefixLen := len(line) - len(strings.TrimLeft(line, " "))
+		prefix := line[:prefixLen]
+		trimmed := line[prefixLen:]
+		if strings.HasPrefix(trimmed, "#") {
+			markers := 0
+			for markers < len(trimmed) && trimmed[markers] == '#' {
+				markers++
+			}
+			if markers < len(trimmed) && trimmed[markers] == ' ' {
+				trimmed = strings.TrimLeft(trimmed[markers+1:], " ")
+				line = prefix + trimmed
+			}
+		}
+		cleaned = append(cleaned, line)
+	}
+	return cleaned
 }
 
 // loopView consumes loopEvents and renders frames. It is pure with respect
@@ -257,8 +520,8 @@ func (v *loopView) frame(width, height int) []string {
 
 	lines := make([]string, 0, height)
 	lines = append(lines, "┌"+laneTitle(v.laneHeading(&v.build), leftWidth)+"┬"+laneTitle(v.laneHeading(&v.check), rightWidth)+"┐")
-	left := v.build.visibleLines(laneHeight - 1)
-	right := v.check.visibleLines(laneHeight - 1)
+	left := v.build.visibleLines(laneHeight-1, leftWidth-2)
+	right := v.check.visibleLines(laneHeight-1, rightWidth-2)
 	leftStatus := padCell(" "+v.laneStatus(&v.build), leftWidth)
 	rightStatus := padCell(" "+v.laneStatus(&v.check), rightWidth)
 	lines = append(lines, "│"+leftStatus+"│"+rightStatus+"│")
@@ -288,6 +551,9 @@ func (v *loopView) laneStatus(lane *viewLane) string {
 
 func (v *loopView) statusLine() string {
 	if v.stopped != nil {
+		if v.notice != "" {
+			return v.notice
+		}
 		return translateStop(v.stopped.Reason, v.runs, v.stopped.State)
 	}
 	active := "starting"
@@ -375,7 +641,7 @@ func loopViewTerminals(in io.Reader, out io.Writer) (*os.File, *os.File, bool) {
 // buffer so the ending survives in scrollback; at the human boundary the
 // summary is the Ready-for-you screen with one decision — accept, iterate,
 // or abandon.
-func runLoopWithView(in, out *os.File, errOut io.Writer, e env, taskTitle string, maxRuns int) int {
+func runLoopWithView(in, out *os.File, errOut io.Writer, e env, taskTitle string, maxRuns int, forceFirstRole string) int {
 	fd := int(in.Fd())
 	oldState, err := term.MakeRaw(fd)
 	if err != nil {
@@ -414,7 +680,8 @@ func runLoopWithView(in, out *os.File, errOut io.Writer, e env, taskTitle string
 	// Each pass runs the loop inside the split view; iterate from the ready
 	// screen records the feedback handoff and re-enters the loop.
 	for {
-		result := watchLoopInView(out, e, taskTitle, maxRuns, keys, interrupts)
+		result := watchLoopInView(out, e, taskTitle, maxRuns, forceFirstRole, keys, interrupts)
+		forceFirstRole = ""
 		if result.err != nil || result.stop.Reason != "human" {
 			restore()
 			return printLoopViewEnding(out, errOut, e, result)
@@ -447,7 +714,7 @@ func runLoopWithView(in, out *os.File, errOut io.Writer, e env, taskTitle string
 
 // watchLoopInView runs one managed-loop pass while rendering the view and
 // handling keys, returning the loop result when it stops.
-func watchLoopInView(out *os.File, e env, taskTitle string, maxRuns int, keys <-chan byte, interrupts <-chan os.Signal) loopResult {
+func watchLoopInView(out *os.File, e env, taskTitle string, maxRuns int, forceFirstRole string, keys <-chan byte, interrupts <-chan os.Signal) loopResult {
 	fmt.Fprint(out, "\x1b[?1049h\x1b[?25l")
 	view := newLoopView(taskTitle, maxRuns)
 	control := &loopControl{}
@@ -457,7 +724,7 @@ func watchLoopInView(out *os.File, e env, taskTitle string, maxRuns int, keys <-
 	go func() {
 		stop, loopErr := runManagedLoop(e, io.Discard, maxRuns, false, func(ev loopEvent) {
 			events <- ev
-		}, control, loopDisplayPlain)
+		}, control, loopDisplayView, forceFirstRole)
 		loopDone <- loopResult{stop: stop, err: loopErr}
 	}()
 
@@ -531,9 +798,23 @@ func watchLoopInView(out *os.File, e env, taskTitle string, maxRuns int, keys <-
 				break
 			}
 			draw()
+			if result.err == nil && result.stop.Reason == "human" {
+				view.notice = "review complete — press enter or space for the inspection summary"
+				draw()
+				waitForReadySummary(keys)
+			}
 			return result
 		}
 		draw()
+	}
+}
+
+func waitForReadySummary(keys <-chan byte) {
+	for key := range keys {
+		switch key {
+		case '\r', '\n', ' ':
+			return
+		}
 	}
 }
 

@@ -1,9 +1,9 @@
 package app
 
 // The "Ready for you" screen: when the loop reaches the human boundary, the
-// view flips to a plain-language summary — what was asked, what changed,
-// what was found, what evidence exists — and one decision: accept, iterate,
-// or abandon.
+// view flips to a plain-language inspection summary — what was asked, what
+// changed, what was found, what evidence exists — and waits for one decision:
+// accept, iterate, or abandon.
 
 import (
 	"fmt"
@@ -171,7 +171,7 @@ func readySummaryLines(summary readySummary) []string {
 		"Ready for you — " + summary.TaskTitle,
 		strings.Repeat("─", 60),
 		"",
-		fmt.Sprintf("Done and independently checked after %d runs.", summary.Runs),
+		fmt.Sprintf("Paused for your inspection after %d runs.", summary.Runs),
 		"",
 		"What was asked:",
 	}
@@ -200,7 +200,7 @@ func readySummaryLines(summary readySummary) []string {
 		"",
 		"Your call:",
 		"  [a] accept — archive the task and get a suggested commit message",
-		"  [i] iterate — tell the agents what to change and run another round",
+		"  [i] iterate — tell the implementer what to change and run another round",
 		"  [x] abandon — leave everything as is",
 		"",
 	)
@@ -251,6 +251,7 @@ func runReadyScreen(out io.Writer, keys <-chan byte, summary readySummary) (read
 	for key := range keys {
 		switch key {
 		case 'a', 'A':
+			writeRawLines(out, []string{"", "Accepted — archiving the task..."})
 			return readyAccept, ""
 		case 'i', 'I':
 			fmt.Fprint(out, "What should change? › ")
@@ -259,10 +260,13 @@ func runReadyScreen(out io.Writer, keys <-chan byte, summary readySummary) (read
 				writeRawLines(out, []string{"(nothing entered — still your call: [a]ccept [i]terate [x] abandon)"})
 				continue
 			}
+			writeRawLines(out, []string{"Sent — routing your feedback to the implementer..."})
 			return readyIterate, strings.TrimSpace(feedback)
 		case 'x', 'X', 'q', 'Q':
+			writeRawLines(out, []string{"", "Abandoned — leaving the task active."})
 			return readyAbandon, ""
 		case 3: // Ctrl-C
+			writeRawLines(out, []string{"", "Cancelled — leaving the task active."})
 			return readyAbandon, ""
 		}
 	}

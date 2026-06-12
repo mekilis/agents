@@ -1286,6 +1286,82 @@ func TestCleanInteractiveAgentReplyExtractsTokenUsage(t *testing.T) {
 	}
 }
 
+func TestPrintInteractiveRoleRunResultFallsBackToTaskProgress(t *testing.T) {
+	var out bytes.Buffer
+	result := roleRunResult{
+		Role:        "implementer",
+		Agent:       "agent",
+		AgentOutput: "fixed finding: tasks/example/findings/cache.md\nhandoff to: reviewer\npath: tasks/example/handoffs/reviewer.md\nToken usage: input=7 output=3 cache_read=11",
+		Before: loopState{NextRole: "implementer", Stats: taskStats{
+			Handoffs:     3,
+			FindingsOpen: 4,
+		}},
+		After: loopState{NextRole: "reviewer", Stats: taskStats{
+			Handoffs:        4,
+			LatestHandoffTo: "reviewer",
+			FindingsOpen:    0,
+			FindingsFixed:   4,
+		}},
+	}
+	printInteractiveRoleRunResult(&out, result)
+	got := ansiEscapes.ReplaceAllString(out.String(), "")
+	for _, want := range []string{
+		"Handoff recorded for reviewer.",
+		"Finding fixed (4 fixed).",
+		"Usage: input=7 output=3 cache_read=11",
+		"Next: Reviewer",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("interactive result missing %q, got:\n%s", want, got)
+		}
+	}
+}
+
+func TestPrintInteractiveRoleHeaderUsesMarkdownHeading(t *testing.T) {
+	var out bytes.Buffer
+	printInteractiveRoleHeader(&out, "reviewer")
+	got := ansiEscapes.ReplaceAllString(out.String(), "")
+	if !strings.Contains(got, "Reviewer") {
+		t.Fatalf("role header missing title:\n%s", got)
+	}
+	if strings.Contains(got, "--------") {
+		t.Fatalf("role header should not use underline fallback:\n%s", got)
+	}
+}
+
+func TestPrintLoopStateOmitsStaleTaskNextAtHumanBoundary(t *testing.T) {
+	var out bytes.Buffer
+	printLoopState(&out, loopState{
+		Task: activeTask{
+			Title: "Tiny habits CLI",
+			Path:  "tasks/2026-06-12-001-tiny-habits-cli",
+		},
+		Stats: taskStats{
+			Next:             "Reviewer should verify the cache artifacts are gone.",
+			FindingsVerified: 4,
+			Handoffs:         19,
+			Verification:     2,
+		},
+		NextRole:   "human",
+		NextAction: "approve archive, commit, or next task",
+		Boundary:   "human approval required",
+	})
+	got := out.String()
+	for _, want := range []string{
+		"next role: human",
+		"next action: approve archive, commit, or next task",
+		"boundary: human approval required",
+		"findings: open=0 fixed=0 verified=4",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("loop state missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "Reviewer should verify") {
+		t.Fatalf("human boundary should not show stale task next:\n%s", got)
+	}
+}
+
 func TestRenderTerminalMarkdownFormatsMarkdown(t *testing.T) {
 	rendered, err := renderTerminalMarkdown("## What it does\n\n- **Task** routing\n\n| Concept | What it is |\n| --- | --- |\n| Task | Scoped work |\n", 80)
 	if err != nil {
@@ -1355,6 +1431,60 @@ func TestProgressWriterSuppressesProviderOutput(t *testing.T) {
 	}
 	if strings.Contains(out.String(), "raw provider transcript") {
 		t.Fatalf("progress writer should not echo provider output, got %q", out.String())
+	}
+}
+
+func TestProgressWriterDedupesSuccessiveProgress(t *testing.T) {
+	var out bytes.Buffer
+	writer := newProgressWriter(&out, "coordinator is thinking")
+	block := strings.Join([]string{
+		"```agents-progress",
+		`{"status":"Routing to implementer","detail":"Main CLI work is complete; implementer should fix open cache-file findings before final review"}`,
+		"```",
+		"```agents-progress",
+		`{"status":"Routing to implementer","detail":"Main CLI work is complete; implementer should fix open cache-file findings before final review"}`,
+		"```",
+		"```agents-progress",
+		`{"status":"Checking context","detail":"Reading the latest task state"}`,
+		"```",
+		"```agents-progress",
+		`{"status":"Routing to implementer","detail":"Main CLI work is complete; implementer should fix open cache-file findings before final review"}`,
+		"```",
+		"",
+	}, "\n")
+	if _, err := writer.Write([]byte(block)); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	if count := strings.Count(got, "Routing to implementer"); count != 2 {
+		t.Fatalf("expected only successive duplicate progress to be suppressed, count=%d output=%q", count, got)
+	}
+}
+
+func TestInteractiveRunHeaderWriterDedupesSuccessiveProgress(t *testing.T) {
+	var out bytes.Buffer
+	writer := interactiveRunHeaderWriter{out: &out}
+	block := strings.Join([]string{
+		"```agents-progress",
+		`{"status":"Running checks","detail":"Executing focused tests"}`,
+		"```",
+		"```agents-progress",
+		`{"status":"Running checks","detail":"Executing focused tests"}`,
+		"```",
+		"```agents-progress",
+		`{"status":"Reviewing files","detail":"Reading implementation"}`,
+		"```",
+		"```agents-progress",
+		`{"status":"Running checks","detail":"Executing focused tests"}`,
+		"```",
+		"",
+	}, "\n")
+	if _, err := writer.Write([]byte(block)); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	if count := strings.Count(got, "Running checks"); count != 2 {
+		t.Fatalf("expected only successive duplicate progress to be suppressed, count=%d output=%q", count, got)
 	}
 }
 
@@ -1787,6 +1917,59 @@ func TestInteractiveTTYChatRunsCoordinatorResponse(t *testing.T) {
 		if strings.Contains(got, unwanted) {
 			t.Fatalf("interactive coordinator response should hide %q, got:\n%s", unwanted, got)
 		}
+	}
+}
+
+func TestInteractiveTTYChatRunsCoordinatorWithOpenFindings(t *testing.T) {
+	var out bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{
+			cwd:       cwd,
+			home:      home,
+			isTTY:     true,
+			trustPath: filepath.Join(home, ".agents", "trust.json"),
+		}
+		if _, err := trustWorkspace(e); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := initWorkspace(e, "share"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := openTask(e, []string{"Tiny Habits CLI"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addFinding(e, []string{"cache files remain", "--by", "reviewer"}, time.Date(2026, 6, 5, 10, 1, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		script := filepath.Join(cwd, "coordinator.sh")
+		body := "#!/bin/sh\nset -eu\nprintf 'You are in the active Tiny Habits task; next implementation should fix open findings.\\n'\n"
+		if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cfg := "roles:\n  implementer: agent\n  reviewer: codex\n  coordinator: " + script + " {prompt_file}\n"
+		if err := os.WriteFile(filepath.Join(cwd, ".agents", "config.yml"), []byte(cfg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := recordCoordinatorChat(e, "where am i", &out); err != nil {
+			t.Fatal(err)
+		}
+		if err := runCoordinatorChatResponse(e, &out); err != nil {
+			t.Fatal(err)
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+	got := out.String()
+	if !strings.Contains(got, "You are in the active Tiny Habits task") {
+		t.Fatalf("coordinator should answer even with open findings, got:\n%s", got)
+	}
+	if strings.Contains(got, "next role: implementer") {
+		t.Fatalf("chat should not be replaced by loop state, got:\n%s", got)
+	}
+	if strings.Contains(got, "Ready for Implementer") {
+		t.Fatalf("chat answer should not print a ready cue without an actionable handoff, got:\n%s", got)
 	}
 }
 
@@ -2427,6 +2610,32 @@ func TestRunRoutesOpenFindingsToImplementer(t *testing.T) {
 	}
 }
 
+func TestReviewerFindingRoutesNextRoleToImplementer(t *testing.T) {
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Review Finds Issue"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addHandoff(e, []string{"--to", "reviewer", "Please review the implementation", "--by", "implementer"}, time.Date(2026, 6, 5, 10, 1, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addFinding(e, []string{"smoke command shadows a read-only shell variable", "--severity", "medium", "--by", "reviewer"}, time.Date(2026, 6, 5, 10, 2, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		state, err := analyzeLoopState(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state.NextRole != "implementer" || state.NextAction != "fix open findings" {
+			t.Fatalf("reviewer finding should route back to implementer, got %+v", state)
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
 func TestRunJSONRoutesOpenFindingsToImplementer(t *testing.T) {
 	var out, errOut bytes.Buffer
 	code := withTempProcessEnv(t, func(home, cwd string) int {
@@ -2569,6 +2778,190 @@ func TestRunRoutesHandoffToReviewerToReviewer(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "next role: reviewer") || !strings.Contains(out.String(), "review latest handoff") {
 		t.Fatalf("unexpected run output:\n%s", out.String())
+	}
+}
+
+func TestGoContinueUsesActiveTaskAndCurrentNextRole(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := trustWorkspace(e); err != nil {
+			t.Fatal(err)
+		}
+		task, err := openTask(e, []string{"Tiny Habits CLI"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addHandoff(e, []string{"--to", "reviewer", "Ready for review."}, time.Date(2026, 6, 5, 10, 1, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		verificationPath := filepath.Join(".agents", task.Path, "verification", "2099-01-01T000000Z-review.md")
+		reviewer := filepath.Join(cwd, "reviewer.sh")
+		reviewerBody := strings.Join([]string{
+			"#!/bin/sh",
+			"set -eu",
+			"mkdir -p " + shellQuote(filepath.Dir(verificationPath)),
+			"cat > " + shellQuote(verificationPath) + " <<'EOF'",
+			"# Verification: review",
+			"",
+			"Result: pass",
+			"By: reviewer",
+			"",
+			"Review passed.",
+			"EOF",
+			"",
+		}, "\n")
+		if err := os.WriteFile(reviewer, []byte(reviewerBody), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cfg := "roles:\n  implementer: agent\n  reviewer: " + reviewer + " {prompt_file}\n  coordinator: codex\n"
+		if err := os.WriteFile(filepath.Join(cwd, ".agents", "config.yml"), []byte(cfg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		code := Run([]string{"go", "--continue", "--plain", "--max-iterations", "2", "Review the implemented habit tracker."}, bytes.NewBuffer(nil), &out, &errOut)
+		entries, err := os.ReadDir(filepath.Join(cwd, ".agents", "tasks"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) != 1 {
+			t.Fatalf("go --continue should not open a new task, got %d tasks", len(entries))
+		}
+		return code
+	})
+	if code != 0 {
+		t.Fatalf("Run go --continue code=%d stderr=%s stdout=%s", code, errOut.String(), out.String())
+	}
+	got := out.String()
+	for _, want := range []string{
+		"task: Tiny Habits CLI",
+		"running reviewer...",
+		"human approval required",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("go --continue output missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "task: Review the implemented habit tracker.") {
+		t.Fatalf("go --continue opened a task from continuation text:\n%s", got)
+	}
+}
+
+func TestGoReviewerFlagUsesActiveTaskAndRoutesToReviewer(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := trustWorkspace(e); err != nil {
+			t.Fatal(err)
+		}
+		task, err := openTask(e, []string{"Tiny Habits CLI"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addHandoff(e, []string{"--to", "implementer", "Build the tiny habits CLI."}, time.Date(2026, 6, 5, 10, 1, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		verificationPath := filepath.Join(".agents", task.Path, "verification", "2099-01-01T000000Z-review.md")
+		reviewer := filepath.Join(cwd, "reviewer.sh")
+		reviewerBody := strings.Join([]string{
+			"#!/bin/sh",
+			"set -eu",
+			"mkdir -p " + shellQuote(filepath.Dir(verificationPath)),
+			"cat > " + shellQuote(verificationPath) + " <<'EOF'",
+			"# Verification: review",
+			"",
+			"Result: pass",
+			"By: reviewer",
+			"",
+			"Review passed.",
+			"EOF",
+			"",
+		}, "\n")
+		if err := os.WriteFile(reviewer, []byte(reviewerBody), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cfg := "roles:\n  implementer: agent\n  reviewer: " + reviewer + " {prompt_file}\n  coordinator: codex\n"
+		if err := os.WriteFile(filepath.Join(cwd, ".agents", "config.yml"), []byte(cfg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		code := Run([]string{"go", "--reviewer", "--plain", "--max-iterations", "2", "Review the latest Tiny Habits changes."}, bytes.NewBuffer(nil), &out, &errOut)
+		entries, err := os.ReadDir(filepath.Join(cwd, ".agents", "tasks"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) != 1 {
+			t.Fatalf("go --reviewer should not open a new task, got %d tasks", len(entries))
+		}
+		return code
+	})
+	if code != 0 {
+		t.Fatalf("Run go --reviewer code=%d stderr=%s stdout=%s", code, errOut.String(), out.String())
+	}
+	got := out.String()
+	for _, want := range []string{
+		"task: Tiny Habits CLI",
+		"running reviewer...",
+		"human approval required",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("go --reviewer output missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "running implementer...") {
+		t.Fatalf("go --reviewer should route directly to reviewer:\n%s", got)
+	}
+}
+
+func TestGoReviewerFlagRunsReviewerEvenWithOpenFindings(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := trustWorkspace(e); err != nil {
+			t.Fatal(err)
+		}
+		task, err := openTask(e, []string{"Tiny Habits CLI"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addFinding(e, []string{"existing review issue", "--severity", "medium", "--by", "reviewer"}, time.Date(2026, 6, 5, 10, 1, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		reviewer := filepath.Join(cwd, "reviewer.sh")
+		reviewerBody := strings.Join([]string{
+			"#!/bin/sh",
+			"set -eu",
+			"task_dir=" + shellQuote(filepath.Join(".agents", task.Path)),
+			"mkdir -p \"$task_dir/handoffs\"",
+			"cat > \"$task_dir/handoffs/2099-01-01T000000Z-handoff-to-implementer.md\" <<'EOF'",
+			"# Handoff: implementer",
+			"",
+			"To: implementer",
+			"From: reviewer",
+			"",
+			"Open finding still needs implementation.",
+			"EOF",
+			"",
+		}, "\n")
+		if err := os.WriteFile(reviewer, []byte(reviewerBody), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cfg := "roles:\n  implementer: agent\n  reviewer: " + reviewer + " {prompt_file}\n  coordinator: codex\n"
+		if err := os.WriteFile(filepath.Join(cwd, ".agents", "config.yml"), []byte(cfg), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return Run([]string{"go", "--reviewer", "--plain", "--max-iterations", "1", "Review the latest Tiny Habits changes."}, bytes.NewBuffer(nil), &out, &errOut)
+	})
+	if code != 1 {
+		t.Fatalf("expected max-iterations exit after forced reviewer, code=%d stderr=%s stdout=%s", code, errOut.String(), out.String())
+	}
+	got := out.String()
+	if !strings.Contains(got, "running reviewer...") {
+		t.Fatalf("go --reviewer should force reviewer before open-finding routing:\n%s", got)
+	}
+	if strings.Contains(got, "running implementer...") {
+		t.Fatalf("go --reviewer --max-iterations 1 should not start implementer:\n%s", got)
+	}
+	if !strings.Contains(got, "next role: implementer") {
+		t.Fatalf("after reviewer, open finding should route to implementer:\n%s", got)
 	}
 }
 
@@ -2877,6 +3270,35 @@ func TestCursorStreamWriterRendersProgressAndToolSummaries(t *testing.T) {
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("live stream missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestCursorStreamWriterFiltersSplitProgressBlocks(t *testing.T) {
+	var out, log, live strings.Builder
+	writer := &cursorStreamWriter{output: &out, log: &log, live: &live}
+	chunks := []string{
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"` + "```agents-pro" + `"}]},"timestamp_ms":1}` + "\n",
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"` + "gress\\n{\\\"status\\\":\\\"gathering context\\\",\\\"detail\\\":\\\"reading task\\\"}\\n```\\n" + `"}]},"timestamp_ms":2}` + "\n",
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"Visible update"}]},"timestamp_ms":3}` + "\n",
+	}
+	for _, chunk := range chunks {
+		if _, err := writer.Write([]byte(chunk)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := live.String()
+	for _, want := range []string{
+		"- Gathering context: Reading task",
+		"Visible update",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("live stream missing %q:\n%s", want, got)
+		}
+	}
+	for _, hidden := range []string{"```agents-progress", `"status":"gathering context"`} {
+		if strings.Contains(got, hidden) {
+			t.Fatalf("live stream leaked %q:\n%s", hidden, got)
 		}
 	}
 }

@@ -69,9 +69,126 @@ func TestViewLaneChunksHandlePartialsSpinnersAndANSI(t *testing.T) {
 	if len(lane.lines) != laneRingCapacity {
 		t.Fatalf("ring exceeded capacity: %d", len(lane.lines))
 	}
-	visible := lane.visibleLines(5)
+	visible := lane.visibleLines(5, 40)
 	if len(visible) != 5 {
 		t.Fatalf("expected 5 visible lines, got %d", len(visible))
+	}
+}
+
+func TestViewLaneRendersMarkdownForSplitView(t *testing.T) {
+	var lane viewLane
+	lane.appendChunk("## Status\n\n- **Task** routing\n\n")
+	visible := lane.visibleLines(10, 60)
+	text := strings.Join(visible, "\n")
+	for _, want := range []string{"Status", "Task routing"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("rendered lane markdown missing %q:\n%s", want, text)
+		}
+	}
+	for _, raw := range []string{"## Status", "**Task**"} {
+		if strings.Contains(text, raw) {
+			t.Fatalf("lane should render markdown instead of showing raw %q:\n%s", raw, text)
+		}
+	}
+}
+
+func TestViewLaneCleansProgressJSON(t *testing.T) {
+	var lane viewLane
+	lane.appendChunk("codex\n")
+	lane.appendChunk(`{"status":"Running checks","detail":"Executing the unit suite"}` + "\n")
+	lane.appendChunk("```agents-progress\n")
+	lane.appendChunk(`{"status":"Reviewing diff","detail":"Checking files"}` + "\n")
+	lane.appendChunk("```\n")
+	text := strings.Join(lane.visibleLines(10, 80), "\n")
+	for _, want := range []string{
+		"codex",
+		"Running checks: Executing the unit suite",
+		"Reviewing diff: Checking files",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("cleaned progress missing %q:\n%s", want, text)
+		}
+	}
+	for _, leaked := range []string{`"status"`, "```agents-progress"} {
+		if strings.Contains(text, leaked) {
+			t.Fatalf("progress protocol leaked %q:\n%s", leaked, text)
+		}
+	}
+}
+
+func TestViewLaneDropsProviderStartupNoise(t *testing.T) {
+	var lane viewLane
+	lane.appendChunk("Reading additional input from stdin...\n")
+	lane.appendChunk("2026-06-12T10:53:08Z  WARN codex_core_plugins::manifest: ignoring interface.defaultPrompt[0]: prompt must be at most 128 characters path=/Users/smart/.codex/.tmp/plugins/example/.codex-plugin/plugin.json\n")
+	lane.appendChunk("failed to initialize MCP client during shutdown: MCP startup failed: handshaking with MCP server failed: connection closed: initialize response\n")
+	lane.appendChunk("Useful review line\n")
+	text := strings.Join(lane.visibleLines(10, 80), "\n")
+	if !strings.Contains(text, "Useful review line") {
+		t.Fatalf("expected useful line to remain:\n%s", text)
+	}
+	for _, leaked := range []string{"Reading additional input", "codex_core_plugins", "defaultPrompt", "MCP client"} {
+		if strings.Contains(text, leaked) {
+			t.Fatalf("provider startup noise leaked %q:\n%s", leaked, text)
+		}
+	}
+}
+
+func TestViewLaneSkipsCodexPromptAndToolTranscript(t *testing.T) {
+	var lane viewLane
+	lane.appendChunk("OpenAI Codex v0.137.0\n")
+	lane.appendChunk("workdir: /Users/smart/demos/tiny-habits\n")
+	lane.appendChunk("You are the reviewer for this Agents task.\n")
+	lane.appendChunk("Working agreement:\n")
+	lane.appendChunk("- Do not edit implementation code, do not mark findings fixed, and do not commit.\n")
+	lane.appendChunk("exec /bin/zsh -lc \"sed -n '241,360p' tiny_habits.py\" in /Users/smart/demos/tiny-habits succeeded in 0ms:\n")
+	lane.appendChunk("def main(argv: list[str] | None = None) -> int:\n")
+	lane.appendChunk("    return args.func(args)\n")
+	lane.appendChunk("Verified:\n")
+	lane.appendChunk("- Reviewed tiny_habits.py and tests.\n")
+	text := strings.Join(lane.visibleLines(20, 80), "\n")
+	if !strings.Contains(text, "Verified") || !strings.Contains(text, "Reviewed tiny_habits.py") {
+		t.Fatalf("expected final review text to remain:\n%s", text)
+	}
+	for _, leaked := range []string{"OpenAI Codex", "Working agreement", "exec /bin/zsh", "def main", "return args.func"} {
+		if strings.Contains(text, leaked) {
+			t.Fatalf("raw transcript leaked %q:\n%s", leaked, text)
+		}
+	}
+}
+
+func TestViewLaneSkipsRawTranscriptPartial(t *testing.T) {
+	var lane viewLane
+	lane.appendChunk("exec /bin/zsh -lc 'git status --short' in /Users/smart/demos/tiny-habits")
+	text := strings.Join(lane.visibleLines(20, 80), "\n")
+	if strings.Contains(text, "exec /bin/zsh") || strings.Contains(text, "git status") {
+		t.Fatalf("raw partial transcript leaked:\n%s", text)
+	}
+	lane.appendChunk("\nVerified:")
+	text = strings.Join(lane.visibleLines(20, 80), "\n")
+	if !strings.Contains(text, "Verified") {
+		t.Fatalf("expected user-facing partial to show:\n%s", text)
+	}
+}
+
+func TestViewLaneScrubsStoredTranscriptLines(t *testing.T) {
+	lane := viewLane{lines: []string{
+		"Useful before",
+		"exec /bin/zsh -lc 'git status --short' in /Users/smart/demos/tiny-habits exited 128 in 0ms:",
+		"fatal: not a git repository",
+		"test_tiny_habits.py",
+		"Verified:",
+		"- Tests passed.",
+	}}
+	text := strings.Join(lane.visibleLines(20, 80), "\n")
+	for _, want := range []string{"Useful before", "Verified", "Tests passed"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("scrubbed lane missing %q:\n%s", want, text)
+		}
+	}
+	for _, leaked := range []string{"exec /bin/zsh", "fatal: not a git repository", "test_tiny_habits.py"} {
+		if strings.Contains(text, leaked) {
+			t.Fatalf("stored transcript leaked %q:\n%s", leaked, text)
+		}
 	}
 }
 
@@ -200,7 +317,7 @@ func TestLoopControlStopsBetweenRuns(t *testing.T) {
 		var events []loopEvent
 		stop, err := runManagedLoop(e, discardWriter{}, 6, false, func(ev loopEvent) {
 			events = append(events, ev)
-		}, control, loopDisplayPlain)
+		}, control, loopDisplayPlain, "")
 		if err != nil {
 			t.Fatal(err)
 		}

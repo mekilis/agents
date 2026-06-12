@@ -145,8 +145,13 @@ func TestGoUnifiedViewUnderPTY(t *testing.T) {
 		t.Fatalf("timed out waiting for %q in PTY output:\n%s", marker, snapshot())
 	}
 
-	// The loop runs to the human boundary, then the view flips to the
-	// Ready-for-you screen; accept archives and suggests a commit message.
+	// The loop runs to the human boundary, pauses in the split view for
+	// inspection, then flips to the Ready-for-you screen; accept archives
+	// and suggests a commit message.
+	waitFor("press enter or space for the inspection summary")
+	if _, err := io.WriteString(ptmx, "\r"); err != nil {
+		t.Fatal(err)
+	}
 	waitFor("Your call:")
 	if _, err := io.WriteString(ptmx, "a"); err != nil {
 		t.Fatal(err)
@@ -173,6 +178,7 @@ func TestGoUnifiedViewUnderPTY(t *testing.T) {
 		"editing main.go",                  // live implementer output
 		"checking diff",                    // live reviewer output
 		"Ready for you — History",          // boundary screen
+		"press enter or space",             // inspect pause before summary
 		"support /history in the terminal", // scope section
 		"Verification evidence:",           // evidence section
 		"archived task: History",           // accept archived

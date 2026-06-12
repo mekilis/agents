@@ -560,6 +560,7 @@ func printHelp(w io.Writer) {
 	fmt.Fprintln(w, "  agents trust [--json]")
 	fmt.Fprintln(w, "  agents init [--share|--local]")
 	fmt.Fprintln(w, "  agents go \"what you want\" [--ref REF] [--max-iterations N] [--plain]")
+	fmt.Fprintln(w, "  agents go --continue|--implementer|--reviewer [\"follow-up\"] [--max-iterations N] [--plain]")
 	fmt.Fprintln(w, "  agents start \"title\" [--ref REF] \"what to do\"")
 	fmt.Fprintln(w, "  agents status [--json]")
 	fmt.Fprintln(w, "  agents task open \"title\" [--ref REF]")
@@ -1225,10 +1226,17 @@ func runCoordinatorChatResponse(e env, out io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if state.NextRole != "coordinator" {
-		printLoopState(out, state)
-		return nil
+	routeRole := state.NextRole
+	routeAction := state.NextAction
+	state.NextRole = "coordinator"
+	state.NextAction = "answer latest coordinator chat"
+	if routeRole != "" {
+		state.NextAction += "; current loop route is " + routeRole
+		if routeAction != "" {
+			state.NextAction += " to " + routeAction
+		}
 	}
+	state.Boundary = ""
 	agent, err := configuredAgent(e.cwd, state.NextRole)
 	if err != nil {
 		return err
@@ -1246,6 +1254,9 @@ func runCoordinatorChatResponse(e env, out io.Writer) error {
 		return err
 	}
 	reply := cleanInteractiveAgentReply(result.Agent, result.AgentOutput)
+	readyCue := result.After.Stats.LatestHandoffTo == "implementer" &&
+		result.After.Stats.LatestHandoffName != "" &&
+		result.After.Stats.LatestHandoffName != result.Before.Stats.LatestHandoffName
 	directive, directiveOK := parseCoordinatorDirective(reply.Text)
 	if directiveOK {
 		allowDirective := coordinatorDirectiveActionable("coordinator", directive)
@@ -1253,6 +1264,7 @@ func runCoordinatorChatResponse(e env, out io.Writer) error {
 			if err := applyCoordinatorDirective(e, "coordinator", directive); err != nil {
 				return err
 			}
+			readyCue = true
 		}
 		reply.Text = removeCoordinatorDirective(reply.Text)
 		if allowDirective {
@@ -1270,7 +1282,9 @@ func runCoordinatorChatResponse(e env, out io.Writer) error {
 	if reply.Usage != "" {
 		fmt.Fprintf(out, "Usage: %s\n", reply.Usage)
 	}
-	printInteractiveReadyCue(out, result)
+	if readyCue {
+		printInteractiveReadyCue(out, result)
+	}
 	return nil
 }
 
@@ -1458,16 +1472,17 @@ func coordinatorDirectivePlaceholder(directive coordinatorDirective) bool {
 }
 
 type progressWriter struct {
-	out       io.Writer
-	label     string
-	stop      chan struct{}
-	done      chan struct{}
-	once      sync.Once
-	mu        sync.Mutex
-	started   bool
-	pending   string
-	inBlock   bool
-	blockLine []string
+	out          io.Writer
+	label        string
+	stop         chan struct{}
+	done         chan struct{}
+	once         sync.Once
+	mu           sync.Mutex
+	started      bool
+	pending      string
+	inBlock      bool
+	blockLine    []string
+	lastProgress string
 }
 
 func newProgressWriter(out io.Writer, label string) *progressWriter {
@@ -1534,8 +1549,10 @@ func (w *progressWriter) handleLine(line string) {
 	if w.inBlock {
 		if trimmed == "```" {
 			if progress, ok := parseProgressDirectiveLines(w.blockLine); ok {
-				fmt.Fprint(w.out, "\r\033[2K")
-				printInteractiveProgress(w.out, progress)
+				if w.printProgress(progress) {
+					fmt.Fprint(w.out, "\r\033[2K")
+					printInteractiveProgress(w.out, progress)
+				}
 			}
 			w.inBlock = false
 			w.blockLine = nil
@@ -1553,6 +1570,18 @@ func (w *progressWriter) handleLine(line string) {
 	}
 }
 
+func (w *progressWriter) printProgress(progress progressDirective) bool {
+	line := formatProgressLine(progress)
+	if line == "" {
+		return false
+	}
+	if w.lastProgress == line {
+		return false
+	}
+	w.lastProgress = line
+	return true
+}
+
 func printInteractiveReadyCue(out io.Writer, result roleRunResult) {
 	if result.After.NextRole == "" || result.After.NextRole == result.Before.NextRole {
 		return
@@ -1561,10 +1590,11 @@ func printInteractiveReadyCue(out io.Writer, result roleRunResult) {
 }
 
 type interactiveRunHeaderWriter struct {
-	out       io.Writer
-	pending   string
-	inBlock   bool
-	blockLine []string
+	out          io.Writer
+	pending      string
+	inBlock      bool
+	blockLine    []string
+	lastProgress string
 }
 
 func (w *interactiveRunHeaderWriter) Write(p []byte) (int, error) {
@@ -1585,7 +1615,7 @@ func (w *interactiveRunHeaderWriter) handleLine(line string) {
 	if w.inBlock {
 		if trimmed == "```" {
 			if progress, ok := parseProgressDirectiveLines(w.blockLine); ok {
-				printInteractiveProgress(w.out, progress)
+				w.printProgress(progress)
 			}
 			w.inBlock = false
 			w.blockLine = nil
@@ -1603,6 +1633,18 @@ func (w *interactiveRunHeaderWriter) handleLine(line string) {
 		w.inBlock = true
 		w.blockLine = nil
 	}
+}
+
+func (w *interactiveRunHeaderWriter) printProgress(progress progressDirective) {
+	line := formatProgressLine(progress)
+	if line == "" {
+		return
+	}
+	if w.lastProgress == line {
+		return
+	}
+	w.lastProgress = line
+	fmt.Fprintln(w.out, line)
 }
 
 type progressDirective struct {
@@ -1625,16 +1667,11 @@ func parseProgressDirectiveLines(lines []string) (progressDirective, bool) {
 }
 
 func printInteractiveProgress(w io.Writer, progress progressDirective) {
-	status := strings.TrimSpace(progress.Status)
-	if status == "" {
+	line := formatProgressLine(progress)
+	if line == "" {
 		return
 	}
-	detail := strings.TrimSpace(progress.Detail)
-	if detail == "" {
-		fmt.Fprintf(w, "- %s\n", sentenceCase(status))
-		return
-	}
-	fmt.Fprintf(w, "- %s: %s\n", sentenceCase(status), sentenceCase(singleLine(detail)))
+	fmt.Fprintln(w, line)
 }
 
 func printInteractiveMarkdown(w io.Writer, markdown string) {
@@ -1661,7 +1698,7 @@ func renderTerminalMarkdown(markdown string, width int) (string, error) {
 		width = 100
 	}
 	renderer, err := glamour.NewTermRenderer(
-		glamour.WithEnvironmentConfig(),
+		glamour.WithStandardStyle("dark"),
 		glamour.WithWordWrap(width),
 	)
 	if err != nil {
@@ -1706,7 +1743,8 @@ func sentenceCase(text string) string {
 
 func printInteractiveRoleHeader(w io.Writer, role string) {
 	title := titleRole(role)
-	fmt.Fprintf(w, "\n%s\n%s\n", title, strings.Repeat("-", len(title)))
+	fmt.Fprintln(w)
+	printInteractiveMarkdown(w, "## "+title)
 }
 
 func titleRole(role string) string {
@@ -1721,6 +1759,9 @@ func printInteractiveRoleRunResult(w io.Writer, result roleRunResult) {
 	if strings.TrimSpace(reply.Text) != "" {
 		fmt.Fprintln(w)
 		printInteractiveMarkdown(w, reply.Text)
+	} else if summary := strings.Join(interactiveRoleProgressLines(result.Before.Stats, result.After.Stats), "\n"); summary != "" {
+		fmt.Fprintln(w)
+		printInteractiveMarkdown(w, summary)
 	}
 	if reply.Usage != "" {
 		fmt.Fprintf(w, "Usage: %s\n", reply.Usage)
@@ -1736,7 +1777,7 @@ func printInteractiveRoleRunResult(w io.Writer, result roleRunResult) {
 }
 
 func runInteractiveQueuedRoles(e env, out io.Writer, maxRuns int) error {
-	stop, err := runManagedLoop(e, out, maxRuns, true, nil, nil, loopDisplayInteractive)
+	stop, err := runManagedLoop(e, out, maxRuns, true, nil, nil, loopDisplayInteractive, "")
 	if err != nil {
 		return err
 	}
@@ -2304,7 +2345,11 @@ func readVerificationStats(dir string) (pass, fail int, latestPass string, err e
 }
 
 func printTaskStats(w io.Writer, stats taskStats) {
-	if stats.Next != "" {
+	printTaskStatsWithOptions(w, stats, true)
+}
+
+func printTaskStatsWithOptions(w io.Writer, stats taskStats, includeNext bool) {
+	if includeNext && stats.Next != "" {
 		fmt.Fprintf(w, "next: %s\n", stats.Next)
 	}
 	fmt.Fprintf(w, "findings: open=%d fixed=%d verified=%d\n", stats.FindingsOpen, stats.FindingsFixed, stats.FindingsVerified)
@@ -2435,7 +2480,7 @@ func parseStartArgs(args []string) (title, ref, text string, err error) {
 // loop renders the unified split view; non-TTY (and --plain) falls back to
 // the plain loop output automatically.
 func runGoCommand(args []string, in io.Reader, out, errOut io.Writer, e env) int {
-	text, ref, maxRuns, plain, err := parseGoArgs(args)
+	text, ref, maxRuns, plain, continueActive, targetRole, err := parseGoArgs(args)
 	if err != nil {
 		fmt.Fprintf(errOut, "agents: go: %v\n", err)
 		return 2
@@ -2450,6 +2495,41 @@ func runGoCommand(args []string, in io.Reader, out, errOut io.Writer, e env) int
 	if !trusted {
 		fmt.Fprintf(errOut, "agents: go: %s is not trusted; `agents go` executes commands from .agents/config.yml — review it, then run `agents trust`\n", e.cwd)
 		return 1
+	}
+	if continueActive {
+		task := readActiveTask(e.cwd)
+		if task.Path == "" || task.Missing {
+			fmt.Fprintln(errOut, "agents: go: no active task to continue")
+			return 1
+		}
+		state, err := analyzeLoopState(e)
+		if err != nil {
+			fmt.Fprintf(errOut, "agents: go: %v\n", err)
+			return 1
+		}
+		role := targetRole
+		if role == "" {
+			role = state.NextRole
+		}
+		if strings.TrimSpace(text) != "" && role != "" && role != "human" {
+			if _, err := addHandoff(e, []string{"--to", role, strings.TrimSpace(text)}, time.Now().UTC()); err != nil {
+				fmt.Fprintf(errOut, "agents: go: %v\n", err)
+				return 1
+			}
+		}
+		if !plain && e.isTTY {
+			if inFile, outFile, ok := loopViewTerminals(in, out); ok {
+				return runLoopWithView(inFile, outFile, errOut, e, task.Title, maxRuns, targetRole)
+			}
+		}
+		fmt.Fprintf(out, "task: %s\n", task.Title)
+		fmt.Fprintf(out, "task path: %s\n", task.Path)
+		fmt.Fprintln(out)
+		return runLoopToStop("go", out, errOut, e, maxRuns, nil, targetRole)
+	}
+	if text == "" {
+		fmt.Fprintln(errOut, "agents: go: instruction text is required, e.g. agents go \"Add /history command\"")
+		return 2
 	}
 	title, instruction := splitGoText(text)
 	taskArgs := []string{title}
@@ -2471,16 +2551,16 @@ func runGoCommand(args []string, in io.Reader, out, errOut io.Writer, e env) int
 	}
 	if !plain && e.isTTY {
 		if inFile, outFile, ok := loopViewTerminals(in, out); ok {
-			return runLoopWithView(inFile, outFile, errOut, e, task.Title, maxRuns)
+			return runLoopWithView(inFile, outFile, errOut, e, task.Title, maxRuns, "")
 		}
 	}
 	fmt.Fprintf(out, "task: %s\n", task.Title)
 	fmt.Fprintf(out, "task path: %s\n", task.Path)
 	fmt.Fprintln(out)
-	return runLoopToStop("go", out, errOut, e, maxRuns, nil)
+	return runLoopToStop("go", out, errOut, e, maxRuns, nil, "")
 }
 
-func parseGoArgs(args []string) (text, ref string, maxRuns int, plain bool, err error) {
+func parseGoArgs(args []string) (text, ref string, maxRuns int, plain, continueActive bool, targetRole string, err error) {
 	maxRuns = defaultMaxLoopRuns
 	for i := 0; i < len(args); i++ {
 		arg := strings.TrimSpace(args[i])
@@ -2489,36 +2569,48 @@ func parseGoArgs(args []string) (text, ref string, maxRuns int, plain bool, err 
 			continue
 		case "--plain":
 			plain = true
+		case "--continue":
+			continueActive = true
+		case "--implementer", "--reviewer":
+			role := strings.TrimPrefix(arg, "--")
+			if targetRole != "" && targetRole != role {
+				return "", "", 0, false, false, "", fmt.Errorf("%s cannot be used with --%s", arg, targetRole)
+			}
+			targetRole = role
+			continueActive = true
 		case "--ref":
 			if i+1 >= len(args) || strings.TrimSpace(args[i+1]) == "" {
-				return "", "", 0, false, fmt.Errorf("--ref requires a value")
+				return "", "", 0, false, false, "", fmt.Errorf("--ref requires a value")
 			}
 			ref = strings.TrimSpace(args[i+1])
 			i++
 		case "--max-iterations":
 			if i+1 >= len(args) {
-				return "", "", 0, false, fmt.Errorf("--max-iterations requires a number")
+				return "", "", 0, false, false, "", fmt.Errorf("--max-iterations requires a number")
 			}
 			n, convErr := strconv.Atoi(strings.TrimSpace(args[i+1]))
 			if convErr != nil || n < 1 {
-				return "", "", 0, false, fmt.Errorf("--max-iterations requires a positive number")
+				return "", "", 0, false, false, "", fmt.Errorf("--max-iterations requires a positive number")
 			}
 			maxRuns = n
 			i++
 		default:
 			if strings.HasPrefix(arg, "--") {
-				return "", "", 0, false, fmt.Errorf("unknown flag %s", arg)
+				return "", "", 0, false, false, "", fmt.Errorf("unknown flag %s", arg)
 			}
 			if text != "" {
-				return "", "", 0, false, fmt.Errorf("go accepts exactly one instruction")
+				return "", "", 0, false, false, "", fmt.Errorf("go accepts exactly one instruction")
 			}
 			text = arg
 		}
 	}
-	if text == "" {
-		return "", "", 0, false, fmt.Errorf("instruction text is required, e.g. agents go \"Add /history command\"")
+	if !continueActive && text == "" {
+		return "", "", 0, false, false, "", fmt.Errorf("instruction text is required, e.g. agents go \"Add /history command\"")
 	}
-	return text, ref, maxRuns, plain, nil
+	if continueActive && ref != "" {
+		return "", "", 0, false, false, "", fmt.Errorf("--ref cannot be used with continuation or role flags")
+	}
+	return text, ref, maxRuns, plain, continueActive, targetRole, nil
 }
 
 // splitGoText derives a task title from the instruction. "title: what to do"
@@ -3671,9 +3763,10 @@ type loopDisplayMode int
 const (
 	loopDisplayPlain loopDisplayMode = iota
 	loopDisplayInteractive
+	loopDisplayView
 )
 
-func runManagedLoop(e env, out io.Writer, maxRuns int, stopAtCoordinator bool, events loopEventSink, control *loopControl, display loopDisplayMode) (loopStop, error) {
+func runManagedLoop(e env, out io.Writer, maxRuns int, stopAtCoordinator bool, events loopEventSink, control *loopControl, display loopDisplayMode, forceFirstRole string) (loopStop, error) {
 	emit := func(ev loopEvent) {
 		if events != nil {
 			events(ev)
@@ -3689,6 +3782,11 @@ func runManagedLoop(e env, out io.Writer, maxRuns int, stopAtCoordinator bool, e
 		state, err := analyzeLoopState(e)
 		if err != nil {
 			return loopStop{}, err
+		}
+		if runs == 0 && forceFirstRole != "" {
+			state.NextRole = forceFirstRole
+			state.NextAction = "act on user-directed " + forceFirstRole + " request"
+			state.Boundary = ""
 		}
 		emit(loopEvent{Event: "state_changed", State: statePayload(state)})
 		if control != nil {
@@ -3727,9 +3825,10 @@ func runManagedLoop(e env, out io.Writer, maxRuns int, stopAtCoordinator bool, e
 			liveOut = &interactiveRunHeaderWriter{out: out}
 		}
 		result, err := runConfiguredRoleWithOptions(e, state, roleRunOptions{
-			ShowRunHeader: events == nil,
-			LiveOutput:    liveOut,
-			Events:        events,
+			ShowRunHeader:    events == nil,
+			LiveOutput:       liveOut,
+			Events:           events,
+			CleanEventOutput: events != nil && display == loopDisplayView,
 		})
 		if err != nil {
 			return loopStop{}, err
@@ -3787,14 +3886,14 @@ func runLoopCommand(args []string, out, errOut io.Writer, e env) int {
 		events = jsonlEventSink(out)
 		loopOut = io.Discard
 	}
-	return runLoopToStop("run", loopOut, errOut, e, flags.MaxRuns, events)
+	return runLoopToStop("run", loopOut, errOut, e, flags.MaxRuns, events, "")
 }
 
 // runLoopToStop drives the managed loop until a stop condition and translates
 // the stop into plain output and an exit code. Shared by `agents run` and
 // `agents go`; cmd names the invoking command in error output.
-func runLoopToStop(cmd string, loopOut, errOut io.Writer, e env, maxRuns int, events loopEventSink) int {
-	stop, err := runManagedLoop(e, loopOut, maxRuns, false, events, nil, loopDisplayPlain)
+func runLoopToStop(cmd string, loopOut, errOut io.Writer, e env, maxRuns int, events loopEventSink, forceFirstRole string) int {
+	stop, err := runManagedLoop(e, loopOut, maxRuns, false, events, nil, loopDisplayPlain, forceFirstRole)
 	if err != nil {
 		if errors.Is(err, errRunInterrupted) {
 			printInterruptHint(loopOut, e)
@@ -3909,9 +4008,10 @@ type roleRunResult struct {
 }
 
 type roleRunOptions struct {
-	ShowRunHeader bool
-	LiveOutput    io.Writer
-	Events        loopEventSink
+	ShowRunHeader    bool
+	LiveOutput       io.Writer
+	Events           loopEventSink
+	CleanEventOutput bool
 }
 
 type interactiveAgentReply struct {
@@ -4067,7 +4167,9 @@ func runConfiguredRoleWithOptions(e env, state loopState, options roleRunOptions
 	}
 	agentDesc := agentDescriptor(agent, effectiveSettings)
 	if options.Events != nil {
-		live = io.MultiWriter(live, &eventChunkWriter{events: options.Events, runID: artifacts.ID, role: state.NextRole})
+		if !(options.CleanEventOutput && strings.EqualFold(agent, "codex")) {
+			live = io.MultiWriter(live, &eventChunkWriter{events: options.Events, runID: artifacts.ID, role: state.NextRole})
+		}
 		options.Events(loopEvent{Event: "run_started", RunID: artifacts.ID, Role: state.NextRole, Agent: agentDesc})
 	}
 	// After run_started, every error return must close the run with a
@@ -4093,6 +4195,11 @@ func runConfiguredRoleWithOptions(e env, state loopState, options roleRunOptions
 	after, err := analyzeLoopState(e)
 	if err != nil {
 		return failRun(err)
+	}
+	if options.Events != nil && options.CleanEventOutput && strings.EqualFold(agent, "codex") {
+		if cleaned := cleanInteractiveAgentOutput(agent, output); strings.TrimSpace(cleaned) != "" {
+			options.Events(loopEvent{Event: "output", RunID: artifacts.ID, Role: state.NextRole, Chunk: cleaned + "\n"})
+		}
 	}
 	if options.Events != nil {
 		options.Events(loopEvent{Event: "run_finished", RunID: artifacts.ID, Role: state.NextRole, Agent: agentDesc, State: statePayload(after)})
@@ -4350,6 +4457,9 @@ type cursorStreamWriter struct {
 	log            io.Writer
 	live           io.Writer
 	pending        string
+	textPending    string
+	inProgress     bool
+	progressBlock  []string
 	deltas         strings.Builder
 	deltaLineOpen  bool
 	finalAssistant string
@@ -4380,6 +4490,7 @@ func (w *cursorStreamWriter) FinalOutput() string {
 		w.handleLine(w.pending)
 		w.pending = ""
 	}
+	w.flushAssistantText()
 	text := firstNonEmpty(w.result, w.finalAssistant, w.deltas.String(), w.output.String())
 	if w.usage != "" {
 		text = strings.TrimSpace(text) + "\nToken usage: " + w.usage
@@ -4410,15 +4521,7 @@ func (w *cursorStreamWriter) handleLine(line string) {
 			return
 		}
 		if ev.TimestampMS != nil {
-			if progress, ok := parseProgressDirectiveFromText(text); ok {
-				w.printProgress(progress)
-				return
-			}
-			w.deltas.WriteString(text)
-			if w.live != nil {
-				fmt.Fprint(w.live, text)
-				w.deltaLineOpen = true
-			}
+			w.processAssistantText(text)
 			return
 		}
 		if w.deltaLineOpen && w.live != nil {
@@ -4436,6 +4539,98 @@ func (w *cursorStreamWriter) handleLine(line string) {
 	default:
 		return
 	}
+}
+
+func (w *cursorStreamWriter) processAssistantText(text string) {
+	w.textPending += text
+	for {
+		if w.inProgress {
+			line, rest, ok := strings.Cut(w.textPending, "\n")
+			if !ok {
+				if strings.TrimSpace(w.textPending) == "```" {
+					if progress, ok := parseProgressDirectiveLines(w.progressBlock); ok {
+						w.printProgress(progress)
+					}
+					w.textPending = ""
+					w.progressBlock = nil
+					w.inProgress = false
+					continue
+				}
+				return
+			}
+			w.textPending = rest
+			if strings.TrimSpace(line) == "```" {
+				if progress, ok := parseProgressDirectiveLines(w.progressBlock); ok {
+					w.printProgress(progress)
+				}
+				w.progressBlock = nil
+				w.inProgress = false
+				continue
+			}
+			w.progressBlock = append(w.progressBlock, line)
+			continue
+		}
+
+		idx := strings.Index(w.textPending, "```agents-progress")
+		if idx < 0 {
+			keepFrom := partialFenceStart(w.textPending)
+			if keepFrom < 0 {
+				w.emitAssistantText(w.textPending)
+				w.textPending = ""
+				return
+			}
+			if keepFrom > 0 {
+				w.emitAssistantText(w.textPending[:keepFrom])
+				w.textPending = w.textPending[keepFrom:]
+			}
+			return
+		}
+		if idx > 0 {
+			w.emitAssistantText(w.textPending[:idx])
+			w.textPending = w.textPending[idx:]
+		}
+		if newline := strings.IndexByte(w.textPending, '\n'); newline >= 0 {
+			w.textPending = w.textPending[newline+1:]
+			w.inProgress = true
+			w.progressBlock = nil
+			continue
+		}
+		return
+	}
+}
+
+func (w *cursorStreamWriter) flushAssistantText() {
+	if w.inProgress {
+		w.textPending = ""
+		w.progressBlock = nil
+		w.inProgress = false
+		return
+	}
+	if w.textPending != "" {
+		w.emitAssistantText(w.textPending)
+		w.textPending = ""
+	}
+}
+
+func (w *cursorStreamWriter) emitAssistantText(text string) {
+	if text == "" {
+		return
+	}
+	w.deltas.WriteString(text)
+	if w.live != nil {
+		fmt.Fprint(w.live, text)
+		w.deltaLineOpen = true
+	}
+}
+
+func partialFenceStart(text string) int {
+	for i := 0; i < len(text); i++ {
+		suffix := text[i:]
+		if strings.HasPrefix("```agents-progress", suffix) {
+			return i
+		}
+	}
+	return -1
 }
 
 func (w *cursorStreamWriter) printProgress(progress progressDirective) {
@@ -4639,6 +4834,22 @@ func taskProgressLines(before, after taskStats) []string {
 	}
 	if after.Next != "" && after.Next != before.Next {
 		lines = append(lines, "Next: "+strings.TrimPrefix(after.Next, "- "))
+	}
+	return lines
+}
+
+func interactiveRoleProgressLines(before, after taskStats) []string {
+	lines := taskProgressLines(before, after)
+	if after.Handoffs <= before.Handoffs || after.LatestHandoffTo == "" {
+		return lines
+	}
+	activityLine := fmt.Sprintf("Handoff recorded for %s.", activityName(after.LatestHandoffTo))
+	roleLine := fmt.Sprintf("Handoff recorded for %s.", after.LatestHandoffTo)
+	for i, line := range lines {
+		if line == activityLine {
+			lines[i] = roleLine
+			return lines
+		}
 	}
 	return lines
 }
@@ -4904,6 +5115,7 @@ func buildRolePrompt(e env, state loopState) (string, error) {
 		fmt.Fprintln(&b, "  ```")
 		fmt.Fprintln(&b, "- Record each real issue as a finding:")
 		fmt.Fprintln(&b, `  agents finding add "summary" --severity low|medium|high`)
+		fmt.Fprintln(&b, "  Open findings automatically route the loop back to the implementer; do not record passing verification when unresolved issues remain.")
 		fmt.Fprintln(&b, "- For findings marked fixed, verify them independently with evidence:")
 		fmt.Fprintln(&b, `  agents finding verify <finding> --evidence "what you checked"`)
 		fmt.Fprintln(&b, "- When the work is clean, end with one `agents-verify` JSON fenced block so the parent process records reproducible verification evidence:")
@@ -5050,7 +5262,7 @@ func printLoopState(w io.Writer, state loopState) {
 	if state.Boundary != "" {
 		fmt.Fprintf(w, "boundary: %s\n", state.Boundary)
 	}
-	printTaskStats(w, state.Stats)
+	printTaskStatsWithOptions(w, state.Stats, state.NextRole != "human")
 }
 
 func printRoleRunResult(w io.Writer, result roleRunResult) {
