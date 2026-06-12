@@ -314,8 +314,7 @@ func acceptReadyTask(out io.Writer, errOut io.Writer, e env, summary readySummar
 		fmt.Fprintf(errOut, "agents: go: archive: %v\n", err)
 		return 1
 	}
-	fmt.Fprintf(out, "archived task: %s\n", record.Title)
-	fmt.Fprintf(out, "archive path: %s\n", record.Path)
+	writeArchiveReport(out, record)
 	fmt.Fprintln(out)
 	fmt.Fprintln(out, "Suggested commit message (agents never commits — your call):")
 	fmt.Fprintln(out)

@@ -3490,10 +3490,25 @@ func runHandoffCommand(args []string, out, errOut io.Writer, e env) int {
 }
 
 type chunkRecord struct {
-	Path  string
-	Title string
-	To    string
-	By    string
+	Path         string
+	Title        string
+	To           string
+	By           string
+	ArchiveStats archiveStats
+}
+
+type archiveStats struct {
+	Decisions           int
+	Handoffs            int
+	VerificationRecords int
+	RunActivityRecords  int
+	FindingsOpen        int
+	FindingsFixed       int
+	FindingsVerified    int
+}
+
+func (s archiveStats) unresolvedFindings() int {
+	return s.FindingsOpen + s.FindingsFixed
 }
 
 func addDecision(e env, args []string, now time.Time) (chunkRecord, error) {
@@ -3979,9 +3994,16 @@ func runArchiveCommand(args []string, out, errOut io.Writer, e env) int {
 		fmt.Fprintf(errOut, "agents: archive: %v\n", err)
 		return 1
 	}
+	writeArchiveReport(out, record)
+	return 0
+}
+
+func writeArchiveReport(out io.Writer, record chunkRecord) {
 	fmt.Fprintf(out, "archived task: %s\n", record.Title)
 	fmt.Fprintf(out, "archive path: %s\n", record.Path)
-	return 0
+	fmt.Fprintf(out, "preserved decisions: %d\n", record.ArchiveStats.Decisions)
+	fmt.Fprintf(out, "preserved findings: %d\n", record.ArchiveStats.unresolvedFindings())
+	fmt.Fprintf(out, "unresolved findings: %d\n", record.ArchiveStats.unresolvedFindings())
 }
 
 func archiveActiveTask(e env, now time.Time) (chunkRecord, error) {
@@ -4002,7 +4024,8 @@ func archiveActiveTask(e env, now time.Time) (chunkRecord, error) {
 	if err := os.MkdirAll(archiveDir, 0o755); err != nil {
 		return chunkRecord{}, err
 	}
-	if err := writeArchiveSummary(taskDir, archiveDir, active, now); err != nil {
+	stats, err := writeArchiveSummary(taskDir, archiveDir, active, now)
+	if err != nil {
 		return chunkRecord{}, err
 	}
 	if err := copyMarkdownDir(filepath.Join(taskDir, "decisions"), filepath.Join(archiveDir, "decisions"), nil); err != nil {
@@ -4017,29 +4040,38 @@ func archiveActiveTask(e env, now time.Time) (chunkRecord, error) {
 	if err := clearActiveTask(e.cwd); err != nil {
 		return chunkRecord{}, err
 	}
-	return chunkRecord{Path: archiveRel, Title: active.Title}, nil
+	return chunkRecord{Path: archiveRel, Title: active.Title, ArchiveStats: stats}, nil
 }
 
-func writeArchiveSummary(taskDir, archiveDir string, active activeTask, now time.Time) error {
+func writeArchiveSummary(taskDir, archiveDir string, active activeTask, now time.Time) (archiveStats, error) {
 	decisionCount, err := countMarkdownFiles(filepath.Join(taskDir, "decisions"))
 	if err != nil {
-		return err
+		return archiveStats{}, err
 	}
 	handoffCount, err := countMarkdownFiles(filepath.Join(taskDir, "handoffs"))
 	if err != nil {
-		return err
+		return archiveStats{}, err
 	}
 	verificationCount, err := countMarkdownFiles(filepath.Join(taskDir, "verification"))
 	if err != nil {
-		return err
+		return archiveStats{}, err
 	}
 	runCount, err := countJSONLFiles(filepath.Join(taskDir, "runs"))
 	if err != nil {
-		return err
+		return archiveStats{}, err
 	}
 	openFindings, fixedFindings, verifiedFindings, err := countFindingStatuses(filepath.Join(taskDir, "findings"))
 	if err != nil {
-		return err
+		return archiveStats{}, err
+	}
+	stats := archiveStats{
+		Decisions:           decisionCount,
+		Handoffs:            handoffCount,
+		VerificationRecords: verificationCount,
+		RunActivityRecords:  runCount,
+		FindingsOpen:        openFindings,
+		FindingsFixed:       fixedFindings,
+		FindingsVerified:    verifiedFindings,
 	}
 
 	var b strings.Builder
@@ -4062,7 +4094,10 @@ func writeArchiveSummary(taskDir, archiveDir string, active activeTask, now time
 	appendArchiveSection(&b, "Scope", filepath.Join(taskDir, "scope.md"))
 	appendArchiveSection(&b, "Final Status", filepath.Join(taskDir, "status.md"))
 	fmt.Fprintln(&b, "Detailed transient chunks remain available in git history.")
-	return os.WriteFile(filepath.Join(archiveDir, "summary.md"), []byte(b.String()), 0o644)
+	if err := os.WriteFile(filepath.Join(archiveDir, "summary.md"), []byte(b.String()), 0o644); err != nil {
+		return archiveStats{}, err
+	}
+	return stats, nil
 }
 
 func appendArchiveSection(b *strings.Builder, title, path string) {

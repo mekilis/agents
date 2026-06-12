@@ -2907,8 +2907,17 @@ func TestArchiveSummarizesAndPrunesActiveTask(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("Run archive code=%d stderr=%s", code, errOut.String())
 	}
-	if !strings.Contains(out.String(), "archived task: Archive Me") {
-		t.Fatalf("unexpected output:\n%s", out.String())
+	gotOut := out.String()
+	for _, want := range []string{
+		"archived task: Archive Me",
+		"archive path: archive/2026-06-05-001-archive-me",
+		"preserved decisions: 1",
+		"preserved findings: 1",
+		"unresolved findings: 1",
+	} {
+		if !strings.Contains(gotOut, want) {
+			t.Fatalf("archive output missing %q, got:\n%s", want, gotOut)
+		}
 	}
 }
 
@@ -6613,6 +6622,15 @@ func TestMCPToolsWrapTaskStateCommands(t *testing.T) {
 	archived := decodeMCPToolText(t, responses[4])
 	if got := archived["title"]; got != "MCP State" {
 		t.Fatalf("expected archive tool to archive active task, got %+v", archived)
+	}
+	if got := archived["preserved_decisions"]; got != float64(1) {
+		t.Fatalf("expected archive tool to report preserved decisions, got %+v", archived)
+	}
+	if got := archived["preserved_findings"]; got != float64(1) {
+		t.Fatalf("expected archive tool to report preserved findings, got %+v", archived)
+	}
+	if got := archived["unresolved_findings"]; got != float64(1) {
+		t.Fatalf("expected archive tool to report unresolved findings, got %+v", archived)
 	}
 }
 

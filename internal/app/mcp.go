@@ -297,7 +297,17 @@ func callMCPTool(e env, name string, rawArgs json.RawMessage) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		return map[string]any{"title": record.Title, "path": record.Path}, nil
+		return map[string]any{
+			"title":                record.Title,
+			"path":                 record.Path,
+			"preserved_decisions":  record.ArchiveStats.Decisions,
+			"preserved_findings":   record.ArchiveStats.unresolvedFindings(),
+			"unresolved_findings":  record.ArchiveStats.unresolvedFindings(),
+			"verified_findings":    record.ArchiveStats.FindingsVerified,
+			"handoffs":             record.ArchiveStats.Handoffs,
+			"verification_records": record.ArchiveStats.VerificationRecords,
+			"run_activity_records": record.ArchiveStats.RunActivityRecords,
+		}, nil
 	default:
 		return nil, fmt.Errorf("unknown tool: %s", name)
 	}
