@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 type runActivityRecord struct {
@@ -121,7 +122,11 @@ func (s *runActivitySink) coalesceMessageText(runID, text string) string {
 			}
 			continue
 		}
-		if isTinyRunActivityFragment(line) {
+		if continuesSplitRunActivitySentence(s.pending[runID], line) {
+			s.pending[runID] = append(s.pending[runID], line)
+			continue
+		}
+		if isRunActivityFragment(line) {
 			s.pending[runID] = append(s.pending[runID], line)
 			if completesRunActivityFence(s.pending[runID]) {
 				kept = append(kept, formatRunActivityPending(s.pending[runID]))
@@ -165,11 +170,14 @@ func (s *runActivitySink) flushPendingMessage(runID, at string) {
 	})
 }
 
-func isTinyRunActivityFragment(line string) bool {
+func isRunActivityFragment(line string) bool {
 	if len([]rune(line)) > 32 {
-		return false
+		return looksLikeSplitRunActivitySentence(line)
 	}
 	if line == "```" || strings.HasPrefix(line, "```") {
+		return true
+	}
+	if isRunActivityPunctuationFragment(line) {
 		return true
 	}
 	if strings.ContainsAny(line, ".!?:/\\") {
@@ -177,6 +185,46 @@ func isTinyRunActivityFragment(line string) bool {
 	}
 	fields := strings.Fields(line)
 	return len(fields) == 1
+}
+
+func looksLikeSplitRunActivitySentence(line string) bool {
+	if line == "" || strings.ContainsAny(line, "\n\r") {
+		return false
+	}
+	if strings.HasSuffix(line, ".") || strings.HasSuffix(line, "!") || strings.HasSuffix(line, "?") || strings.HasSuffix(line, ":") {
+		return false
+	}
+	return strings.Contains(line, " ,") ||
+		strings.Contains(line, " .") ||
+		strings.Contains(line, " /") ||
+		strings.Contains(line, " ’") ||
+		strings.Contains(line, " '")
+}
+
+func continuesSplitRunActivitySentence(pending []string, line string) bool {
+	if len(pending) == 0 || line == "" {
+		return false
+	}
+	if !looksLikeSplitRunActivitySentence(pending[0]) {
+		return false
+	}
+	if isRunActivityPunctuationFragment(line) {
+		return true
+	}
+	first, _ := utf8.DecodeRuneInString(line)
+	return first >= 'a' && first <= 'z'
+}
+
+func isRunActivityPunctuationFragment(line string) bool {
+	if line == "" {
+		return false
+	}
+	for _, r := range line {
+		if !strings.ContainsRune(".,!?:;’'\"`)]}", r) {
+			return false
+		}
+	}
+	return true
 }
 
 func formatRunActivityPending(parts []string) string {
@@ -250,8 +298,13 @@ func shouldJoinRunActivityPending(pending, line string) bool {
 
 func normalizeRunActivityFragment(line string) string {
 	line = strings.ToLower(strings.TrimSpace(line))
-	line = strings.Trim(line, " \t\r\n.,!?:;")
-	return strings.Join(strings.Fields(line), " ")
+	var b strings.Builder
+	for _, r := range line {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 func appendRunActivityRecord(path string, rec runActivityRecord) error {

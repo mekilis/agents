@@ -5748,6 +5748,34 @@ func TestRunActivityCoalescesTokenStreamFragments(t *testing.T) {
 	}
 }
 
+func TestRunActivityCoalescesSplitSentenceBeforeCompleteMessage(t *testing.T) {
+	dir := t.TempDir()
+	sink := newTestRunActivitySink(dir)
+	sink.handle(loopEvent{Event: "run_started", RunID: "r1", Role: "implementer", Agent: "agent"})
+	for _, chunk := range []string{
+		"I ’ll pick up the task state first , inspect the latest hand off and the relevant CLI output /render\n",
+		"ing paths , then make only narrow UX /test\n",
+		"changes if the dog food evidence points to a concrete issue\n.\n",
+		"I’ll pick up the task state first, inspect the latest handoff and the relevant CLI output/rendering paths, then make only narrow UX/test changes if the dogfood evidence points to a concrete issue.\n",
+		"Reading: handoff.md\n",
+	} {
+		sink.handle(loopEvent{Event: "output", RunID: "r1", Role: "implementer", Chunk: chunk})
+	}
+	sink.handle(loopEvent{Event: "run_finished", RunID: "r1", Role: "implementer", Agent: "agent"})
+
+	messages := readTestRunActivityMessages(t, dir)
+	if len(messages) != 2 {
+		t.Fatalf("expected complete sentence plus progress line, got %#v", messages)
+	}
+	want := "I’ll pick up the task state first, inspect the latest handoff and the relevant CLI output/rendering paths, then make only narrow UX/test changes if the dogfood evidence points to a concrete issue."
+	if messages[0] != want {
+		t.Fatalf("message 0 = %q, want %q (all messages: %#v)", messages[0], want, messages)
+	}
+	if messages[1] != "Reading: handoff.md" {
+		t.Fatalf("expected progress line to be preserved, got %#v", messages)
+	}
+}
+
 func TestRunActivityCoalescesCommandAndFenceFragments(t *testing.T) {
 	dir := t.TempDir()
 	sink := newTestRunActivitySink(dir)
