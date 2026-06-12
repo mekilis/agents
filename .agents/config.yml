@@ -19,8 +19,6 @@ providers:
     reasoning: low
   agent:
     model: gpt-5.5-low
-review:
-  first_pass: lmstudio
 # Each role is a provider name (cursor, cursor-agent, agent, codex, claude)
 # or a map with provider plus optional model/reasoning overrides:
 #   reviewer:
@@ -32,3 +30,5 @@ roles:
   implementer: agent
   reviewer: codex
   coordinator: codex
+review:
+  first_pass: lmstudio
