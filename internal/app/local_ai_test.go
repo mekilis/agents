@@ -2,6 +2,7 @@ package app
 
 import (
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -71,7 +72,7 @@ func TestLocalAICoordinatorAdvisoryRejectsRoutingText(t *testing.T) {
 }
 
 func TestClassifyCoordinatorIntentWithOpenAICompat(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newLocalAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/chat/completions" {
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
@@ -108,7 +109,7 @@ func TestClassifyCoordinatorIntentWithOpenAICompat(t *testing.T) {
 }
 
 func TestRunFirstPassReviewWithOpenAICompat(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := newLocalAITestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/chat/completions" {
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
@@ -139,6 +140,20 @@ func TestRunFirstPassReviewWithOpenAICompat(t *testing.T) {
 	if got.Result != "pass" || got.Summary != "clean" || len(got.Findings) != 0 {
 		t.Fatalf("unexpected result: %+v", got)
 	}
+}
+
+func newLocalAITestServer(t *testing.T, handler http.Handler) *httptest.Server {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("cannot bind local HTTP test server on loopback: %v", err)
+	}
+
+	server := httptest.NewUnstartedServer(handler)
+	server.Listener = listener
+	server.Start()
+	return server
 }
 
 func TestClassifyCoordinatorIntentRequiresConfigAndValidResult(t *testing.T) {
