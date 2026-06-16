@@ -344,6 +344,8 @@ func runLocalAIReviewerItem(e env, state loopState, rc roleConfig, settings agen
 func runFirstPassReviewWithOpenAICompat(settings agentSettings, input string) (localAIReviewResult, error) {
 	content, err := localAIChat(settings,
 		"You are a reviewer in an ordered Agents review pipeline. Review only the provided task context. "+
+			"Start from the full diff, enumerate changed functions and sibling branches/paths, check parity across success/error/early-return/404/fallback and read/write counterparts, and include that branch checklist in the summary. "+
+			"When reviewing a provided finding, inspect the enclosing function and sibling branches before passing; return fail with one finding per real issue for any parity gap independent of seeded findings. "+
 			"Return only JSON: {\"result\":\"pass|fail|escalate\",\"summary\":\"...\",\"findings\":[{\"severity\":\"low|medium|high\",\"text\":\"...\",\"evidence\":\"...\"}]}. "+
 			"Use fail only for concrete, grounded issues. Use pass when there are no blocking issues. Use escalate when the context is insufficient or uncertain.",
 		strings.TrimSpace(input),
@@ -364,6 +366,14 @@ func localAIReviewInput(e env, state loopState) string {
 	if stat := gitDiffStat(e.cwd); strings.TrimSpace(stat) != "" {
 		fmt.Fprintf(&b, "\nGit diff stat:\n%s\n", stat)
 	}
+	if diff := gitDiff(e.cwd); strings.TrimSpace(diff) != "" {
+		fmt.Fprintf(&b, "\nGit diff:\n%s\n", diff)
+	}
+	fmt.Fprintln(&b, "\nReviewer branch checklist requirements:")
+	fmt.Fprintln(&b, "- Start from the full diff before judging seeded findings.")
+	fmt.Fprintln(&b, "- Enumerate changed functions and sibling branches/paths.")
+	fmt.Fprintln(&b, "- Check parity across success, error, early-return, 404, fallback, read counterpart, and write counterpart paths.")
+	fmt.Fprintln(&b, "- Record one finding per real issue independent of seeded findings.")
 	return b.String()
 }
 

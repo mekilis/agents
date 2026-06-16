@@ -355,6 +355,26 @@ openai_compatible` for local chat completion servers. Per-role
 `model`/`reasoning` values override the named provider for that role only. Set
 `cmd: my-agent {prompt_file}` as an advanced escape hatch, or put provider
 flags directly in a custom role command.
+
+For review-heavy projects, prefer an ordered reviewer pipeline: a local coder or
+local reviewer first pass for fast branch-parity checks, followed by Codex with
+high reasoning for the independent review. Reviewer list entries run in order;
+per-entry `model` and `reasoning` overrides apply only to that reviewer:
+
+```yaml
+providers:
+  local-reviewer:
+    type: openai_compatible
+    base_url: http://127.0.0.1:1234/v1
+    model: your-local-review-model
+roles:
+  reviewer:
+    - local-reviewer
+    - provider: codex
+      model: gpt-5.5
+      reasoning: high
+```
+
 Legacy `settings.local_ai_*`, `settings.codex_*`, `settings.claude_*`, and
 `settings.cursor_model` keys still work, but new config should prefer
 `providers` and `roles.reviewer`.

@@ -73,6 +73,22 @@ func gitDiffStat(cwd string) string {
 		return "(no git diff available)"
 	}
 	stat := strings.TrimRight(string(out), "\n")
+	if files := gitUntrackedFiles(cwd); len(files) > 0 {
+		var b strings.Builder
+		if strings.TrimSpace(stat) != "" {
+			fmt.Fprintln(&b, stat)
+		}
+		fmt.Fprintln(&b, "Untracked files:")
+		const maxFiles = 50
+		for i, file := range files {
+			if i >= maxFiles {
+				fmt.Fprintf(&b, "  ...and %d more\n", len(files)-i)
+				break
+			}
+			fmt.Fprintf(&b, "  %s\n", file)
+		}
+		stat = strings.TrimRight(b.String(), "\n")
+	}
 	if strings.TrimSpace(stat) == "" {
 		return "(working tree clean)"
 	}

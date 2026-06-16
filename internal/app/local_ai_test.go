@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -179,6 +180,16 @@ func TestRunFirstPassReviewWithOpenAICompat(t *testing.T) {
 		}
 		if req.Model != "google/gemma-3-4b" || len(req.Messages) != 2 || req.Messages[1].Content != "review context" {
 			t.Fatalf("unexpected request: %+v", req)
+		}
+		for _, want := range []string{
+			"Start from the full diff",
+			"enumerate changed functions and sibling branches/paths",
+			"success/error/early-return/404/fallback and read/write counterparts",
+			"one finding per real issue",
+		} {
+			if !strings.Contains(req.Messages[0].Content, want) {
+				t.Fatalf("review system prompt missing %q:\n%s", want, req.Messages[0].Content)
+			}
 		}
 		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"result\":\"pass\",\"summary\":\"clean\",\"findings\":[]}"}}]}`))
 	}))

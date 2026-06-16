@@ -6135,12 +6135,14 @@ func buildRolePrompt(e env, state loopState) (string, error) {
 		appendPromptDir(&b, e.cwd, state.Task.Path, "handoffs", "Handoffs")
 		appendPromptDir(&b, e.cwd, state.Task.Path, "findings", "Findings")
 		appendPromptDir(&b, e.cwd, state.Task.Path, "verification", "Verification")
+		appendGitDiffPrompt(&b, e.cwd)
 		fmt.Fprintln(&b, "Working agreement:")
 		if state.NextAction == "review plan before implementation" {
 			fmt.Fprintln(&b, "- This is a plan review gate before implementation. Review `plan.md` for readiness; do not review or request implementation changes unless they are needed to make the plan actionable.")
 			fmt.Fprintln(&b, "- If the plan is shallow, stale, missing evidence, incorrect, or omits validation or constraints, record findings against the plan so the implementer can fix it before code changes.")
 			fmt.Fprintln(&b, "- If the plan is ready, record review evidence. The human must still approve the plan before implementation proceeds.")
 		}
+		appendReviewerBranchParityDiscipline(&b)
 		fmt.Fprintln(&b, "- Review the working tree, tests, and task chunks; verify claims against the code, not the handoff text.")
 		fmt.Fprintln(&b, "- Review the current task plan in `plan.md` when present. Check for substantive objective, repo-relative evidence, assumptions or open questions, implementation shape, validation, risks, and constraints; do not require exact section headings.")
 		fmt.Fprintln(&b, "- Check whether the implementation and review scope match the approved or draft plan.")
@@ -6168,6 +6170,108 @@ func buildRolePrompt(e env, state loopState) (string, error) {
 		return buildCoordinatorPrompt(e, state)
 	}
 	return b.String(), nil
+}
+
+func appendGitDiffPrompt(b *strings.Builder, cwd string) {
+	if stat := gitDiffStat(cwd); strings.TrimSpace(stat) != "" {
+		fmt.Fprintf(b, "## Git diff stat\n\n%s\n\n", stat)
+	}
+	if diff := gitDiff(cwd); strings.TrimSpace(diff) != "" {
+		fmt.Fprintf(b, "## Git diff\n\n```diff\n%s\n```\n\n", diff)
+	}
+}
+
+func gitDiff(cwd string) string {
+	out, err := exec.Command("git", "-C", cwd, "diff", "--no-ext-diff", "HEAD").CombinedOutput()
+	if err != nil {
+		return "(no git diff available)"
+	}
+	text := strings.TrimSpace(string(out))
+	if untracked := gitUntrackedDiff(cwd); strings.TrimSpace(untracked) != "" {
+		if text == "" {
+			text = untracked
+		} else {
+			text += "\n\n" + untracked
+		}
+	}
+	if text == "" {
+		return "(working tree clean)"
+	}
+	const maxDiffBytes = 120_000
+	if len(text) > maxDiffBytes {
+		return text[:maxDiffBytes] + "\n...[diff truncated; inspect the working tree directly before verifying]..."
+	}
+	return text
+}
+
+func gitUntrackedDiff(cwd string) string {
+	files := gitUntrackedFiles(cwd)
+	if len(files) == 0 {
+		return ""
+	}
+	const (
+		maxFiles      = 50
+		maxFileBytes  = 20_000
+		maxTotalBytes = 80_000
+	)
+	var b strings.Builder
+	for i, file := range files {
+		if i >= maxFiles {
+			fmt.Fprintf(&b, "\n...[untracked diff truncated; %d more files]...\n", len(files)-i)
+			break
+		}
+		if b.Len() >= maxTotalBytes {
+			fmt.Fprintln(&b, "\n...[untracked diff truncated; inspect the working tree directly before verifying]...")
+			break
+		}
+		data, err := os.ReadFile(filepath.Join(cwd, file))
+		if err != nil {
+			fmt.Fprintf(&b, "diff --git a/%s b/%s\nnew file mode 100644\n--- /dev/null\n+++ b/%s\n@@\n+[untracked file unreadable: %v]\n", file, file, file, err)
+			continue
+		}
+		if strings.ContainsRune(string(data), '\x00') {
+			fmt.Fprintf(&b, "diff --git a/%s b/%s\nnew file mode 100644\n--- /dev/null\n+++ b/%s\n@@\n+[binary untracked file omitted]\n", file, file, file)
+			continue
+		}
+		text := string(data)
+		truncated := false
+		if len(text) > maxFileBytes {
+			text = text[:maxFileBytes]
+			truncated = true
+		}
+		fmt.Fprintf(&b, "diff --git a/%s b/%s\nnew file mode 100644\n--- /dev/null\n+++ b/%s\n@@\n", file, file, file)
+		for _, line := range strings.Split(strings.TrimRight(text, "\n"), "\n") {
+			fmt.Fprintf(&b, "+%s\n", line)
+		}
+		if truncated {
+			fmt.Fprintln(&b, "+...[untracked file truncated; inspect the working tree directly before verifying]...")
+		}
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func gitUntrackedFiles(cwd string) []string {
+	out, err := exec.Command("git", "-C", cwd, "ls-files", "--others", "--exclude-standard", "-z").Output()
+	if err != nil || len(out) == 0 {
+		return nil
+	}
+	parts := strings.Split(strings.TrimRight(string(out), "\x00"), "\x00")
+	files := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part != "" {
+			files = append(files, part)
+		}
+	}
+	return files
+}
+
+func appendReviewerBranchParityDiscipline(b *strings.Builder) {
+	fmt.Fprintln(b, "- Start every reviewer run with a full-diff review before considering seeded findings fixed or verified.")
+	fmt.Fprintln(b, "- Enumerate the changed functions and their sibling branches or paths, including success, error, early-return, 404, fallback, read counterpart, and write counterpart paths when they exist.")
+	fmt.Fprintln(b, "- Check branch parity across those sibling paths: shared guards, validation, persistence, cleanup, user-visible errors, task-state writes, and tests should be intentionally consistent or intentionally different.")
+	fmt.Fprintln(b, "- When verifying a provided finding, inspect the whole enclosing function and sibling branches before emitting `agents finding verify`; open new findings for any parity gap you discover.")
+	fmt.Fprintln(b, "- Record one finding per real issue independent of seeded findings; do not merge unrelated parity problems into a single finding and do not pass because only the seeded finding was fixed.")
+	fmt.Fprintln(b, "- Include an explicit branch checklist in your response naming each changed function and sibling path you reviewed, with the parity result for each.")
 }
 
 func applyRoleOutputDirectives(e env, actor, output string) (string, error) {

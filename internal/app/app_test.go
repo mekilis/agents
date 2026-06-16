@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -4305,6 +4306,146 @@ func TestReviewerPromptIncludesPlanReviewInstructionsAndOmitsLocalAIReviewNotes(
 	})
 	if code != 0 {
 		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
+func TestReviewerPromptIncludesBranchParityChecklistAndFullDiff(t *testing.T) {
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		task, err := openTask(e, []string{"Branch Parity"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addHandoff(e, []string{"--to", "reviewer", "Review sibling command branches; add branch checklist."}, time.Date(2026, 6, 5, 10, 1, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		writeReviewerParityFixture(t, cwd)
+		if err := os.WriteFile(filepath.Join(cwd, "new_command.go"), []byte(strings.Join([]string{
+			"package fixture",
+			"",
+			"func newCommand() error {",
+			"	return nil",
+			"}",
+			"",
+		}, "\n")), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		prompt, err := buildRolePrompt(e, loopState{
+			Task:       task,
+			NextRole:   "reviewer",
+			NextAction: "review latest handoff",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, want := range []string{
+			"## Git diff",
+			"func runCommand(name string, trusted bool) error",
+			`case "write":`,
+			`case "read":`,
+			"Untracked files:",
+			"new_command.go",
+			"diff --git a/new_command.go b/new_command.go",
+			"func newCommand() error",
+			"Start every reviewer run with a full-diff review",
+			"Enumerate the changed functions and their sibling branches or paths",
+			"success, error, early-return, 404, fallback, read counterpart, and write counterpart paths",
+			"When verifying a provided finding, inspect the whole enclosing function and sibling branches",
+			"Include an explicit branch checklist",
+		} {
+			if !strings.Contains(prompt, want) {
+				t.Fatalf("reviewer prompt missing %q:\n%s", want, prompt)
+			}
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
+func TestLocalAIReviewInputIncludesUntrackedFiles(t *testing.T) {
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		task, err := openTask(e, []string{"Local Reviewer Untracked"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeReviewerParityFixture(t, cwd)
+		if err := os.WriteFile(filepath.Join(cwd, "untracked_review.go"), []byte(strings.Join([]string{
+			"package fixture",
+			"",
+			"func untrackedReviewPath() error {",
+			"	return nil",
+			"}",
+			"",
+		}, "\n")), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		input := localAIReviewInput(e, loopState{
+			Task:       task,
+			NextAction: "review latest handoff",
+		})
+		for _, want := range []string{
+			"Git diff stat:",
+			"Untracked files:",
+			"untracked_review.go",
+			"Git diff:",
+			"diff --git a/untracked_review.go b/untracked_review.go",
+			"func untrackedReviewPath() error",
+		} {
+			if !strings.Contains(input, want) {
+				t.Fatalf("local AI reviewer input missing %q:\n%s", want, input)
+			}
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
+func writeReviewerParityFixture(t *testing.T, cwd string) {
+	t.Helper()
+	runGit(t, cwd, "init")
+	runGit(t, cwd, "config", "user.email", "agents@example.test")
+	runGit(t, cwd, "config", "user.name", "Agents Test")
+	before := strings.Join([]string{
+		"package fixture",
+		"",
+		"func runCommand(name string, trusted bool) error {",
+		"	switch name {",
+		`	case "write":`,
+		"		return writeData()",
+		`	case "read":`,
+		"		return readData()",
+		"	default:",
+		"		return nil",
+		"	}",
+		"}",
+		"",
+		"func writeData() error { return nil }",
+		"func readData() error { return nil }",
+		"",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(cwd, "commands.go"), []byte(before), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, cwd, "add", "commands.go")
+	runGit(t, cwd, "commit", "-m", "base")
+	after := strings.Replace(before, "\t\treturn writeData()", "\t\tif !trusted {\n\t\t\treturn nil\n\t\t}\n\t\treturn writeData()", 1)
+	if err := os.WriteFile(filepath.Join(cwd, "commands.go"), []byte(after), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func runGit(t *testing.T, cwd string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", cwd}, args...)...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v failed: %v\n%s", args, err, out)
 	}
 }
 
