@@ -1743,6 +1743,68 @@ func TestCoordinatorCannotRecordVerificationDirective(t *testing.T) {
 	}
 }
 
+func TestNonExecutableVerificationDirectiveIsIgnored(t *testing.T) {
+	for _, cmd := range []string{
+		"(Not executable in this environment, verified manually)",
+		"(Test execution could not be performed)",
+	} {
+		cmd := cmd
+		t.Run(cmd, func(t *testing.T) {
+			raw := "Looks clean.\n\n```agents-verify\n{\"text\":\"Manually inspected files.\",\"cmd\":\"" + cmd + "\"}\n```\n"
+			code := withTempProcessEnv(t, func(home, cwd string) int {
+				e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+				if _, err := openTask(e, []string{"Review"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC)); err != nil {
+					t.Fatal(err)
+				}
+				cleaned, err := applyRoleOutputDirectives(e, "reviewer", raw)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if strings.Contains(cleaned, "agents-verify") {
+					t.Fatalf("directive should be removed from cleaned output:\n%s", cleaned)
+				}
+				stats, err := readTaskStats(cwd, readActiveTask(cwd).Path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if stats.Verification != 0 || stats.VerificationFail != 0 {
+					t.Fatalf("non-executable verification must be ignored, stats=%+v", stats)
+				}
+				return 0
+			})
+			if code != 0 {
+				t.Fatalf("withTempProcessEnv code=%d", code)
+			}
+		})
+	}
+}
+
+func TestReviewerPromptAddsGeminiToolGuidance(t *testing.T) {
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json"), agentDesc: "gemini (model gemini-2.5-flash-lite)"}
+		task, err := openTask(e, []string{"Review"}, time.Date(2026, 6, 5, 10, 0, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		prompt, err := buildRolePrompt(e, loopState{Task: task, NextRole: "reviewer", NextAction: "review latest handoff"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, want := range []string{"Gemini CLI note", "run_shell_command", "summarize the review without an `agents-verify` block"} {
+			if !strings.Contains(prompt, want) {
+				t.Fatalf("Gemini reviewer prompt missing %q:\n%s", want, prompt)
+			}
+		}
+		if strings.Contains(prompt, `{"text":"specific checks performed and review result","cmd":"go test ./..."}`) {
+			t.Fatalf("Gemini reviewer prompt should not include the generic verification directive:\n%s", prompt)
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
 func TestCoordinatorPromptAvoidsCannedProgressAndAllowsReadOnlyRepoInspection(t *testing.T) {
 	code := withTempProcessEnv(t, func(home, cwd string) int {
 		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
@@ -4023,6 +4085,8 @@ func TestReadConfigParsesModelSettings(t *testing.T) {
 		"  claude_model: opus",
 		"  claude_effort: high",
 		"  cursor_model: claude-4.6-sonnet-medium-thinking",
+		"  gemini_model: gemini-3-pro",
+		"  antigravity_model: Gemini 3.5 Flash (Medium)",
 		"  local_ai_enabled: true",
 		"  local_ai_review_first_pass: true",
 		"  local_ai_provider: lmstudio",
@@ -4045,7 +4109,8 @@ func TestReadConfigParsesModelSettings(t *testing.T) {
 	if cfg.Settings.CodexModel != "gpt-5.5" || cfg.Settings.CodexReasoning != "low" {
 		t.Fatalf("unexpected codex settings: %+v", cfg.Settings)
 	}
-	if cfg.Settings.ClaudeModel != "opus" || cfg.Settings.ClaudeEffort != "high" || cfg.Settings.CursorModel != "claude-4.6-sonnet-medium-thinking" {
+	if cfg.Settings.ClaudeModel != "opus" || cfg.Settings.ClaudeEffort != "high" || cfg.Settings.CursorModel != "claude-4.6-sonnet-medium-thinking" ||
+		cfg.Settings.GeminiModel != "gemini-3-pro" || cfg.Settings.AntigravityModel != "Gemini 3.5 Flash (Medium)" {
 		t.Fatalf("unexpected settings: %+v", cfg.Settings)
 	}
 	if !cfg.Settings.LocalAIEnabled || !cfg.Settings.LocalAIReviewFirstPass || cfg.Settings.LocalAIProvider != "lmstudio" ||
@@ -4952,6 +5017,35 @@ func TestResolveAgentCommandUsesProviderModelSettings(t *testing.T) {
 		if !strings.Contains(cursorCommand, want) {
 			t.Fatalf("cursor command missing %q:\n%s", want, cursorCommand)
 		}
+	}
+
+	geminiCommand, err := resolveAgentCommand("gemini", agentSettings{GeminiModel: "gemini-3-pro"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"gemini --skip-trust", "--approval-mode auto_edit", "--model 'gemini-3-pro'", `--prompt "$(cat {prompt_file})"`} {
+		if !strings.Contains(geminiCommand, want) {
+			t.Fatalf("gemini command missing %q:\n%s", want, geminiCommand)
+		}
+	}
+
+	antigravityCommand, err := resolveAgentCommand("agy", agentSettings{AntigravityModel: "Gemini 3.5 Flash (Medium)"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"agy --dangerously-skip-permissions", "--model 'Gemini 3.5 Flash (Medium)'", `--print "$(cat {prompt_file})"`} {
+		if !strings.Contains(antigravityCommand, want) {
+			t.Fatalf("antigravity command missing %q:\n%s", want, antigravityCommand)
+		}
+	}
+
+	antigravityAliasCommand, err := resolveAgentCommand("antigravity", agentSettings{AntigravityModel: "Gemini 3.1 Pro (High)"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(antigravityAliasCommand, "agy --dangerously-skip-permissions") ||
+		!strings.Contains(antigravityAliasCommand, "--model 'Gemini 3.1 Pro (High)'") {
+		t.Fatalf("antigravity alias command missing expected flags:\n%s", antigravityAliasCommand)
 	}
 }
 
@@ -7222,6 +7316,9 @@ func TestAgentDescriptorQualifiesModel(t *testing.T) {
 		{"claude", agentSettings{ClaudeModel: "opus", ClaudeEffort: "xhigh"}, "claude (model opus, reasoning xhigh)"},
 		{"agent", agentSettings{CursorModel: "gpt-5"}, "agent (model gpt-5)"},
 		{"cursor", agentSettings{}, "cursor (model provider default)"},
+		{"gemini", agentSettings{GeminiModel: "gemini-3-pro"}, "gemini (model gemini-3-pro)"},
+		{"agy", agentSettings{AntigravityModel: "Gemini 3.5 Flash (Medium)"}, "agy (model Gemini 3.5 Flash (Medium))"},
+		{"antigravity", agentSettings{AntigravityModel: "Gemini 3.1 Pro (High)"}, "antigravity (model Gemini 3.1 Pro (High))"},
 		{"my-agent {prompt_file}", agentSettings{}, "my-agent {prompt_file} (custom command)"},
 		{"", agentSettings{}, ""},
 	}

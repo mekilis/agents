@@ -122,7 +122,7 @@ func localAIProviderRole(rc roleConfig, settings agentSettings) bool {
 		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(rc.Provider)) {
-	case "cursor", "cursor-agent", "agent", "codex", "claude":
+	case "cursor", "cursor-agent", "agent", "codex", "claude", "gemini", "agy", "antigravity":
 		return false
 	}
 	return strings.TrimSpace(rc.Provider) != ""

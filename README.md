@@ -59,16 +59,10 @@ it yourself, write `agents completion zsh` to a directory on your zsh `fpath`.
 
 ## Release
 
-Releases are published by GoReleaser from version tags:
-
-```bash
-git tag v0.4.1
-git push origin v0.4.1
-```
-
-The `release` workflow builds archives for Linux, macOS, and Windows, attaches
-checksums, and publishes them to GitHub Releases. The workflow uses Node 24
-compatible GitHub Actions.
+Releases are published by GoReleaser from `v*` tags. Push a new semantic
+version tag to run the `release` workflow, which builds archives for Linux,
+macOS, and Windows, attaches checksums, and publishes them to GitHub Releases.
+The workflow uses Node 24 compatible GitHub Actions.
 
 ## Tutorial
 
@@ -136,7 +130,7 @@ agents status
 agents status --json
 ```
 
-One command from intent to a running loop — `agents go` opens a task, records
+One command from intent to a running loop: `agents go` opens a task, records
 the scope, hands off to the implementer, and drives the loop until a stop
 condition. No role configuration questions are asked of the user:
 
@@ -149,18 +143,18 @@ agents go --continue "Review the current state"        # continue the active tas
 agents go --reviewer "Inspect the latest changes"      # start with reviewer, then keep looping
 ```
 
-On a terminal, `go` renders the unified loop view: two lanes — Building and
-Checking — with live agent output, and a status bar tracking iterations and
+On a terminal, `go` renders the unified loop view: two lanes, Building and
+Checking, with live agent output, and a status bar tracking iterations and
 the findings burn-down. The waiting lane shows why it waits; roles never lead
 the UI (they stay in records and logs). Press `q` twice to stop after the
 current run, `p` to pause after the current run; endings are translated to
-plain language ("Done and independently checked — your call.", "The agents
-are stuck — …"). When stdout is not a terminal — CI, pipes — or with
+plain language ("Done and independently checked - your call.", "The agents
+are stuck - ..."). When stdout is not a terminal, such as CI or pipes, or with
 `--plain`, `go` falls back to today's plain loop output automatically.
 
 When the loop reaches the human boundary, the view flips to the
 **Ready for you** screen: what was asked (scope), what changed
-(`git diff --stat`), the findings history, and the verification evidence —
+(`git diff --stat`), the findings history, and the verification evidence,
 then one decision. `a` accepts: the task is archived and a commit message is
 suggested (agents never commit; that stays behind human approval). `i`
 iterates: describe what should change, and the feedback becomes a handoff
@@ -232,12 +226,12 @@ Every record carries an actor identity, resolved from `--by`, then the
 launches a role, it sets `AGENTS_ACTOR` to the role name in the agent's
 environment, so records written by agents are attributed automatically.
 
-Actor names alone are not enough: `cursor`, `codex`, and `claude` name tools,
-not models. `agents run` also sets `AGENTS_AGENT` to a qualified descriptor —
-for example `codex (model gpt-5.5, reasoning high)` — and records carry it as
-an `Agent:` line, so it is always inspectable which model produced a decision,
-finding, fix, or verification. Run output and `agents dispatch` show the same
-qualified descriptor.
+Actor names alone are not enough: `cursor`, `codex`, `claude`, `gemini`, and
+`agy` name tools, not models. `agents run` also sets `AGENTS_AGENT` to a
+qualified descriptor, for example `codex (model gpt-5.5, reasoning high)`, and
+records carry it as an `Agent:` line, so it is always inspectable which model
+produced a decision, finding, fix, or verification. Run output and
+`agents dispatch` show the same qualified descriptor.
 
 Independent verification is enforced, not suggested:
 
@@ -272,7 +266,7 @@ agents mcp                      # serve local Agents tools over MCP stdio
   independent verification evidence is newer than the latest handoff),
 - the next role has no configured agent,
 - a role run records no coordination progress (exit code 1, instead of
-  churning) — including a run whose only "progress" is another handoff to the
+  churning), including a run whose only "progress" is another handoff to the
   same target with no findings or verification movement,
 - or the role-run budget is exhausted (exit code 1, rerun to continue).
 
@@ -313,8 +307,8 @@ provider artifacts under `.agents/runs/`: prompts in `prompts/` and raw live
 logs in `logs/`. Those logs are for debugging provider behavior; the native
 watch path is the cleaned task run activity. The run log launch marker records
 the role, agent, model, and reasoning setting. Built-in agent names are
-`cursor`, `cursor-agent`, `agent`, `codex`, and `claude`. Custom commands can
-include `{prompt_file}`:
+`cursor`, `cursor-agent`, `agent`, `codex`, `claude`, `gemini`, `agy`, and
+`antigravity`. Custom commands can include `{prompt_file}`:
 
 ```bash
 tail -f .agents/runs/logs/2026-06-05T120000Z-implementer.log
@@ -333,6 +327,11 @@ providers:
   claude:
     model: ""
     effort: high
+  gemini:
+    model: gemini-2.5-flash-lite
+  agy:
+    provider: agy
+    model: Gemini 3.5 Flash (Low)
   cursor:
     model: gpt-5
 roles:
@@ -347,14 +346,21 @@ roles:
 ```
 
 Providers are named by who runs them or how Agents reaches them. Built-in
-provider names are `cursor`, `cursor-agent`, `agent`, `codex`, and `claude`;
-local OpenAI-compatible providers such as `lmstudio` and `ollama` can be used
+provider names are `cursor`, `cursor-agent`, `agent`, `codex`, `claude`,
+`gemini`, `agy`, and `antigravity`; local OpenAI-compatible providers such as
+`lmstudio` and `ollama` can be used
 for coordinator preflight and as reviewer list items. Models and
 provider-specific settings live under `providers`; use `type:
 openai_compatible` for local chat completion servers. Per-role
 `model`/`reasoning` values override the named provider for that role only. Set
 `cmd: my-agent {prompt_file}` as an advanced escape hatch, or put provider
 flags directly in a custom role command.
+
+For Google-side CLIs, `agy` is the recommended provider for now because it can
+run shell checks in Agents loops. `gemini` works best with an explicit model
+such as `gemini-2.5-flash-lite`, but the Gemini CLI headless environment may
+expose limited tools; if it cannot actually run checks, Agents will not treat
+manual or non-executable `agents-verify` commands as passing verification.
 
 For review-heavy projects, prefer an ordered reviewer pipeline: a local coder or
 local reviewer first pass for fast branch-parity checks, followed by Codex with
@@ -375,8 +381,9 @@ roles:
       reasoning: high
 ```
 
-Legacy `settings.local_ai_*`, `settings.codex_*`, `settings.claude_*`, and
-`settings.cursor_model` keys still work, but new config should prefer
+Legacy `settings.local_ai_*`, `settings.codex_*`, `settings.claude_*`,
+`settings.cursor_model`, `settings.gemini_model`, and
+`settings.antigravity_model` keys still work, but new config should prefer
 `providers` and `roles.reviewer`.
 
 ```bash
@@ -389,7 +396,7 @@ Agents records and routes coordination state, attributes every record to an
 actor, enforces independent verification, and `agents run` manages the
 implementer/reviewer loop across configured local agent commands until a stop
 condition or the human approval boundary. It does not automate commits, push
-branches, or create pull requests — those stay behind human approval.
+branches, or create pull requests; those stay behind human approval.
 Natural-language top-level commands are product direction; use the scriptable
 commands below in the current build. `agents archive` is the local cleanup
 boundary for completed task state: it writes a summary and prunes the active

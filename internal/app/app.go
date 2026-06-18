@@ -118,7 +118,7 @@ type reviewConfig struct {
 }
 
 // roleConfig holds who plays a role. Provider is a provider-map key or built-in
-// agent name (cursor, cursor-agent, agent, codex, claude); Cmd is an advanced
+// agent name (cursor, cursor-agent, agent, codex, claude, gemini, agy, antigravity); Cmd is an advanced
 // escape hatch containing {prompt_file}. Model and Reasoning override provider
 // settings for this role only.
 type roleConfig struct {
@@ -179,6 +179,8 @@ type agentSettings struct {
 	ClaudeModel            string
 	ClaudeEffort           string
 	CursorModel            string
+	GeminiModel            string
+	AntigravityModel       string
 	LocalAIEnabled         bool
 	LocalAIReviewFirstPass bool
 	LocalAIProvider        string
@@ -366,7 +368,7 @@ func currentEnv(in io.Reader) (env, error) {
 }
 
 // agentDescriptor qualifies an agent name with the model and reasoning that
-// will actually run. Built-in names (cursor, codex, claude) identify tools,
+// will actually run. Built-in names (cursor, codex, claude, gemini, agy) identify tools,
 // not models, so durable records and run output should carry both.
 func agentDescriptor(agent string, settings agentSettings) string {
 	label := strings.TrimSpace(agent)
@@ -717,6 +719,10 @@ func readConfig(cwd string) (config, error) {
 				cfg.Settings.ClaudeEffort = value
 			case "cursor_model":
 				cfg.Settings.CursorModel = value
+			case "gemini_model":
+				cfg.Settings.GeminiModel = value
+			case "antigravity_model", "agy_model":
+				cfg.Settings.AntigravityModel = value
 			case "local_ai_enabled":
 				cfg.Settings.LocalAIEnabled = strings.EqualFold(value, "true")
 			case "local_ai_review_first_pass":
@@ -795,6 +801,14 @@ func providerSettings(pc providerConfig, settings agentSettings) agentSettings {
 		if model != "" {
 			effective.CursorModel = model
 		}
+	case "gemini":
+		if model != "" {
+			effective.GeminiModel = model
+		}
+	case "agy", "antigravity":
+		if model != "" {
+			effective.AntigravityModel = model
+		}
 	default:
 		if model != "" {
 			effective.Model = model
@@ -843,6 +857,14 @@ func roleSettings(rc roleConfig, settings agentSettings) agentSettings {
 	case "cursor", "cursor-agent", "agent":
 		if model != "" {
 			effective.CursorModel = model
+		}
+	case "gemini":
+		if model != "" {
+			effective.GeminiModel = model
+		}
+	case "agy", "antigravity":
+		if model != "" {
+			effective.AntigravityModel = model
 		}
 	default:
 		if model != "" {
@@ -2804,6 +2826,10 @@ settings:
   # Cursor Agent: run 'agent models' or 'cursor-agent --list-models' for account-specific choices
   # Common examples from CLI help: gpt-5, claude-4.6-sonnet-medium, claude-4.6-sonnet-medium-thinking
   cursor_model: ""
+  # Gemini CLI: run 'gemini --help' for current model and auth behavior.
+  gemini_model: ""
+  # Antigravity CLI: run 'agy models' for account-specific choices.
+  antigravity_model: ""
 providers:
   # Local OpenAI-compatible providers can coordinate or act as reviewer entries.
   # LM Studio: base URL http://127.0.0.1:1234/v1.
@@ -2813,7 +2839,7 @@ providers:
     base_url: http://127.0.0.1:1234/v1
     model: google/gemma-3-4b
     timeout_ms: 800
-# Each role is a provider name (cursor, cursor-agent, agent, codex, claude)
+# Each role is a provider name (cursor, cursor-agent, agent, codex, claude, gemini, agy, antigravity)
 # or a map with provider plus optional model/reasoning overrides. The reviewer
 # role can also be an ordered list, e.g.:
 #   reviewer:
@@ -5268,8 +5294,24 @@ func resolveAgentCommand(agent string, settings agentSettings) (string, error) {
 		}
 		args = append(args, `"$(cat `+promptFileMarker+`)"`)
 		return strings.Join(args, " "), nil
+	case "gemini":
+		args := []string{"gemini --skip-trust --approval-mode auto_edit"}
+		geminiModel := firstNonEmpty(settings.GeminiModel, settings.Model)
+		if strings.TrimSpace(geminiModel) != "" {
+			args = append(args, "--model "+shellQuote(strings.TrimSpace(geminiModel)))
+		}
+		args = append(args, `--prompt "$(cat `+promptFileMarker+`)"`)
+		return strings.Join(args, " "), nil
+	case "agy", "antigravity":
+		args := []string{"agy --dangerously-skip-permissions"}
+		antigravityModel := firstNonEmpty(settings.AntigravityModel, settings.Model)
+		if strings.TrimSpace(antigravityModel) != "" {
+			args = append(args, "--model "+shellQuote(strings.TrimSpace(antigravityModel)))
+		}
+		args = append(args, `--print "$(cat `+promptFileMarker+`)"`)
+		return strings.Join(args, " "), nil
 	default:
-		return "", fmt.Errorf("unknown agent %q: use cursor, cursor-agent, agent, codex, claude, or a command containing %s", agent, promptFileMarker)
+		return "", fmt.Errorf("unknown agent %q: use cursor, cursor-agent, agent, codex, claude, gemini, agy, antigravity, or a command containing %s", agent, promptFileMarker)
 	}
 }
 
@@ -5931,6 +5973,10 @@ func effectiveModelSetting(agent string, settings agentSettings) string {
 		return settings.ClaudeModel
 	case "cursor", "cursor-agent", "agent":
 		return settings.CursorModel
+	case "gemini":
+		return firstNonEmpty(settings.GeminiModel, settings.Model)
+	case "agy", "antigravity":
+		return firstNonEmpty(settings.AntigravityModel, settings.Model)
 	default:
 		return settings.Model
 	}
@@ -6115,7 +6161,12 @@ func buildRolePrompt(e env, state loopState) (string, error) {
 		fmt.Fprintln(&b, "  ```agents-progress")
 		fmt.Fprintln(&b, `  {"status":"Editing files","detail":"Updating the CLI parser and focused tests"}`)
 		fmt.Fprintln(&b, "  ```")
-		fmt.Fprintln(&b, "- Run relevant checks.")
+		if isGeminiAgent(e) {
+			fmt.Fprintln(&b, "- Gemini CLI note: use only tools exposed by your environment. Prior observed available tools include `grep_search` and `replace`; `run_shell_command` is not available here.")
+			fmt.Fprintln(&b, "- Gemini CLI note: do not claim you ran shell checks unless the environment actually provides a working shell tool. If shell checks are unavailable, say so in the reviewer handoff.")
+		} else {
+			fmt.Fprintln(&b, "- Run relevant checks.")
+		}
 		fmt.Fprintln(&b, "- Mark findings you fixed with `agents finding fix <finding> --evidence \"what proves the fix\"`.")
 		fmt.Fprintln(&b, "- Keep task state current: `agents task status \"where things stand\"` and `agents task next \"what should happen next\"`.")
 		fmt.Fprintln(&b, "- When ready for review, end with one `agents-handoff` JSON fenced block so the parent process records the reviewer handoff:")
@@ -6151,18 +6202,26 @@ func buildRolePrompt(e env, state loopState) (string, error) {
 		fmt.Fprintln(&b, "  ```agents-progress")
 		fmt.Fprintln(&b, `  {"status":"Running checks","detail":"Verifying tests and reviewing the diff"}`)
 		fmt.Fprintln(&b, "  ```")
+		geminiAgent := isGeminiAgent(e)
+		if geminiAgent {
+			appendProviderPromptGuidance(&b)
+		}
 		fmt.Fprintln(&b, "- Record each real issue as a finding:")
 		fmt.Fprintln(&b, `  agents finding add "summary" --severity low|medium|high`)
 		fmt.Fprintln(&b, "  Open findings automatically route the loop back to the implementer; do not record passing verification when unresolved issues remain.")
 		fmt.Fprintln(&b, "- For findings marked fixed, verify them independently with evidence:")
 		fmt.Fprintln(&b, `  agents finding verify <finding> --evidence "what you checked"`)
-		fmt.Fprintln(&b, "- When the work is clean, end with one `agents-verify` JSON fenced block so the parent process records reproducible verification evidence:")
-		fmt.Fprintln(&b, "```agents-verify")
-		fmt.Fprintln(&b, `{"text":"specific checks performed and review result","cmd":"go test ./..."}`)
-		fmt.Fprintln(&b, "```")
-		fmt.Fprintln(&b, "  Replace the text and command with the actual verification you performed; do not copy placeholder evidence.")
-		fmt.Fprintln(&b, "  The parent Agents process records this verification; do not run `agents verify` yourself.")
-		fmt.Fprintln(&b, "  Recording passing verification reaches the human approval boundary; nothing ships on your claim alone.")
+		if geminiAgent {
+			fmt.Fprintln(&b, "- When the work is clean, summarize the review without an `agents-verify` block. Gemini CLI in this environment cannot run shell checks, so command verification must be recorded by a human or another agent.")
+		} else {
+			fmt.Fprintln(&b, "- When the work is clean, end with one `agents-verify` JSON fenced block so the parent process records reproducible verification evidence:")
+			fmt.Fprintln(&b, "```agents-verify")
+			fmt.Fprintln(&b, `{"text":"specific checks performed and review result","cmd":"go test ./..."}`)
+			fmt.Fprintln(&b, "```")
+			fmt.Fprintln(&b, "  Replace the text and command with the actual verification you performed; do not copy placeholder evidence.")
+			fmt.Fprintln(&b, "  The parent Agents process records this verification; do not run `agents verify` yourself.")
+			fmt.Fprintln(&b, "  Recording passing verification reaches the human approval boundary; nothing ships on your claim alone.")
+		}
 		fmt.Fprintln(&b, "- Summarize the review in your response: issues first, then what was verified.")
 		fmt.Fprintln(&b, "- Keep build caches, compiled binaries, and scratch files out of the repository (including .agents/); use the system temp directory instead.")
 		fmt.Fprintln(&b, "- Do not edit implementation code, do not mark findings fixed, and do not commit.")
@@ -6315,6 +6374,9 @@ func applyVerificationDirective(e env, actor string, directive verificationDirec
 	if verificationDirectivePlaceholder(directive) {
 		return nil
 	}
+	if verificationDirectiveNonExecutable(directive) {
+		return nil
+	}
 	if !policyForRole(actor).MayRecordVerify {
 		return fmt.Errorf("%s cannot record verification", actor)
 	}
@@ -6329,6 +6391,29 @@ func applyVerificationDirective(e env, actor string, directive verificationDirec
 func verificationDirectivePlaceholder(directive verificationDirective) bool {
 	return strings.EqualFold(strings.TrimSpace(directive.Text), "specific checks performed and review result") &&
 		strings.EqualFold(strings.TrimSpace(directive.Cmd), "go test ./...")
+}
+
+func verificationDirectiveNonExecutable(directive verificationDirective) bool {
+	cmd := strings.ToLower(strings.TrimSpace(directive.Cmd))
+	if cmd == "" {
+		return false
+	}
+	return strings.Contains(cmd, "not executable") ||
+		strings.Contains(cmd, "manual") ||
+		strings.Contains(cmd, "verified manually") ||
+		strings.Contains(cmd, "not run") ||
+		strings.Contains(cmd, "could not be performed") ||
+		strings.Contains(cmd, "could not be executed")
+}
+
+func isGeminiAgent(e env) bool {
+	agent := strings.ToLower(strings.TrimSpace(e.agentDesc))
+	return strings.Contains(agent, "gemini")
+}
+
+func appendProviderPromptGuidance(b *strings.Builder) {
+	fmt.Fprintln(b, "- Gemini CLI note: use only tools exposed by your environment. Prior observed available tools include `grep_search` and `replace`; `run_shell_command` is not available here.")
+	fmt.Fprintln(b, "- Gemini CLI note: do not emit `agents-verify` with a fake, manual, or non-executable `cmd`. If you cannot actually run a command, review the code and write a normal summary instead; leave command verification for a human or another agent.")
 }
 
 func appendPromptFile(b *strings.Builder, cwd, taskPath, name, heading string) {

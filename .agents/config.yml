@@ -19,7 +19,7 @@ providers:
     reasoning: low
   agent:
     model: gpt-5.5-low
-# Each role is a provider name (cursor, cursor-agent, agent, codex, claude)
+# Each role is a provider name (cursor, cursor-agent, agent, codex, claude, gemini, agy, antigravity)
 # or a map with provider plus optional model/reasoning overrides:
 #   reviewer:
 #     provider: codex
