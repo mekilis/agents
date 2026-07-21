@@ -1,0 +1,6 @@
+# Handoff: reviewer
+
+To: reviewer
+From: smart
+
+Release v0.5.0 preflight evidence: reviewed v0.4.3..HEAD (9 commits: addressed inbox feature/fix/tests/docs plus task archive state), confirmed v0.5.0 is semver-appropriate for a new addressed agent inbox feature, inspected README.md inbox docs and tutorials/agent-inbox-two-harnesses.md plus tutorials/agent-inbox-demo.sh, and inspected .goreleaser.yaml. Fresh temporary binary demo passed from /tmp-style workspace: direct handoff to cursor-one listed and consumed, independent finding fix/verify recorded by different actors, watch --as codex-review emitted backlog inbox_item, and status showed codex-review unconsumed=1/cursor-one unconsumed=0. Go gates now pass with isolated caches: gofmt clean, go build ./cmd/agents, go vet ./..., go test ./... (291 passed), go test -race ./... (291 passed). I fixed a release-blocking race-test issue in internal/app/inbox.go and internal/app/app_test.go by guarding the inbox watch sleep hook replacement with a mutex-backed helper. go mod tidy is clean. Open blocker recorded: GoReleaser executable validation did not complete because goreleaser is not installed and go-run/mise ephemeral attempts were killed before reaching check/snapshot output; do not push/tag until `goreleaser check` and preferably `goreleaser release --snapshot --clean --skip=publish` pass.

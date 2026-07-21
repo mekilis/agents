@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 )
@@ -213,6 +214,26 @@ type inboxOptions struct {
 var inboxWatchSleep = func() {
 	time.Sleep(200 * time.Millisecond)
 }
+var inboxWatchSleepMu sync.Mutex
+
+func sleepInboxWatch() {
+	inboxWatchSleepMu.Lock()
+	sleep := inboxWatchSleep
+	inboxWatchSleepMu.Unlock()
+	sleep()
+}
+
+func setInboxWatchSleep(sleep func()) func() {
+	inboxWatchSleepMu.Lock()
+	oldSleep := inboxWatchSleep
+	inboxWatchSleep = sleep
+	inboxWatchSleepMu.Unlock()
+	return func() {
+		inboxWatchSleepMu.Lock()
+		inboxWatchSleep = oldSleep
+		inboxWatchSleepMu.Unlock()
+	}
+}
 
 func parseInboxArgs(args []string) (inboxOptions, error) {
 	var opts inboxOptions
@@ -296,7 +317,7 @@ func runInboxWatch(out, errOut io.Writer, e env, opts inboxOptions) int {
 			data, _ := json.Marshal(map[string]any{"event": "inbox_item", "agent": opts.As, "item": item})
 			fmt.Fprintln(out, string(data))
 		}
-		inboxWatchSleep()
+		sleepInboxWatch()
 	}
 }
 

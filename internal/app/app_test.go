@@ -950,14 +950,13 @@ func TestInboxWatchEmitsExistingAndNewMatchingItems(t *testing.T) {
 
 		ready := make(chan struct{})
 		release := make(chan struct{})
-		oldSleep := inboxWatchSleep
 		var once sync.Once
-		inboxWatchSleep = func() {
+		restoreSleep := setInboxWatchSleep(func() {
 			once.Do(func() { close(ready) })
 			<-release
-		}
+		})
 		defer func() {
-			inboxWatchSleep = oldSleep
+			restoreSleep()
 			close(release)
 		}()
 
@@ -1092,14 +1091,13 @@ func TestWatchAsEmitsInboxEvent(t *testing.T) {
 		}
 		ready := make(chan struct{})
 		release := make(chan struct{})
-		oldSleep := inboxWatchSleep
 		var once sync.Once
-		inboxWatchSleep = func() {
+		restoreSleep := setInboxWatchSleep(func() {
 			once.Do(func() { close(ready) })
 			<-release
-		}
+		})
 		defer func() {
-			inboxWatchSleep = oldSleep
+			restoreSleep()
 			close(release)
 		}()
 
