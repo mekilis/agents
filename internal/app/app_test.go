@@ -853,7 +853,78 @@ func TestAddressedHandoffRequiresRegisteredAgent(t *testing.T) {
 	}
 }
 
-func TestInboxWatchEmitsOnlyNewMatchingItem(t *testing.T) {
+func TestParseInboxHandoffOnlyUsesHeaderBlockForRouting(t *testing.T) {
+	dir := t.TempDir()
+
+	tests := []struct {
+		name      string
+		content   string
+		wantTo    string
+		wantAgent string
+		wantFrom  string
+	}{
+		{
+			name: "addressed header with inert body and quoted handoff",
+			content: strings.Join([]string{
+				"# Handoff: implementer",
+				"",
+				"To: Implementer",
+				"Agent: Alice.One",
+				"From: Supervisor",
+				"",
+				"Body line",
+				"To: reviewer",
+				"From: body",
+				"Agent: bob",
+				"",
+				"> # Handoff: reviewer",
+				">",
+				"> To: reviewer",
+				"> Agent: bob",
+				"> From: quoted",
+				"",
+			}, "\n"),
+			wantTo:    "Implementer",
+			wantAgent: "Alice.One",
+			wantFrom:  "Supervisor",
+		},
+		{
+			name: "case insensitive role header",
+			content: strings.Join([]string{
+				"# Handoff: reviewer",
+				"",
+				"tO: reviewer",
+				"fRoM: implementer",
+				"",
+				"Agent: body-only",
+				"",
+			}, "\n"),
+			wantTo:   "reviewer",
+			wantFrom: "implementer",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(dir, strings.ReplaceAll(tt.name, " ", "-")+".md")
+			if err := os.WriteFile(path, []byte(tt.content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			item, err := parseInboxHandoff(path, "tasks/test", filepath.Base(path))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if item.To != tt.wantTo || item.Agent != tt.wantAgent || item.From != tt.wantFrom {
+				t.Fatalf("routing should come only from header block: %+v", item)
+			}
+			if strings.Contains(item.Agent, "body-only") {
+				t.Fatalf("body agent line should not control routing: %+v", item)
+			}
+		})
+	}
+}
+
+func TestInboxWatchEmitsExistingAndNewMatchingItems(t *testing.T) {
 	code := withTempProcessEnv(t, func(home, cwd string) int {
 		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
 		if _, err := openTask(e, []string{"Watch Inbox"}, time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)); err != nil {
@@ -866,6 +937,14 @@ func TestInboxWatchEmitsOnlyNewMatchingItem(t *testing.T) {
 			t.Fatal(err)
 		}
 		if _, err := addHandoff(e, []string{"--to", "implementer", "existing work"}, time.Date(2026, 7, 21, 10, 1, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		consumed, err := addHandoff(e, []string{"--to", "implementer", "--agent", "alice", "consumed work"}, time.Date(2026, 7, 21, 10, 1, 30, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		consumedID := strings.TrimSuffix(filepath.Base(consumed.Path), ".md")
+		if _, err := consumeInboxItem(e, "alice", consumedID); err != nil {
 			t.Fatal(err)
 		}
 
@@ -886,7 +965,23 @@ func TestInboxWatchEmitsOnlyNewMatchingItem(t *testing.T) {
 		defer reader.Close()
 		defer writer.Close()
 		var errOut bytes.Buffer
+		lineCh := make(chan string, 2)
+		errCh := make(chan error, 1)
+		go func() {
+			scanner := bufio.NewScanner(reader)
+			for scanner.Scan() {
+				lineCh <- scanner.Text()
+			}
+			if err := scanner.Err(); err != nil {
+				errCh <- err
+			}
+		}()
 		go runInboxWatch(writer, &errOut, e, inboxOptions{As: "alice", Watch: true})
+
+		event := readInboxWatchEvent(t, lineCh, errCh, &errOut)
+		if event.Event != "inbox_item" || event.Agent != "alice" || event.Item.Text != "existing work" {
+			t.Fatalf("unexpected existing watch event: %+v", event)
+		}
 
 		<-ready
 		if _, err := addHandoff(e, []string{"--to", "reviewer", "wrong role"}, time.Date(2026, 7, 21, 10, 2, 0, 0, time.UTC)); err != nil {
@@ -900,40 +995,44 @@ func TestInboxWatchEmitsOnlyNewMatchingItem(t *testing.T) {
 		}
 		release <- struct{}{}
 
-		lineCh := make(chan string, 1)
-		errCh := make(chan error, 1)
-		go func() {
-			line, err := bufio.NewReader(reader).ReadString('\n')
-			if err != nil {
-				errCh <- err
-				return
-			}
-			lineCh <- line
-		}()
-
-		select {
-		case err := <-errCh:
-			t.Fatalf("watch read failed: %v stderr=%s", err, errOut.String())
-		case line := <-lineCh:
-			var event struct {
-				Event string    `json:"event"`
-				Agent string    `json:"agent"`
-				Item  inboxItem `json:"item"`
-			}
-			if err := json.Unmarshal([]byte(line), &event); err != nil {
-				t.Fatalf("watch line should be stable JSON: %v\n%s", err, line)
-			}
-			if event.Event != "inbox_item" || event.Agent != "alice" || event.Item.Text != "new direct work" {
-				t.Fatalf("unexpected watch event: %+v", event)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatalf("timed out waiting for watch event stderr=%s", errOut.String())
+		event = readInboxWatchEvent(t, lineCh, errCh, &errOut)
+		if event.Event != "inbox_item" || event.Agent != "alice" || event.Item.Text != "new direct work" {
+			t.Fatalf("unexpected new watch event: %+v", event)
 		}
 		return 0
 	})
 	if code != 0 {
 		t.Fatalf("withTempProcessEnv code=%d", code)
 	}
+}
+
+func readInboxWatchEvent(t *testing.T, lineCh <-chan string, errCh <-chan error, errOut *bytes.Buffer) struct {
+	Event string    `json:"event"`
+	Agent string    `json:"agent"`
+	Item  inboxItem `json:"item"`
+} {
+	t.Helper()
+	select {
+	case err := <-errCh:
+		t.Fatalf("watch read failed: %v stderr=%s", err, errOut.String())
+	case line := <-lineCh:
+		var event struct {
+			Event string    `json:"event"`
+			Agent string    `json:"agent"`
+			Item  inboxItem `json:"item"`
+		}
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatalf("watch line should be stable JSON: %v\n%s", err, line)
+		}
+		return event
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for watch event stderr=%s", errOut.String())
+	}
+	return struct {
+		Event string    `json:"event"`
+		Agent string    `json:"agent"`
+		Item  inboxItem `json:"item"`
+	}{}
 }
 
 func TestCLIInboxConsumeFlagAloneConsumesReturnedItems(t *testing.T) {

@@ -38,4 +38,5 @@ while IFS= read -r event; do
 done
 ```
 
-Watch mode emits one JSON line per new unconsumed inbox item.
+Watch mode emits one JSON line for each existing unconsumed inbox item, then
+continues emitting new unconsumed items as they arrive.

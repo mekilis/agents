@@ -22,8 +22,6 @@ watch_log="${TMPDIR:-/tmp}/agents-inbox-demo-watch.$$"
 agents watch --as codex-review > "$watch_log" &
 watch_pid=$!
 sleep 0.2
-agents handoff --to reviewer --agent codex-review "Watch command demo event"
-sleep 0.2
 kill "$watch_pid" 2>/dev/null || true
 wait "$watch_pid" 2>/dev/null || true
 rm -f "$watch_log"

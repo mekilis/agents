@@ -275,9 +275,12 @@ func runInboxWatch(out, errOut io.Writer, e env, opts inboxOptions) int {
 		return 1
 	}
 	for _, item := range items {
-		if !item.Consumed {
-			seen[item.ID] = true
+		if item.Consumed {
+			continue
 		}
+		seen[item.ID] = true
+		data, _ := json.Marshal(map[string]any{"event": "inbox_item", "agent": opts.As, "item": item})
+		fmt.Fprintln(out, string(data))
 	}
 	for {
 		items, err = listInboxItems(e, opts.As)
@@ -361,6 +364,10 @@ func parseInboxHandoff(path, activePath, name string) (inboxItem, error) {
 	sawFrom := false
 	for i, line := range lines {
 		trimmed := strings.TrimSpace(line)
+		if sawFrom && trimmed == "" {
+			bodyAt = i + 1
+			break
+		}
 		lower := strings.ToLower(trimmed)
 		if strings.HasPrefix(lower, "to:") {
 			item.To = strings.TrimSpace(trimmed[len("To:"):])
@@ -369,9 +376,6 @@ func parseInboxHandoff(path, activePath, name string) (inboxItem, error) {
 		} else if strings.HasPrefix(lower, "from:") {
 			item.From = strings.TrimSpace(trimmed[len("From:"):])
 			sawFrom = true
-		}
-		if bodyAt == 0 && sawFrom && trimmed == "" {
-			bodyAt = i + 1
 		}
 	}
 	if bodyAt < len(lines) {
