@@ -278,12 +278,16 @@ func runOneShot(args []string, in io.Reader, out, errOut io.Writer, e env) int {
 		return runMCPCommand(args[1:], in, out, errOut, e)
 	case "task":
 		return runTaskCommand(args[1:], out, errOut, e)
+	case "agent":
+		return runAgentCommand(args[1:], out, errOut, e)
 	case "plan":
 		return runPlanCommand(args[1:], out, errOut, e)
 	case "decision":
 		return runDecisionCommand(args[1:], out, errOut, e)
 	case "handoff":
 		return runHandoffCommand(args[1:], out, errOut, e)
+	case "inbox":
+		return runInboxCommand(args[1:], out, errOut, e)
 	case "finding":
 		return runFindingCommand(args[1:], out, errOut, e)
 	case "verify":
@@ -925,8 +929,11 @@ func printHelp(w io.Writer) {
 	fmt.Fprintln(w, "  agents task use <task>")
 	fmt.Fprintln(w, "  agents task scope|status|next \"text\"")
 	fmt.Fprintln(w, "  agents plan draft|show|refine|approve|clear ...")
+	fmt.Fprintln(w, "  agents agent add NAME --role ROLE [--harness LABEL]")
+	fmt.Fprintln(w, "  agents agent list|remove ...")
 	fmt.Fprintln(w, "  agents decision add \"text\" [--by ACTOR]")
-	fmt.Fprintln(w, "  agents handoff --to ROLE \"text\" [--by ACTOR]")
+	fmt.Fprintln(w, "  agents handoff --to ROLE \"text\" [--agent NAME] [--by ACTOR]")
+	fmt.Fprintln(w, "  agents inbox --as NAME [--consume [ITEM]] [--watch] [--json]")
 	fmt.Fprintln(w, "  agents finding add \"text\" [--severity low|medium|high] [--by ACTOR]")
 	fmt.Fprintln(w, "  agents finding fix <finding> [--evidence \"text\"] [--by ACTOR]")
 	fmt.Fprintln(w, "  agents finding verify <finding> [--evidence \"text\"] [--by ACTOR]")
@@ -934,7 +941,7 @@ func printHelp(w io.Writer) {
 	fmt.Fprintln(w, "  agents archive")
 	fmt.Fprintln(w, "  agents dispatch <implementer|reviewer|coordinator> [--json]")
 	fmt.Fprintln(w, "  agents run [--max-iterations N] [--once] [--json] [--json-events]")
-	fmt.Fprintln(w, "  agents watch")
+	fmt.Fprintln(w, "  agents watch [--as NAME]")
 	fmt.Fprintln(w, "  agents runs [--follow]")
 	fmt.Fprintln(w, "  agents mcp")
 	fmt.Fprintln(w, "  agents completion zsh")
@@ -2431,6 +2438,9 @@ func printStatus(w io.Writer, e env, jsonOut bool) error {
 			}
 		}
 		printTaskStatsWithOptions(w, stats, humanState == nil)
+		for _, agent := range active.Agents {
+			fmt.Fprintf(w, "agent: %s role=%s harness=%s inbox=%d\n", agent.Name, agent.Role, agent.Harness, agent.Unconsumed)
+		}
 		if humanState != nil {
 			printHumanBoundary(w, *humanState)
 		}
@@ -2449,11 +2459,22 @@ func statusPayload(e env) (statusJSON, error) {
 		Trust:     trustStatus(trusted),
 	}
 	if active.Path != "" {
-		stats, err := readTaskStats(e.cwd, active.Path)
-		if err != nil {
-			return statusJSON{}, err
+		var stats taskStats
+		if !active.Missing {
+			var err error
+			stats, err = readTaskStats(e.cwd, active.Path)
+			if err != nil {
+				return statusJSON{}, err
+			}
 		}
 		payload.ActiveTask = taskPayload(active, stats)
+		if !active.Missing {
+			agents, err := agentStatusPayload(e, active.Path)
+			if err != nil {
+				return statusJSON{}, err
+			}
+			payload.ActiveTask.Agents = agents
+		}
 	}
 	return payload, nil
 }
@@ -2473,6 +2494,7 @@ type taskJSON struct {
 	Plan     string       `json:"plan,omitempty"`
 	Findings findingsJSON `json:"findings"`
 	Records  recordsJSON  `json:"records"`
+	Agents   []agentJSON  `json:"agents,omitempty"`
 }
 
 type findingsJSON struct {
@@ -2486,6 +2508,13 @@ type recordsJSON struct {
 	Handoffs           int `json:"handoffs"`
 	Verification       int `json:"verification"`
 	VerificationFailed int `json:"verification_failed,omitempty"`
+}
+
+type agentJSON struct {
+	Name       string `json:"name"`
+	Role       string `json:"role"`
+	Harness    string `json:"harness,omitempty"`
+	Unconsumed int    `json:"unconsumed"`
 }
 
 type dispatchJSON struct {
@@ -3541,6 +3570,7 @@ type chunkRecord struct {
 	Path         string
 	Title        string
 	To           string
+	Agent        string
 	By           string
 	ArchiveStats archiveStats
 }
@@ -3593,17 +3623,34 @@ func addHandoff(e env, args []string, now time.Time) (chunkRecord, error) {
 	if err != nil {
 		return chunkRecord{}, err
 	}
-	to, text, err := parseHandoffArgs(rest)
+	to, agent, text, err := parseHandoffArgs(rest)
 	if err != nil {
 		return chunkRecord{}, err
 	}
+	if agent != "" {
+		target, err := registeredAgentByName(e, agent)
+		if err != nil {
+			return chunkRecord{}, err
+		}
+		if target.Role != to {
+			return chunkRecord{}, fmt.Errorf("agent %s has role %s, not %s", agent, target.Role, to)
+		}
+	}
 	title := "Handoff to " + to
-	body := fmt.Sprintf("# Handoff: %s\n\nTo: %s\nFrom: %s\n%s\n%s\n", to, to, actor, agentLine(e), text)
+	if agent != "" {
+		title = "Handoff to " + agent
+	}
+	targetLine := ""
+	if agent != "" {
+		targetLine = "Agent: " + agent + "\n"
+	}
+	body := fmt.Sprintf("# Handoff: %s\n\nTo: %s\n%sFrom: %s\n%s\n%s\n", to, to, targetLine, actor, agentLine(e), text)
 	record, err := writeActiveTaskChunk(e, "handoffs", title, body, now)
 	if err != nil {
 		return chunkRecord{}, err
 	}
 	record.To = to
+	record.Agent = agent
 	return record, nil
 }
 
@@ -3614,7 +3661,7 @@ func parseSingleTextArg(args []string, name string) (string, error) {
 	return strings.TrimSpace(args[0]), nil
 }
 
-func parseHandoffArgs(args []string) (to, text string, err error) {
+func parseHandoffArgs(args []string) (to, agent, text string, err error) {
 	for i := 0; i < len(args); i++ {
 		arg := strings.TrimSpace(args[i])
 		switch arg {
@@ -3622,27 +3669,33 @@ func parseHandoffArgs(args []string) (to, text string, err error) {
 			continue
 		case "--to":
 			if i+1 >= len(args) || strings.TrimSpace(args[i+1]) == "" {
-				return "", "", fmt.Errorf("--to requires a role")
+				return "", "", "", fmt.Errorf("--to requires a role")
 			}
 			to = strings.TrimSpace(args[i+1])
 			i++
+		case "--agent":
+			if i+1 >= len(args) || strings.TrimSpace(args[i+1]) == "" {
+				return "", "", "", fmt.Errorf("--agent requires a name")
+			}
+			agent = strings.TrimSpace(args[i+1])
+			i++
 		default:
 			if strings.HasPrefix(arg, "--") {
-				return "", "", fmt.Errorf("unknown flag %s", arg)
+				return "", "", "", fmt.Errorf("unknown flag %s", arg)
 			}
 			if text != "" {
-				return "", "", fmt.Errorf("handoff text must be one argument")
+				return "", "", "", fmt.Errorf("handoff text must be one argument")
 			}
 			text = arg
 		}
 	}
 	if to == "" {
-		return "", "", fmt.Errorf("--to is required")
+		return "", "", "", fmt.Errorf("--to is required")
 	}
 	if text == "" {
-		return "", "", fmt.Errorf("handoff text is required")
+		return "", "", "", fmt.Errorf("handoff text is required")
 	}
-	return to, text, nil
+	return to, agent, text, nil
 }
 
 func writeActiveTaskChunk(e env, kind, title, body string, now time.Time) (chunkRecord, error) {

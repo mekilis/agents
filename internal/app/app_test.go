@@ -748,6 +748,292 @@ func TestStartOpensTaskAndHandoffToImplementer(t *testing.T) {
 	}
 }
 
+func TestAgentInboxAddressingFilteringAndConsume(t *testing.T) {
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json"), actor: "supervisor"}
+		if _, err := openTask(e, []string{"Agent Inbox"}, time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if err := addRegisteredAgent(e, []string{"alice", "--role", "implementer", "--harness", "cursor"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := addRegisteredAgent(e, []string{"bob", "--role", "reviewer", "--harness", "codex"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addHandoff(e, []string{"--to", "implementer", "role work"}, time.Date(2026, 7, 21, 10, 1, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		direct, err := addHandoff(e, []string{"--to", "implementer", "--agent", "alice", "direct work"}, time.Date(2026, 7, 21, 10, 2, 0, 0, time.UTC))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addHandoff(e, []string{"--to", "reviewer", "review work"}, time.Date(2026, 7, 21, 10, 3, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		alice, err := listInboxItems(e, "alice")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(alice) != 2 {
+			t.Fatalf("alice should see role and direct handoffs, got %+v", alice)
+		}
+		bob, err := listInboxItems(e, "bob")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(bob) != 1 || bob[0].Text != "review work" {
+			t.Fatalf("bob should only see reviewer role handoff, got %+v", bob)
+		}
+		id := strings.TrimSuffix(filepath.Base(direct.Path), ".md")
+		if _, err := consumeInboxItem(e, "alice", id); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := consumeInboxItem(e, "alice", id); err != nil {
+			t.Fatalf("consume should be idempotent: %v", err)
+		}
+		alice, err = listInboxItems(e, "alice")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, item := range alice {
+			if item.ID == id && !item.Consumed {
+				t.Fatalf("expected %s consumed in %+v", id, alice)
+			}
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
+func TestAgentRegistrationRejectsUnsafeNames(t *testing.T) {
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Agent Names"}, time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		for _, name := range []string{"../reviewer", "reviewer/one", "reviewer one", ".."} {
+			if err := addRegisteredAgent(e, []string{name, "--role", "reviewer"}); err == nil {
+				t.Fatalf("expected unsafe agent name %q to fail", name)
+			}
+		}
+		if err := addRegisteredAgent(e, []string{"reviewer.one-2", "--role", "reviewer", "--harness", "codex"}); err != nil {
+			t.Fatalf("expected safe agent name to register: %v", err)
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
+func TestAddressedHandoffRequiresRegisteredAgent(t *testing.T) {
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Registered Targets"}, time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addHandoff(e, []string{"--to", "reviewer", "--agent", "missing", "direct work"}, time.Date(2026, 7, 21, 10, 1, 0, 0, time.UTC)); err == nil {
+			t.Fatal("expected direct handoff to an unregistered agent to fail")
+		}
+		if err := addRegisteredAgent(e, []string{"reviewer-one", "--role", "reviewer"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addHandoff(e, []string{"--to", "implementer", "--agent", "reviewer-one", "direct work"}, time.Date(2026, 7, 21, 10, 2, 0, 0, time.UTC)); err == nil {
+			t.Fatal("expected direct handoff to reject role mismatch")
+		}
+		if _, err := addHandoff(e, []string{"--to", "reviewer", "--agent", "reviewer-one", "direct work"}, time.Date(2026, 7, 21, 10, 3, 0, 0, time.UTC)); err != nil {
+			t.Fatalf("expected direct handoff to registered agent to succeed: %v", err)
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
+func TestInboxWatchEmitsOnlyNewMatchingItem(t *testing.T) {
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Watch Inbox"}, time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if err := addRegisteredAgent(e, []string{"alice", "--role", "implementer"}); err != nil {
+			t.Fatal(err)
+		}
+		if err := addRegisteredAgent(e, []string{"bob", "--role", "reviewer"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addHandoff(e, []string{"--to", "implementer", "existing work"}, time.Date(2026, 7, 21, 10, 1, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+
+		ready := make(chan struct{})
+		release := make(chan struct{})
+		oldSleep := inboxWatchSleep
+		var once sync.Once
+		inboxWatchSleep = func() {
+			once.Do(func() { close(ready) })
+			<-release
+		}
+		defer func() {
+			inboxWatchSleep = oldSleep
+			close(release)
+		}()
+
+		reader, writer := io.Pipe()
+		defer reader.Close()
+		defer writer.Close()
+		var errOut bytes.Buffer
+		go runInboxWatch(writer, &errOut, e, inboxOptions{As: "alice", Watch: true})
+
+		<-ready
+		if _, err := addHandoff(e, []string{"--to", "reviewer", "wrong role"}, time.Date(2026, 7, 21, 10, 2, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addHandoff(e, []string{"--to", "reviewer", "--agent", "bob", "wrong agent"}, time.Date(2026, 7, 21, 10, 3, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addHandoff(e, []string{"--to", "implementer", "--agent", "alice", "new direct work"}, time.Date(2026, 7, 21, 10, 4, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		release <- struct{}{}
+
+		lineCh := make(chan string, 1)
+		errCh := make(chan error, 1)
+		go func() {
+			line, err := bufio.NewReader(reader).ReadString('\n')
+			if err != nil {
+				errCh <- err
+				return
+			}
+			lineCh <- line
+		}()
+
+		select {
+		case err := <-errCh:
+			t.Fatalf("watch read failed: %v stderr=%s", err, errOut.String())
+		case line := <-lineCh:
+			var event struct {
+				Event string    `json:"event"`
+				Agent string    `json:"agent"`
+				Item  inboxItem `json:"item"`
+			}
+			if err := json.Unmarshal([]byte(line), &event); err != nil {
+				t.Fatalf("watch line should be stable JSON: %v\n%s", err, line)
+			}
+			if event.Event != "inbox_item" || event.Agent != "alice" || event.Item.Text != "new direct work" {
+				t.Fatalf("unexpected watch event: %+v", event)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for watch event stderr=%s", errOut.String())
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
+func TestCLIInboxConsumeFlagAloneConsumesReturnedItems(t *testing.T) {
+	var out, errOut bytes.Buffer
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Consume Inbox"}, time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if err := addRegisteredAgent(e, []string{"alice", "--role", "implementer"}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addHandoff(e, []string{"--to", "implementer", "first"}, time.Date(2026, 7, 21, 10, 1, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := addHandoff(e, []string{"--to", "implementer", "second"}, time.Date(2026, 7, 21, 10, 2, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if code := Run([]string{"inbox", "--as", "alice", "--consume", "--json"}, bytes.NewBuffer(nil), &out, &errOut); code != 0 {
+			return code
+		}
+		var payload struct {
+			Consumed int         `json:"consumed"`
+			Items    []inboxItem `json:"items"`
+		}
+		if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload.Consumed != 2 || len(payload.Items) != 2 {
+			t.Fatalf("expected two consumed items, got %+v output=%s", payload, out.String())
+		}
+		out.Reset()
+		if code := Run([]string{"inbox", "--as", "alice", "--consume", "--json"}, bytes.NewBuffer(nil), &out, &errOut); code != 0 {
+			return code
+		}
+		if err := json.Unmarshal(out.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload.Consumed != 0 || len(payload.Items) != 0 {
+			t.Fatalf("expected idempotent empty consume, got %+v", payload)
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("Run inbox consume code=%d stderr=%s", code, errOut.String())
+	}
+}
+
+func TestWatchAsEmitsInboxEvent(t *testing.T) {
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"Watch As"}, time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		if err := addRegisteredAgent(e, []string{"alice", "--role", "implementer"}); err != nil {
+			t.Fatal(err)
+		}
+		ready := make(chan struct{})
+		release := make(chan struct{})
+		oldSleep := inboxWatchSleep
+		var once sync.Once
+		inboxWatchSleep = func() {
+			once.Do(func() { close(ready) })
+			<-release
+		}
+		defer func() {
+			inboxWatchSleep = oldSleep
+			close(release)
+		}()
+
+		reader, writer := io.Pipe()
+		defer reader.Close()
+		defer writer.Close()
+		var errOut bytes.Buffer
+		go Run([]string{"watch", "--as", "alice"}, bytes.NewBuffer(nil), writer, &errOut)
+		<-ready
+		if _, err := addHandoff(e, []string{"--to", "implementer", "--agent", "alice", "watch command work"}, time.Date(2026, 7, 21, 10, 1, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		release <- struct{}{}
+		lineCh := make(chan string, 1)
+		go func() {
+			line, _ := bufio.NewReader(reader).ReadString('\n')
+			lineCh <- line
+		}()
+		select {
+		case line := <-lineCh:
+			if !strings.Contains(line, `"event":"inbox_item"`) || !strings.Contains(line, "watch command work") {
+				t.Fatalf("unexpected watch line %q stderr=%s", line, errOut.String())
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for agents watch --as output stderr=%s", errOut.String())
+		}
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("withTempProcessEnv code=%d", code)
+	}
+}
+
 func TestStartRequiresInstruction(t *testing.T) {
 	var out, errOut bytes.Buffer
 	code := withTempProcessEnv(t, func(home, cwd string) int {
@@ -7532,6 +7818,84 @@ func TestMCPToolsWrapTaskStateCommands(t *testing.T) {
 	}
 	if got := archived["unresolved_findings"]; got != float64(1) {
 		t.Fatalf("expected archive tool to report unresolved findings, got %+v", archived)
+	}
+}
+
+func TestMCPAgentInboxRoundTrip(t *testing.T) {
+	var out, errOut bytes.Buffer
+	var status map[string]any
+	code := withTempProcessEnv(t, func(home, cwd string) int {
+		t.Setenv("AGENTS_ACTOR", "cursor-one")
+		e := env{cwd: cwd, home: home, trustPath: filepath.Join(home, ".agents", "trust.json")}
+		if _, err := openTask(e, []string{"MCP Inbox"}, time.Date(2026, 7, 21, 11, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		}
+		input := mcpTestFrames(
+			mcpToolCallLine(1, "agent_add", map[string]any{"name": "cursor-one", "role": "implementer", "harness": "cursor"}),
+			mcpToolCallLine(2, "agent_add", map[string]any{"name": "codex-review", "role": "reviewer", "harness": "codex"}),
+			mcpToolCallLine(3, "agent_list", map[string]any{}),
+			mcpToolCallLine(4, "add_handoff", map[string]any{"to": "implementer", "agent": "cursor-one", "text": "Handle MCP-directed work"}),
+			mcpToolCallLine(5, "add_handoff", map[string]any{"to": "reviewer", "agent": "codex-review", "text": "Explicit override work"}),
+			mcpToolCallLine(6, "inbox_list", map[string]any{}),
+			mcpToolCallLine(7, "inbox_list", map[string]any{"as": "codex-review"}),
+		)
+		if code := Run([]string{"mcp"}, strings.NewReader(input), &out, &errOut); code != 0 {
+			return code
+		}
+		responses := decodeMCPTestResponses(t, out.String())
+		agents := decodeMCPToolText(t, responses[2])
+		if !strings.Contains(fmt.Sprint(agents), "cursor-one") {
+			t.Fatalf("agent_list missing registered agent: %+v", agents)
+		}
+		direct := decodeMCPToolText(t, responses[3])
+		data, err := os.ReadFile(filepath.Join(cwd, stateDir, direct["path"].(string)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(data), "From: cursor-one") {
+			t.Fatalf("expected default MCP actor attribution, got:\n%s", string(data))
+		}
+		inbox := decodeMCPToolText(t, responses[5])
+		items := inbox["items"].([]any)
+		if len(items) != 1 {
+			t.Fatalf("expected one inbox item, got %+v", inbox)
+		}
+		id := items[0].(map[string]any)["id"].(string)
+		overrideInbox := decodeMCPToolText(t, responses[6])
+		if got := overrideInbox["agent"]; got != "codex-review" || len(overrideInbox["items"].([]any)) != 1 {
+			t.Fatalf("expected explicit inbox override, got %+v", overrideInbox)
+		}
+		out.Reset()
+		errOut.Reset()
+		input = mcpTestFrames(
+			mcpToolCallLine(8, "inbox_consume", map[string]any{"id": id}),
+			mcpToolCallLine(9, "status", map[string]any{}),
+		)
+		if code := Run([]string{"mcp"}, strings.NewReader(input), &out, &errOut); code != 0 {
+			return code
+		}
+		responses = decodeMCPTestResponses(t, out.String())
+		consumed := decodeMCPToolText(t, responses[0])
+		if consumed["agent"] != "cursor-one" || consumed["consumed"] != float64(1) {
+			t.Fatalf("expected default consume identity, got %+v", consumed)
+		}
+		status = decodeMCPToolText(t, responses[1])
+		return 0
+	})
+	if code != 0 {
+		t.Fatalf("Run mcp code=%d stderr=%s", code, errOut.String())
+	}
+	task := status["active_task"].(map[string]any)
+	statusAgents := task["agents"].([]any)
+	sawCursorConsumed := false
+	for _, entry := range statusAgents {
+		agent := entry.(map[string]any)
+		if agent["name"] == "cursor-one" && agent["unconsumed"] == float64(0) {
+			sawCursorConsumed = true
+		}
+	}
+	if !sawCursorConsumed {
+		t.Fatalf("expected consumed inbox count, got %+v", status)
 	}
 }
 

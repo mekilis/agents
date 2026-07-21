@@ -605,9 +605,18 @@ func combineEventSinks(sinks ...loopEventSink) loopEventSink {
 }
 
 func runWatchCommand(args []string, out, errOut io.Writer, e env) int {
-	if len(args) != 0 {
-		fmt.Fprintln(errOut, "agents: watch does not accept arguments yet")
-		return 2
+	if len(args) > 0 {
+		opts, err := parseInboxArgs(args)
+		if err != nil {
+			fmt.Fprintf(errOut, "agents: watch: %v\n", err)
+			return 2
+		}
+		if opts.As == "" {
+			fmt.Fprintln(errOut, "agents: watch: --as is required")
+			return 2
+		}
+		opts.Watch = true
+		return runInboxWatch(out, errOut, e, opts)
 	}
 	if err := printRunActivity(out, e, true, true); err != nil {
 		fmt.Fprintf(errOut, "agents: watch: %v\n", err)

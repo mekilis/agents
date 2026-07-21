@@ -193,7 +193,12 @@ func mcpTools() []mcpTool {
 		{Name: "run_once", Description: "Run one queued Agents role using existing local configuration.", InputSchema: objectSchema(nil, nil)},
 		{Name: "recent_runs", Description: "Return persisted cleaned run activity for the active task.", InputSchema: objectSchema(nil, nil)},
 		{Name: "watch_activity", Description: "Return the current persisted cleaned run activity snapshot.", InputSchema: objectSchema(nil, nil)},
-		{Name: "add_handoff", Description: "Record a handoff to a role on the active task.", InputSchema: objectSchema(map[string]any{"to": stringSchema("Target role."), "text": stringSchema("Handoff text."), "by": stringSchema("Optional actor override.")}, []string{"to", "text"})},
+		{Name: "agent_add", Description: "Register a named task agent with role and harness labels.", InputSchema: objectSchema(map[string]any{"name": stringSchema("Agent name."), "role": stringSchema("Agent role."), "harness": stringSchema("Harness label.")}, []string{"name", "role"})},
+		{Name: "agent_list", Description: "List named task agents.", InputSchema: objectSchema(nil, nil)},
+		{Name: "agent_remove", Description: "Remove a named task agent.", InputSchema: objectSchema(map[string]any{"name": stringSchema("Agent name.")}, []string{"name"})},
+		{Name: "inbox_list", Description: "List inbox items for a named agent.", InputSchema: objectSchema(map[string]any{"as": stringSchema("Optional agent name. Defaults to the registered AGENTS_ACTOR.")}, nil)},
+		{Name: "inbox_consume", Description: "Mark inbox items consumed for a named agent.", InputSchema: objectSchema(map[string]any{"as": stringSchema("Optional agent name. Defaults to the registered AGENTS_ACTOR."), "id": stringSchema("Optional inbox item id.")}, nil)},
+		{Name: "add_handoff", Description: "Record a handoff to a role or named agent on the active task.", InputSchema: objectSchema(map[string]any{"to": stringSchema("Target role."), "agent": stringSchema("Optional target agent name."), "text": stringSchema("Handoff text."), "by": stringSchema("Optional actor override.")}, []string{"to", "text"})},
 		{Name: "add_finding", Description: "Record an open finding on the active task.", InputSchema: objectSchema(map[string]any{"text": stringSchema("Finding text."), "severity": enumSchema("Finding severity.", []string{"low", "medium", "high"}), "by": stringSchema("Optional actor override.")}, []string{"text"})},
 		{Name: "fix_finding", Description: "Mark a finding fixed with optional evidence.", InputSchema: findingUpdateSchema()},
 		{Name: "verify_finding", Description: "Mark a fixed finding independently verified with optional evidence.", InputSchema: findingUpdateSchema()},
@@ -245,18 +250,91 @@ func callMCPTool(e env, name string, rawArgs json.RawMessage) (any, error) {
 		return mcpRunActivity(e)
 	case "add_handoff":
 		var args struct {
-			To   string `json:"to"`
-			Text string `json:"text"`
-			By   string `json:"by"`
+			To    string `json:"to"`
+			Agent string `json:"agent"`
+			Text  string `json:"text"`
+			By    string `json:"by"`
 		}
 		if err := decodeMCPArgs(rawArgs, &args); err != nil {
 			return nil, err
 		}
-		record, err := addHandoff(e, withBy(args.By, "--to", args.To, args.Text), time.Now().UTC())
+		cliArgs := []string{"--to", args.To}
+		if strings.TrimSpace(args.Agent) != "" {
+			cliArgs = append(cliArgs, "--agent", args.Agent)
+		}
+		cliArgs = append(cliArgs, args.Text)
+		record, err := addHandoff(e, withBy(args.By, cliArgs...), time.Now().UTC())
 		if err != nil {
 			return nil, err
 		}
-		return map[string]any{"to": record.To, "path": record.Path}, nil
+		return map[string]any{"to": record.To, "agent": record.Agent, "path": record.Path}, nil
+	case "agent_add":
+		var args struct {
+			Name    string `json:"name"`
+			Role    string `json:"role"`
+			Harness string `json:"harness"`
+		}
+		if err := decodeMCPArgs(rawArgs, &args); err != nil {
+			return nil, err
+		}
+		cliArgs := []string{args.Name, "--role", args.Role}
+		if strings.TrimSpace(args.Harness) != "" {
+			cliArgs = append(cliArgs, "--harness", args.Harness)
+		}
+		if err := addRegisteredAgent(e, cliArgs); err != nil {
+			return nil, err
+		}
+		return map[string]any{"name": args.Name, "role": args.Role, "harness": args.Harness}, nil
+	case "agent_list":
+		agents, err := readRegisteredAgents(e)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"agents": agents}, nil
+	case "agent_remove":
+		var args struct {
+			Name string `json:"name"`
+		}
+		if err := decodeMCPArgs(rawArgs, &args); err != nil {
+			return nil, err
+		}
+		if err := removeRegisteredAgent(e, []string{args.Name}); err != nil {
+			return nil, err
+		}
+		return map[string]any{"removed": args.Name}, nil
+	case "inbox_list":
+		var args struct {
+			As string `json:"as"`
+		}
+		if err := decodeMCPArgs(rawArgs, &args); err != nil {
+			return nil, err
+		}
+		as, err := mcpInboxAgent(e, args.As)
+		if err != nil {
+			return nil, err
+		}
+		items, err := listInboxItems(e, as)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"agent": as, "items": items}, nil
+	case "inbox_consume":
+		var args struct {
+			As string `json:"as"`
+			ID string `json:"id"`
+		}
+		if err := decodeMCPArgs(rawArgs, &args); err != nil {
+			return nil, err
+		}
+		as, err := mcpInboxAgent(e, args.As)
+		if err != nil {
+			return nil, err
+		}
+		items, err := consumeInboxItems(e, as, args.ID)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"agent": as, "items": items, "consumed": len(items)}, nil
 	case "add_finding":
 		var args struct {
 			Text     string `json:"text"`
@@ -325,6 +403,20 @@ func withBy(by string, args ...string) []string {
 		return args
 	}
 	return append([]string{"--by", strings.TrimSpace(by)}, args...)
+}
+
+func mcpInboxAgent(e env, explicit string) (string, error) {
+	if as := strings.TrimSpace(explicit); as != "" {
+		return as, nil
+	}
+	actor, err := resolveActor(e, "")
+	if err != nil {
+		return "", err
+	}
+	if _, err := registeredAgentByName(e, actor); err != nil {
+		return "", fmt.Errorf("as is required unless AGENTS_ACTOR is a registered agent: %w", err)
+	}
+	return actor, nil
 }
 
 func mcpUpdateFinding(e env, rawArgs json.RawMessage, status, section string) (any, error) {

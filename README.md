@@ -69,6 +69,7 @@ The workflow uses Node 24 compatible GitHub Actions.
 Start with the short tutorial:
 
 - [Build a tiny todo CLI with Agents](tutorials/tiny-todo-cli.md)
+- [Agent inbox with two harnesses](tutorials/agent-inbox-two-harnesses.md)
 
 It shows the intended flow in a fresh project: initialize `.agents/`, trust the
 workspace, chat with the coordinator, let implementer and reviewer roles work,
