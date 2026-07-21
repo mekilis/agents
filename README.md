@@ -222,6 +222,32 @@ agents finding verify tasks/.../findings/2026-06-05T120000Z-missing-regression-t
 agents verify "go test ./... passes" --cmd 'go test ./...'
 ```
 
+For multi-harness work, register task-scoped named agents and let each harness
+read the inbox addressed to it. Role handoffs remain broadcast to every
+registered agent for that role; addressed handoffs keep the role target and add
+one named recipient:
+
+```bash
+agents agent add cursor-one --role implementer --harness cursor
+agents agent add codex-review --role reviewer --harness codex
+agents agent list
+
+agents handoff --to implementer "Any implementer can take this"
+agents handoff --to implementer --agent cursor-one "Cursor should take this"
+
+agents inbox --as cursor-one
+agents inbox --as cursor-one --json
+agents inbox --as cursor-one --consume
+agents inbox --as cursor-one --consume 2026-07-21T120000Z-handoff-to-implementer.md
+agents watch --as cursor-one
+```
+
+`agents inbox --as NAME` lists unconsumed role and direct handoffs for a
+registered agent. `--consume` marks all listed items consumed, or one item when
+given an item id. `agents watch --as NAME` emits one JSON line for each existing
+unconsumed inbox item before waiting for new arrivals, which lets a harness
+start or resume without missing backlog.
+
 Every record carries an actor identity, resolved from `--by`, then the
 `AGENTS_ACTOR` environment variable, then the OS user. When `agents run`
 launches a role, it sets `AGENTS_ACTOR` to the role name in the agent's
@@ -280,9 +306,9 @@ history.
 
 `agents mcp` starts a local stdio MCP server for clients that want to inspect
 and update the same task state without bespoke shell parsing. It exposes tools
-for status, one loop step, recent run activity, handoffs, findings, decisions,
-and archive; it does not add IDE orchestration or bypass existing Agents
-boundaries.
+for status, one loop step, recent run activity, agent registration, inbox
+list/consume, handoffs, findings, decisions, and archive; it does not add IDE
+orchestration or bypass existing Agents boundaries.
 
 For Agents development itself, prefer letting Agents drive the work:
 
