@@ -15,10 +15,44 @@ available.
 
 ## Install
 
-Download archives for tagged releases from
+Install the latest macOS or Linux release:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mekilis/agents/main/install.sh | sh
+```
+
+The installer detects macOS/Linux and amd64/arm64, downloads the matching
+[GitHub Releases](https://github.com/mekilis/agents/releases) archive, verifies
+it against `checksums.txt`, and installs `agents`. When `agents` is already on
+`PATH`, the installer replaces that binary. Otherwise, it chooses a user-writable
+bin directory such as `$HOME/.local/bin` when possible. If it installs somewhere
+not already on `PATH`, it prints the directory to add.
+
+Install a specific release:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mekilis/agents/main/install.sh | AGENTS_VERSION=0.5.0 sh
+```
+
+Install into a specific directory:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mekilis/agents/main/install.sh | AGENTS_INSTALL_DIR="$HOME/bin" sh
+```
+
+If the target directory is not writable, choose a writable `AGENTS_INSTALL_DIR`
+or rerun with permissions for that directory.
+
+To upgrade, run the installer again. It safely replaces the existing
+PATH-resolved `agents` binary after the downloaded release passes checksum
+verification. If that directory is not writable, set `AGENTS_INSTALL_DIR` to the
+directory you want to manage or rerun with permissions for the existing
+installation directory.
+
+You can also download archives manually from
 [GitHub Releases](https://github.com/mekilis/agents/releases). Pick the archive
-for your OS and CPU, unpack it, and put the `agents` binary somewhere on
-`PATH`.
+for your OS and CPU, verify it against `checksums.txt`, unpack it, and put the
+`agents` binary somewhere on `PATH`.
 
 From this repository:
 
@@ -33,9 +67,9 @@ Check with:
 agents help
 ```
 
-To update the local command after pulling or editing this repo, run the same
-install command again. If your shell cannot find `agents`, add Go's bin
-directory to `PATH`:
+To update a source-built local command after pulling or editing this repo, run
+the same `go install` command again. If your shell cannot find `agents`, add
+Go's bin directory to `PATH`:
 
 ```bash
 export PATH="$(go env GOPATH)/bin:$PATH"
