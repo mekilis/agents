@@ -93,6 +93,7 @@ type env struct {
 type config struct {
 	Roles            map[string]roleConfig
 	ReviewerPipeline []roleConfig
+	Adviser          adviserConfig
 	Providers        map[string]providerConfig
 	Review           reviewConfig
 	Settings         agentSettings
@@ -255,6 +256,8 @@ func runOneShot(args []string, in io.Reader, out, errOut io.Writer, e env) int {
 		return 0
 	case "completion":
 		return runCompletionCommand(args[1:], out, errOut, e)
+	case "advise":
+		return runAdviserCommand(args[1:], out, errOut, e)
 	case "status":
 		jsonOut, err := parseJSONFlag(args[1:])
 		if err != nil {
@@ -467,6 +470,9 @@ func readConfig(cwd string) (config, error) {
 		}
 		return cfg, err
 	}
+	if err := parseAdviserConfig(string(data), &cfg.Adviser); err != nil {
+		return cfg, err
+	}
 	inRoles := false
 	inProviders := false
 	inReview := false
@@ -479,6 +485,10 @@ func readConfig(cwd string) (config, error) {
 			continue
 		}
 		trimmedLine := strings.TrimSpace(line)
+		if !strings.HasPrefix(line, " ") && trimmedLine == "adviser:" {
+			inRoles, inProviders, inReview, inSettings = false, false, false, false
+			continue
+		}
 		if trimmedLine == "roles:" {
 			inRoles = true
 			inProviders = false
@@ -925,6 +935,8 @@ func printHelp(w io.Writer) {
 	fmt.Fprintln(w, "  agents go --continue|--implementer|--reviewer [\"follow-up\"] [--max-iterations N] [--plain]")
 	fmt.Fprintln(w, "  agents start \"title\" [--ref REF] \"what to do\"")
 	fmt.Fprintln(w, "  agents status [--json]")
+	fmt.Fprintln(w, "  agents advise ask [--json] [--] \"<prompt>\"")
+	fmt.Fprintln(w, "  agents advise ratings [--json]")
 	fmt.Fprintln(w, "  agents task open \"title\" [--ref REF]")
 	fmt.Fprintln(w, "  agents task use <task>")
 	fmt.Fprintln(w, "  agents task scope|status|next \"text\"")

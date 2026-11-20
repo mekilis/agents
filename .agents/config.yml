@@ -19,16 +19,20 @@ providers:
     reasoning: low
   agent:
     model: gpt-5.5-low
+  agy:
+    provider: agy
 # Each role is a provider name (cursor, cursor-agent, agent, codex, claude, gemini, agy, antigravity)
-# or a map with provider plus optional model/reasoning overrides:
-#   reviewer:
-#     provider: codex
-#     model: gpt-5.5
-#     reasoning: low
-# Advanced escape hatch: a cmd template containing {prompt_file}.
+# or a map with provider plus optional model/reasoning overrides.
+# roles.adviser drives agents advise ask/ratings; scores are earned from peer critique, never set here.
 roles:
   implementer: agent
   reviewer:
     - lmstudio
     - codex
   coordinator: codex
+  adviser:
+    - codex
+    - agy
+adviser:
+  critics: 2
+  explore_every: 4

@@ -245,6 +245,24 @@ the work. They should naturally cover the objective, brief repo-relative
 evidence, assumptions or open questions, implementation shape, validation,
 risks, and constraints such as requested permissions or boundaries.
 
+Before coding, you can run a peer-critique advice round that is separate from
+implementer/reviewer. Configure `roles.adviser` (and optional `adviser.critics`
+/ `adviser.explore_every`) in `.agents/config.yml`. Ratings are earned from
+peer outcomes and keyed by provider plus model; humans never set scores:
+
+```bash
+agents advise ask "What should Agents do next for inbox UX?"
+agents advise ask --json -- "ratings"   # literal prompt after --
+agents advise ratings
+agents advise ratings --json
+```
+
+A scored round needs at least two verifiable adviser identities. Clean peer
+critiques raise the proposer's rating; proposal-linked findings lower it.
+Standings live under `.agents/reputation/` (gitignored) and survive
+`agents archive`. Advice never auto-starts implementation: pick a direction,
+open or continue a task, approve a plan, then let the implementer code.
+
 Record coordination state:
 
 ```bash
